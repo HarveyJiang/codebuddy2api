@@ -155,6 +155,33 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.pool.select()
         self.assertNotIn(key, self.store.data['session_bindings'])
 
+    def test_consumption_rate_and_expire_unused(self):
+        # 模拟 3 天内余额 300 → 150：日耗 50。
+        status = self.store.data['account_status'].setdefault(self.a, {})
+        day0 = self.now - 3 * 86400
+        status['usage_history'] = [{'date': 'd0', 'samples': [[day0, 100], [day0 + 3600, 50]]},
+                                   {'date': 'd1', 'samples': [[self.now - 86400, 50]]}]
+        status['remaining'] = 150
+        consumption = self.pool.consumption(status)
+        self.assertAlmostEqual(consumption['daily_rate'], 100, delta=5)  # 200 消耗 / 2 天跨度
+        # 余额上涨样本（签到）不 计入消耗。
+        status['usage_history'][0]['samples'].append([day0 + 7200, -100])
+        self.assertAlmostEqual(self.pool.consumption(status)['daily_rate'], 100, delta=5)
+        # 最早过期 2 天后：按速率能烧 200，剩 150 → 无浪费。
+        status['earliest_expiry'] = self.now + 2 * 86400
+        row = self.pool.rows(self.store.account_rows())[0]
+        self.assertEqual(row['daily_rate'], consumption['daily_rate'])
+        self.assertEqual(row['expire_unused'], 0)
+        self.assertAlmostEqual(row['days_to_empty'], 1.5, delta=0.2)
+        # 快过期（1 天）时：只能烧 100 → 预计 50 浪费。
+        status['earliest_expiry'] = self.now + 86400
+        row = self.pool.rows(self.store.account_rows())[0]
+        self.assertAlmostEqual(row['expire_unused'], 50, delta=5)
+        # 无历史则字段为空。
+        row_b = self.pool.rows(self.store.account_rows())[1]
+        self.assertIsNone(row_b['daily_rate'])
+        self.assertIsNone(row_b['expire_unused'])
+
     def test_record_exponential_backoff_and_reset(self):
         self.pool.record(self.a, 429)
         first = self.store.data['account_status'][self.a]['cooldown_until']

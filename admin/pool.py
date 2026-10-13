@@ -106,7 +106,22 @@ class AccountPool:
     def update(self, aid, **values):
         with self.store.lock:
             if aid in self.store.data["accounts"]:
-                self.store.data["account_status"].setdefault(aid, {}).update(values)
+                status = self.store.data["account_status"].setdefault(aid, {})
+                old = status.get("remaining")
+                new = values.get("remaining")
+                # 记录积分余额变化：按天滚动存 (时间戳, 变化量)，用于消耗速率与预测。
+                if isinstance(new, (int, float)) and isinstance(old, (int, float)) and old != new:
+                    today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
+                    history = status.setdefault("usage_history", [])
+                    if not history or history[-1].get("date") != today:
+                        history.append({"date": today, "samples": []})
+                    history[-1]["samples"].append([int(self.clock()), round(old - new, 2)])
+                    # 只保留最近 30 天，且每天最多 288 个采样点（5 分钟同步一次的量级）。
+                    del history[:-30]
+                    if len(history[-1]["samples"]) > 288:
+                        del history[-1]["samples"][:len(history[-1]["samples"]) - 288]
+                    self.dirty = True
+                status.update(values)
                 self.dirty = True
 
     def flush(self, force=False):
@@ -129,14 +144,45 @@ class AccountPool:
             return "exhausted"
         return "available"
 
+    def consumption(self, status):
+        """从 usage_history 估算日消耗速率（近 7 天，剔除余额上涨样本如签到/充值）。"""
+        history = status.get("usage_history", [])
+        if not history:
+            return None
+        now = self.clock()
+        cutoff = now - 7 * 86400
+        total_spent, span_start, span_end = 0.0, None, None
+        for day in history:
+            for ts, delta in day.get("samples", []):
+                if ts < cutoff or delta <= 0:
+                    continue
+                total_spent += delta
+                span_start = ts if span_start is None else min(span_start, ts)
+                span_end = ts if span_end is None else max(span_end, ts)
+        if not total_spent or span_start is None or not span_end or span_end <= span_start:
+            return None
+        days = max((span_end - span_start) / 86400, 0.5)
+        return {"daily_rate": round(total_spent / days, 2), "spent_7d": round(total_spent, 2)}
+
     def rows(self, rows):
         today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
         for row in rows:
             status = self.store.data["account_status"].get(row["id"], {})
-            row.update({"pool_state": self.state(row), "remaining": status.get("remaining"), "credits_updated": status.get("credits_updated"),
+            consumption = self.consumption(status)
+            expiry = status.get("earliest_expiry")
+            remaining = status.get("remaining")
+            # 过期前用不完的积分：整号剩余 - 到期前按当前速率能消耗的量（粗估）。
+            expire_unused = None
+            if expiry and consumption and isinstance(remaining, (int, float)) and remaining > 0:
+                burnable = max(0.0, consumption["daily_rate"] * max((expiry - self.clock()) / 86400, 0))
+                expire_unused = round(max(0.0, remaining - burnable), 2)
+            row.update({"pool_state": self.state(row), "remaining": remaining, "credits_updated": status.get("credits_updated"),
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
-                        "earliest_expiry": status.get("earliest_expiry"), "earliest_expiry_remaining": status.get("earliest_expiry_remaining"),
+                        "earliest_expiry": expiry, "earliest_expiry_remaining": status.get("earliest_expiry_remaining"),
                         "weight": int(status.get("weight", 0)),
+                        "daily_rate": consumption["daily_rate"] if consumption else None,
+                        "days_to_empty": round(remaining / consumption["daily_rate"], 1) if consumption and isinstance(remaining, (int, float)) and consumption["daily_rate"] > 0 else None,
+                        "expire_unused": expire_unused,
                         "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
                         "request_count": status.get("request_count", 0)})
