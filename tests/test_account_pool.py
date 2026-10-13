@@ -123,6 +123,33 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.tick()
         self.assertNotIn('sync', self.pages)
 
+    async def test_credential_refresh_spreads_within_day_window(self):
+        calls = []
+        def fake_operate(aid, action):
+            calls.append((aid, action))
+            return {'id': aid, 'ok': True}
+        self.pool.operate = fake_operate
+        self.store.data['pool']['auto_checkin'] = False
+        self.store.data['pool']['sync_window'] = ['10:00', '20:00']
+        for aid, slot in ((self.a, '10:30'), (self.b, '15:00')):
+            self.store.data['account_status'].setdefault(aid, {}).update(
+                refresh_slot=slot, refresh_slot_date='2026-10-14')
+        # 11:00：只有 a 的随机时刻已过（凭据未临近到期故不实际刷新，仅落当日标记）。
+        self.now = datetime(2026, 10, 14, 11, 0, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        statuses = self.store.data['account_status']
+        self.assertEqual(statuses[self.a].get('refresh_window_date'), '2026-10-14')
+        self.assertIsNone(statuses[self.b].get('refresh_window_date'))
+        # 15:30：b 的时刻到了，也落标记。
+        self.now = datetime(2026, 10, 14, 15, 30, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        self.assertEqual(statuses[self.b].get('refresh_window_date'), '2026-10-14')
+        # 21:00：时段外不再发起任何预刷新。
+        self.now = datetime(2026, 10, 14, 21, 0, tzinfo=CN).timestamp()
+        seen = len(calls)
+        await self.pool.tick()
+        self.assertEqual(len(calls), seen)
+
     async def test_checkin_retry_cap_and_success_reset(self):
         self.store.data['pool']['auto_checkin'] = True
         self.store.data['pool']['checkin_time'] = '00:00'

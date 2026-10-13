@@ -421,20 +421,36 @@ class AccountPool:
                     except HTTPException:
                         pass
         # 低峰凭据预刷新：expiresAt 2 小时内到期的账号提前刷新，避免请求撞上 401 再冷却。
-        if now.hour in (4, 5):
-            stale = [aid for aid, item in self.store.data["accounts"].items()
-                     if item["enabled"] and self.store.data["account_status"].get(aid, {}).get("token_refreshed", 0) < self.clock() - 86400
-                     and (row := next((r for r in self.store.account_rows() if r["id"] == aid), None))
-                     and row.get("refresh_available") and not row.get("expired")
-                     and 0 < row["expires_at"] / 1000 - self.clock() < 7200]
-            for aid in stale:
-                try:
-                    await asyncio.to_thread(self.operate, aid, "refresh")
-                except HTTPException:
-                    pass
-        # 统计只在配置的时段内进行（默认 10:00-20:00 北京时间），夜间不发起积分查询。
+        # 凭据预刷新：分散到白天时段，每个账号每天随机一个时刻，模拟正常使用时刷新，
+        # 避免半夜集中刷新。仅在 access token 两小时内到期时才动作。
         window = cfg.get("sync_window") or ["10:00", "20:00"]
         in_window = len(window) == 2 and window[0] <= now.strftime("%H:%M") <= window[1]
+        if in_window:
+            today = now.strftime("%Y-%m-%d")
+            for aid, item in list(self.store.data["accounts"].items()):
+                status = self.store.data["account_status"].get(aid, {})
+                if not item["enabled"] or status.get("refresh_window_date") == today:
+                    continue
+                # 每个账号每天抽一个时刻（默认统计时段内），到点后当天不再考虑。
+                slot = status.get("refresh_slot")
+                if slot is None or status.get("refresh_slot_date") != today:
+                    lo = int(window[0][:2]) * 60 + int(window[0][3:])
+                    hi = max(lo, int(window[1][:2]) * 60 + int(window[1][3:]))
+                    minute = random.randint(lo, hi)
+                    slot = f"{minute // 60:02d}:{minute % 60:02d}"
+                    self.update(aid, refresh_slot=slot, refresh_slot_date=today)
+                if now.strftime("%H:%M") < slot:
+                    continue
+                row = next((r for r in self.store.account_rows() if r["id"] == aid), None)
+                self.update(aid, refresh_window_date=today)
+                if (row and row.get("refresh_available") and not row.get("expired")
+                        and status.get("token_refreshed", 0) < self.clock() - 86400
+                        and 0 < row["expires_at"] / 1000 - self.clock() < 7200):
+                    try:
+                        await asyncio.to_thread(self.operate, aid, "refresh")
+                    except HTTPException:
+                        pass
+        # 统计只在配置的时段内进行（默认 10:00-20:00 北京时间），夜间不发起积分查询。
         if in_window and self.clock() - self.last_sync > int(cfg.get("sync_interval", 1800)) and not self.jobs.locked():
             await self.batch("status")
             self.last_sync = self.clock()
