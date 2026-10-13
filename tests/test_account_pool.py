@@ -187,7 +187,8 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.store.data['pool']['checkin_time']='00:00'
         await self.pool.tick()
         self.assertEqual(self.checkin_posts,1)
-        self.assertNotIn(self.b,self.store.data['account_status'])
+        # Paused accounts still check in; they are only excluded from request routing.
+        self.assertIn(self.b,self.store.data['account_status'])
         restarted=AccountPool(self.store,clock=lambda:self.now,client_factory=self.pool.client_factory)
         await restarted.tick()
         self.assertEqual(self.checkin_posts,1)

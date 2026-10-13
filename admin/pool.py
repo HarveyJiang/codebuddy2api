@@ -229,7 +229,8 @@ class AccountPool:
     def operate(self, aid, action):
         with self.operation_lock(aid):
             item, previous = self.snapshot(aid)
-            if not item["enabled"]:
+            # 暂停只是不参与请求分配，签到与积分查询照常执行。
+            if not item["enabled"] and action not in ("checkin", "status"):
                 return {"id": aid, "ok": False, "message": "账号已暂停，未执行操作"}
             manager = self.store.manager_for(aid, item)
             try:
@@ -287,7 +288,7 @@ class AccountPool:
             raise HTTPException(409, "已有批量任务进行中，请稍后刷新")
         async with self.jobs:
             with self.store.lock:
-                ids = [aid for aid, item in self.store.data["accounts"].items() if item["enabled"]]
+                ids = list(self.store.data["accounts"])
             semaphore = asyncio.Semaphore(3)
             async def run(aid):
                 async with semaphore:
@@ -315,7 +316,7 @@ class AccountPool:
         now = datetime.fromtimestamp(self.clock(), CN)
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
-            due = [aid for aid, item in self.store.data["accounts"].items() if item["enabled"] and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800]
+            due = [aid for aid, item in self.store.data["accounts"].items() if self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800]
         if cfg["auto_checkin"]:
             window = int(cfg.get("checkin_window", 30))
             start = datetime.strptime(cfg["checkin_time"], "%H:%M")
