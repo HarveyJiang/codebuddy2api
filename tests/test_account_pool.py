@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from datetime import datetime
 from unittest.mock import Mock
 
 import httpx
@@ -11,8 +12,11 @@ from fastapi import HTTPException
 
 from core import converter
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity
-from test_admin_server import credential
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity, CN
+try:
+    from .test_admin_server import credential
+except ImportError:
+    from test_admin_server import credential
 
 
 class PoolTests(unittest.IsolatedAsyncioTestCase):
@@ -41,6 +45,60 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.pool=AccountPool(self.store,clock=lambda:self.now,client_factory=lambda:httpx.Client(transport=httpx.MockTransport(respond)))
         for aid,item in self.store.data['accounts'].items():
             self.store.manager_for(aid,item).get_headers=Mock(return_value={'X-Domain':'www.codebuddy.cn'})
+
+    def test_expiry_aware_routing_and_weights(self):
+        self.pool.update(self.a, remaining=100, packages=1, credits_updated=self.now,
+                         earliest_expiry=self.now + 3600, earliest_expiry_remaining=4.6)
+        self.pool.update(self.b, remaining=100, packages=1, credits_updated=self.now,
+                         earliest_expiry=self.now + 86400, earliest_expiry_remaining=100)
+        # Soonest-to-expire credits are consumed first.
+        self.assertEqual([self.pool.select()[0] for _ in range(2)], [self.a, self.b, self.a][:2])
+        # Weight overrides expiry ordering.
+        self.pool.update(self.b, weight=5)
+        self.assertEqual([self.pool.select()[0] for _ in range(2)], [self.b, self.a])
+        # Unknown expiry sorts after known ones within the same weight.
+        self.pool.update(self.a, weight=5, earliest_expiry=None)
+        self.assertEqual(self.pool.select()[0], self.b)
+
+    def test_summarize_packages_earliest_expiry(self):
+        result = summarize_packages([
+            {'CycleCapacityRemainPrecise': '4.61', 'CycleCapacitySizePrecise': '100', 'CycleEndTime': '2026-10-14 09:06:13'},
+            {'CycleCapacityRemainPrecise': '100', 'CycleCapacitySizePrecise': '100', 'CycleEndTime': '2026-10-15 09:00:47'},
+            {'CycleCapacityRemainPrecise': '0', 'CycleCapacitySizePrecise': '100', 'CycleEndTime': '2026-10-13 00:00:00'},
+            {'CycleCapacityRemainPrecise': '50', 'CycleCapacitySizePrecise': '50'},
+        ])
+        self.assertEqual(result['earliest_expiry'], datetime(2026, 10, 14, 9, 6, 13, tzinfo=CN).timestamp())
+        self.assertAlmostEqual(result['earliest_expiry_remaining'], 4.61)
+        self.assertEqual(result['remaining'], 154.61)
+
+    async def test_checkin_random_window_per_account(self):
+        self.store.data['pool']['auto_checkin'] = True
+        self.store.data['pool']['checkin_time'] = '09:00'
+        self.store.data['pool']['checkin_window'] = 30
+        # 09:10 Beijing time: inside the window.
+        now_cn = datetime(2026, 10, 14, 9, 10, tzinfo=CN)
+        self.now = now_cn.timestamp()
+        # Force a deterministic offset: one account due now, one later.
+        for aid, offset in ((self.a, 0), (self.b, 25)):
+            self.store.data['account_status'].setdefault(aid, {})
+            self.store.data['account_status'][aid]['checkin_offset'] = offset
+            self.store.data['account_status'][aid]['checkin_offset_date'] = '2026-10-14'
+        await self.pool.tick()
+        self.assertEqual(self.checkin_posts, 1)
+        self.assertIn(self.pool.checkin_offset(self.a, '2026-10-14', 30), range(31))
+
+    def test_key_daily_limit_blocks_after_quota(self):
+        kid, value = self.store.add_key('limited', daily_limit=2)
+        self.store.save()
+        self.assertEqual(self.store.check_api('Bearer ' + value, ''), kid)
+        for _ in range(2):
+            self.store.record_key_usage(kid)
+        with self.assertRaises(HTTPException) as ctx:
+            self.store.check_api('Bearer ' + value, '')
+        self.assertEqual(ctx.exception.status_code, 429)
+        # Unlimited key keeps working.
+        kid2, value2 = self.store.add_key('unlimited')
+        self.assertEqual(self.store.check_api('Bearer ' + value2, ''), kid2)
 
     async def asyncTearDown(self):
         self.tmp.cleanup()

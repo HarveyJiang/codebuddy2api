@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import math
+import random
 import threading
 import time
 from contextvars import ContextVar
@@ -30,9 +31,22 @@ def number(value):
     return max(Decimal(0), n)
 
 
+def package_expiry(p):
+    """Parse CycleEndTime (Beijing time) into a unix timestamp; None if absent/invalid."""
+    value = p.get("CycleEndTime")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN).timestamp()
+    except ValueError:
+        return None
+
+
 def summarize_packages(packages):
     remain = Decimal(0)
     size = Decimal(0)
+    earliest = None
+    earliest_remaining = None
     for p in packages:
         # Precise values carry fractional credit balances; cycle values are spendable now.
         prefix = "Cycle" if any(k in p for k in ["CycleCapacityRemainPrecise", "CycleCapacityRemain"]) else ""
@@ -40,9 +54,15 @@ def summarize_packages(packages):
             return p.get(prefix + name + "Precise", p.get(prefix + name, default))
         r = number(field("CapacityRemain"))
         capacity = number(field("CapacitySize", r))
-        remain += min(r, capacity) if capacity else r
+        spendable = min(r, capacity) if capacity else r
+        remain += spendable
         size += capacity
-    return {"remaining": float(remain), "capacity": float(size), "used": float(max(Decimal(0), size - remain)), "packages": len(packages)}
+        if spendable > 0:
+            expiry = package_expiry(p)
+            if expiry is not None and (earliest is None or expiry < earliest):
+                earliest, earliest_remaining = expiry, float(spendable)
+    return {"remaining": float(remain), "capacity": float(size), "used": float(max(Decimal(0), size - remain)), "packages": len(packages),
+            "earliest_expiry": earliest, "earliest_expiry_remaining": earliest_remaining}
 
 
 class BillingError(Exception):
@@ -60,9 +80,12 @@ class AccountPool:
         self.jobs = asyncio.Lock()
         self.last_sync = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00"})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
+            for item in store.data.get("keys", {}).values():
+                item.setdefault("daily_limit", None)
+                item.setdefault("usage", {})
             store.save()
 
     def operation_lock(self, aid):
@@ -100,10 +123,21 @@ class AccountPool:
             status = self.store.data["account_status"].get(row["id"], {})
             row.update({"pool_state": self.state(row), "remaining": status.get("remaining"), "credits_updated": status.get("credits_updated"),
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
+                        "earliest_expiry": status.get("earliest_expiry"), "earliest_expiry_remaining": status.get("earliest_expiry_remaining"),
+                        "weight": int(status.get("weight", 0)),
                         "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
                         "request_count": status.get("request_count", 0)})
         return rows
+
+    def order_candidates(self, candidates):
+        """Sort by weight desc, then earliest credit expiry asc so the soonest-to-expire
+        account is consumed first; unknown expiry sorts last within the same weight."""
+        def key(row):
+            status = self.store.data["account_status"].get(row["id"], {})
+            expiry = status.get("earliest_expiry")
+            return (-int(status.get("weight", 0)), expiry is None, expiry or 0)
+        return sorted(candidates, key=key)
 
     def select(self, affinity_key=None):
         with self.store.lock:
@@ -121,7 +155,8 @@ class AccountPool:
             if bound in {row["id"] for row in candidates}:
                 aid = bound
             else:
-                aid = candidates[self.cursor % len(candidates)]["id"]
+                ordered = self.order_candidates(candidates)
+                aid = ordered[self.cursor % len(ordered)]["id"]
                 self.cursor += 1
             if affinity_key:
                 if affinity_key not in bindings and len(bindings) >= 4096:
@@ -262,18 +297,37 @@ class AccountPool:
                         return {"id": aid, "ok": False, "message": "账号已移除"}
             return {"results": await asyncio.gather(*(run(aid) for aid in ids))}
 
+    def checkin_offset(self, aid, today, window_minutes):
+        """Per-account deterministic random minute offset within the daily window,
+        regenerated each day so签到时间不像固定整点那样容易被风控。"""
+        with self.store.lock:
+            status = self.store.data["account_status"].setdefault(aid, {})
+            offset = status.get("checkin_offset")
+            if offset is not None and status.get("checkin_offset_date") == today:
+                return offset
+            offset = random.randint(0, max(0, window_minutes))
+            status["checkin_offset"] = offset
+            status["checkin_offset_date"] = today
+            self.store.save()
+            return offset
+
     async def tick(self):
         now = datetime.fromtimestamp(self.clock(), CN)
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
             due = [aid for aid, item in self.store.data["accounts"].items() if item["enabled"] and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800]
-        if cfg["auto_checkin"] and now.strftime("%H:%M") >= cfg["checkin_time"]:
+        if cfg["auto_checkin"]:
+            window = int(cfg.get("checkin_window", 30))
+            start = datetime.strptime(cfg["checkin_time"], "%H:%M")
             for aid in due:
-                self.update(aid, auto_attempt=int(self.clock()))
-                try:
-                    await asyncio.to_thread(self.operate, aid, "checkin")
-                except HTTPException:
-                    pass
+                offset = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), window)
+                due_time = (start + timedelta(minutes=offset)).strftime("%H:%M")
+                if now.strftime("%H:%M") >= due_time:
+                    self.update(aid, auto_attempt=int(self.clock()))
+                    try:
+                        await asyncio.to_thread(self.operate, aid, "checkin")
+                    except HTTPException:
+                        pass
         if self.clock() - self.last_sync > 300 and not self.jobs.locked():
             await self.batch("status")
             self.last_sync = self.clock()
@@ -318,7 +372,7 @@ class PoolMiddleware:
             return await self.app(scope, receive, send)
         headers = dict(scope.get("headers", []))
         try:
-            self.pool.store.check_api(headers.get(b"authorization", b"").decode(), headers.get(b"x-api-key", b"").decode())
+            kid = self.pool.store.check_api(headers.get(b"authorization", b"").decode(), headers.get(b"x-api-key", b"").decode())
             raw = bytearray()
             while True:
                 message = await receive()
@@ -387,3 +441,5 @@ class PoolMiddleware:
         finally:
             REQUEST_CREDENTIAL.reset(token)
             self.pool.record(aid, status)
+            if kid is not None:
+                self.pool.store.record_key_usage(kid)

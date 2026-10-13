@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -173,19 +174,57 @@ class Store:
             result.append(row)
         return result
 
-    def add_key(self, name, value=None):
+    def add_key(self, name, value=None, daily_limit=None):
         value = value or "sk-wb-" + secrets.token_urlsafe(32)
         kid = secrets.token_hex(8)
-        self.data["keys"][kid] = {"name": name, "hash": digest(value), "hint": value[:5] + "…" + value[-4:], "created": int(time.time())}
+        limit = None
+        if daily_limit is not None:
+            try:
+                limit = int(daily_limit)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "每日上限需为整数")
+            if limit < 0:
+                raise HTTPException(400, "每日上限不能为负")
+        self.data["keys"][kid] = {"name": name, "hash": digest(value), "hint": value[:5] + "…" + value[-4:], "created": int(time.time()), "daily_limit": limit, "usage": {}}
         return kid, value
 
+    def _today(self):
+        return datetime.fromtimestamp(time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
     def check_api(self, authorization, x_api_key):
+        """Return the matching key id, or None for the legacy single admin key."""
         token = authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else x_api_key or ""
         with self.lock:
             hashed = digest(token)
-            allowed = hashed in self.test_keys or any(hmac.compare_digest(hashed, item["hash"]) for item in self.data["keys"].values())
-        if not allowed:
-            raise HTTPException(401, "invalid api key")
+            for kid, item in self.data["keys"].items():
+                if hmac.compare_digest(hashed, item["hash"]):
+                    usage = item.setdefault("usage", {})
+                    today = self._today()
+                    if usage.get("date") != today:
+                        usage.clear()
+                        usage["date"] = today
+                    limit = item.get("daily_limit")
+                    if limit is not None and usage.get("count", 0) >= limit:
+                        raise HTTPException(429, "该密钥今日请求数已达上限")
+                    return kid
+            if hashed in self.test_keys:
+                return None
+        raise HTTPException(401, "invalid api key")
+
+    def record_key_usage(self, kid, tokens=None):
+        with self.lock:
+            item = self.data["keys"].get(kid)
+            if not item:
+                return
+            usage = item.setdefault("usage", {})
+            today = self._today()
+            if usage.get("date") != today:
+                usage.clear()
+                usage["date"] = today
+            usage["count"] = usage.get("count", 0) + 1
+            if tokens:
+                usage["tokens"] = usage.get("tokens", 0) + int(tokens)
+            self.save()
 
     def require_admin(self, req):
         sid = req.cookies.get(COOKIE, "")
@@ -373,7 +412,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def overview(req: Request):
         store.require_admin(req)
         with store.lock:
-            keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
+            keys = [{"id": kid, "usage": {"date": store._today(), "count": 0, "tokens": 0}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
             return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
@@ -409,6 +448,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(body["checkin_time"], str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", body["checkin_time"]):
                     raise HTTPException(400, "请选择有效的签到时间")
                 settings["checkin_time"] = body["checkin_time"]
+            if "checkin_window" in body:
+                try:
+                    window = int(body["checkin_window"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "签到随机窗口无效")
+                if not 0 <= window <= 600:
+                    raise HTTPException(400, "签到随机窗口需在 0-600 分钟之间")
+                settings["checkin_window"] = window
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}
@@ -444,6 +491,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             new = dict(item)
             if "name" in body:
                 new["name"] = clean_name(body["name"], item["name"])
+            if "weight" in body:
+                try:
+                    weight = int(body["weight"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "权重需为整数")
+                if not 0 <= weight <= 100:
+                    raise HTTPException(400, "权重需在 0-100 之间")
+                with store.lock:
+                    store.data["account_status"].setdefault(aid, {})["weight"] = weight
             if "enabled" in body:
                 if type(body["enabled"]) is not bool:
                     raise HTTPException(400, "启用状态不正确")
@@ -493,9 +549,31 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         with store.lock:
             if len(store.data["keys"]) >= 100:
                 raise HTTPException(400, "最多保存 100 枚 API Key")
-            kid, key = store.add_key(name)
+            kid, key = store.add_key(name, daily_limit=body.get("daily_limit"))
             store.save()
         return {"id": kid, "key": key}
+
+    @app.patch("/admin/api/keys/{kid}")
+    async def edit_key(kid: str, req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        with store.lock:
+            item = store.data["keys"].get(kid)
+            if not item:
+                raise HTTPException(404, "密钥不存在")
+            if "daily_limit" in body:
+                if body["daily_limit"] in (None, ""):
+                    item["daily_limit"] = None
+                else:
+                    try:
+                        limit = int(body["daily_limit"])
+                    except (TypeError, ValueError):
+                        raise HTTPException(400, "每日上限需为整数")
+                    if limit < 0:
+                        raise HTTPException(400, "每日上限不能为负")
+                    item["daily_limit"] = limit
+            store.save()
+        return {"ok": True}
 
     @app.delete("/admin/api/keys/{kid}")
     async def revoke_key(kid: str, req: Request):

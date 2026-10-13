@@ -6,8 +6,14 @@ import httpx
 from fastapi import HTTPException
 
 from admin.browser_login import BASE, BrowserLogin
-import test_admin_server as admin_tests
-from test_admin_server import credential
+try:
+    from . import test_admin_server as admin_tests
+except ImportError:
+    import test_admin_server as admin_tests
+try:
+    from .test_admin_server import credential
+except ImportError:
+    from test_admin_server import credential
 
 
 class BrowserLoginTests(unittest.IsolatedAsyncioTestCase):
