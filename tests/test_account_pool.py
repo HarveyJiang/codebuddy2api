@@ -87,6 +87,29 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.checkin_posts, 1)
         self.assertIn(self.pool.checkin_offset(self.a, '2026-10-14', 30), range(31))
 
+    async def test_sync_only_inside_configured_window(self):
+        self.store.data['pool']['sync_window'] = ['10:00', '20:00']
+        self.store.data['pool']['sync_interval'] = 1800
+
+        async def status_call(_action=None):
+            self.pages.append('sync')
+        self.pool.batch = status_call
+        # 03:00 北京时间：夜间不同步。
+        self.now = datetime(2026, 10, 14, 3, 0, tzinfo=CN).timestamp()
+        self.pool.last_sync = 0
+        await self.pool.tick()
+        self.assertNotIn('sync', self.pages)
+        # 11:00：时段内同步。
+        self.now = datetime(2026, 10, 14, 11, 0, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        self.assertIn('sync', self.pages)
+        # 21:00：时段外不再同步。
+        self.pages.clear()
+        self.now = datetime(2026, 10, 14, 21, 0, tzinfo=CN).timestamp()
+        self.pool.last_sync = 0
+        await self.pool.tick()
+        self.assertNotIn('sync', self.pages)
+
     async def test_checkin_retry_cap_and_success_reset(self):
         self.store.data['pool']['auto_checkin'] = True
         self.store.data['pool']['checkin_time'] = '00:00'

@@ -464,6 +464,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 5 <= interval <= 1440:
                     raise HTTPException(400, "积分同步间隔需在 5-1440 分钟之间")
                 settings["sync_interval"] = interval * 60
+            if "sync_window" in body:
+                window = body["sync_window"]
+                pattern = r"(?:[01]\d|2[0-3]):[0-5]\d"
+                if (not isinstance(window, list) or len(window) != 2
+                        or not all(isinstance(t, str) and re.fullmatch(pattern, t) for t in window)):
+                    raise HTTPException(400, "统计时段需为两个 HH:MM 时间")
+                start, end = window
+                settings["sync_window"] = [start, end] if start <= end else [end, start]
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}

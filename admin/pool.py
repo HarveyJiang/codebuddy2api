@@ -84,7 +84,7 @@ class AccountPool:
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3, "sync_interval": 1800})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3, "sync_interval": 1800, "sync_window": ["10:00", "20:00"]})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -423,7 +423,10 @@ class AccountPool:
                     await asyncio.to_thread(self.operate, aid, "refresh")
                 except HTTPException:
                     pass
-        if self.clock() - self.last_sync > int(cfg.get("sync_interval", 1800)) and not self.jobs.locked():
+        # 统计只在配置的时段内进行（默认 10:00-20:00 北京时间），夜间不发起积分查询。
+        window = cfg.get("sync_window") or ["10:00", "20:00"]
+        in_window = len(window) == 2 and window[0] <= now.strftime("%H:%M") <= window[1]
+        if in_window and self.clock() - self.last_sync > int(cfg.get("sync_interval", 1800)) and not self.jobs.locked():
             await self.batch("status")
             self.last_sync = self.clock()
         self.flush()
