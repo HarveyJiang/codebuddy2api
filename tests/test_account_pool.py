@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from datetime import datetime
 from unittest.mock import Mock
@@ -124,27 +125,30 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('sync', self.pages)
 
     async def test_batch_checkin_spreads_requests(self):
-        import time as _time
-        times = []
-        def timing_operate(aid, action):
-            times.append(_time.monotonic())
-            return {'id': aid, 'ok': True, 'message': '签到成功'}
-        self.pool.operate = timing_operate
-        # 错峰开启：两个账号不会在同一瞬间发起。
-        self.store.data['pool']['batch_spread'] = 1
-        await self.pool.batch('checkin')
-        self.assertEqual(len(times), 2)
-        self.assertGreater(max(times) - min(times), 0.02)
-        # 错峰关闭：几乎同时发起。
-        self.store.data['pool']['batch_spread'] = 0
-        times.clear()
-        await self.pool.batch('checkin')
-        self.assertLess(max(times) - min(times), 0.05)
-        # status 动作不引入延迟。
-        self.store.data['pool']['batch_spread'] = 5
-        times.clear()
-        await self.pool.batch('status')
-        self.assertLess(max(times) - min(times), 0.05)
+        # 记录每次实际延迟的秒数，验证错峰参数真正生效（而非依赖时序竞态）。
+        delays = []
+        real_sleep = asyncio.sleep
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+            await real_sleep(0)
+        self.pool.operate = lambda aid, action: {'id': aid, 'ok': True, 'message': '签到成功'}
+        with unittest.mock.patch('admin.pool.asyncio.sleep', fake_sleep):
+            self.store.data['pool']['batch_spread'] = 90
+            await self.pool.batch('checkin')
+            self.assertEqual(len(delays), 2)
+            for delay in delays:
+                self.assertGreaterEqual(delay, 0)
+                self.assertLessEqual(delay, 90)
+            self.assertNotEqual(delays[0], delays[1])  # 各自随机，不重合
+            # 关闭错峰则不延迟。
+            delays.clear()
+            self.store.data['pool']['batch_spread'] = 0
+            await self.pool.batch('checkin')
+            self.assertEqual(delays, [])
+            # status 动作不引入延迟。
+            self.store.data['pool']['batch_spread'] = 90
+            await self.pool.batch('status')
+            self.assertEqual(delays, [])
 
     async def test_credential_refresh_spreads_within_day_window(self):
         calls = []
