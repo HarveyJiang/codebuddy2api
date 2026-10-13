@@ -456,6 +456,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 0 <= window <= 600:
                     raise HTTPException(400, "签到随机窗口需在 0-600 分钟之间")
                 settings["checkin_window"] = window
+            if "sync_interval" in body:
+                try:
+                    interval = int(body["sync_interval"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "积分同步间隔需为整数分钟")
+                if not 5 <= interval <= 1440:
+                    raise HTTPException(400, "积分同步间隔需在 5-1440 分钟之间")
+                settings["sync_interval"] = interval * 60
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}

@@ -55,7 +55,7 @@ function render() {
   const known = accounts.filter(a => a.remaining !== null && a.remaining !== undefined);
   $("total-credits").textContent = known.length ? known.reduce((s,a) => s + a.remaining, 0).toLocaleString("zh-CN", {maximumFractionDigits:2}) + (known.length < accounts.length ? "（部分）" : "") : "待查询";
   if (!$("pool-settings").contains(document.activeElement)) {
-    $("pool-routing").value = overview.pool?.routing || "manual"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("checkin-window").value = overview.pool?.checkin_window ?? 30;
+    $("pool-routing").value = overview.pool?.routing || "manual"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("checkin-window").value = overview.pool?.checkin_window ?? 30; $("sync-interval").value = Math.round((overview.pool?.sync_interval ?? 1800) / 60);
   }
   $("keys-body").innerHTML = keys.map(k => { const u = k.usage || {}; const limited = k.daily_limit !== null && k.daily_limit !== undefined; const ratio = limited && k.daily_limit > 0 ? (u.count || 0) / k.daily_limit : 0; const warn = ratio >= 1 ? "red" : ratio >= 0.8 ? "amber" : ""; return `<tr><td><strong>${esc(k.name)}</strong></td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td class="align-right"><div class="actions"><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`; }).join("");
   const selected = $("model").value || "deepseek-v4-flash";
@@ -136,8 +136,8 @@ async function batchAction(action) {
 }
 $("refresh").addEventListener("click", () => page === "accounts" ? batchAction("status") : refresh().catch(e=>toast(e.message)));
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,checkin_window:Number($("checkin-window").value)}});await refresh();toast("账号池设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
-setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },30000);
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,checkin_window:Number($("checkin-window").value),sync_interval:Number($("sync-interval").value)}});await refresh();toast("账号池设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);
 document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 $("go-guide").addEventListener("click", () => goPage("guide"));
 document.querySelectorAll(".close-dialog").forEach(b => b.addEventListener("click", () => b.closest("dialog").close()));

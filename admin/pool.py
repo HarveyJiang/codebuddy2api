@@ -84,7 +84,7 @@ class AccountPool:
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3, "sync_interval": 1800})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -116,7 +116,7 @@ class AccountPool:
                     if not history or history[-1].get("date") != today:
                         history.append({"date": today, "samples": []})
                     history[-1]["samples"].append([int(self.clock()), round(old - new, 2)])
-                    # 只保留最近 30 天，且每天最多 288 个采样点（5 分钟同步一次的量级）。
+                    # 只保留最近 30 天，每天最多 288 个采样点（足够覆盖 5 分钟~30 分钟同步频率）。
                     del history[:-30]
                     if len(history[-1]["samples"]) > 288:
                         del history[-1]["samples"][:len(history[-1]["samples"]) - 288]
@@ -423,7 +423,7 @@ class AccountPool:
                     await asyncio.to_thread(self.operate, aid, "refresh")
                 except HTTPException:
                     pass
-        if self.clock() - self.last_sync > 300 and not self.jobs.locked():
+        if self.clock() - self.last_sync > int(cfg.get("sync_interval", 1800)) and not self.jobs.locked():
             await self.batch("status")
             self.last_sync = self.clock()
         self.flush()
