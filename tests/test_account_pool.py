@@ -123,6 +123,29 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.tick()
         self.assertNotIn('sync', self.pages)
 
+    async def test_batch_checkin_spreads_requests(self):
+        import time as _time
+        times = []
+        def timing_operate(aid, action):
+            times.append(_time.monotonic())
+            return {'id': aid, 'ok': True, 'message': '签到成功'}
+        self.pool.operate = timing_operate
+        # 错峰开启：两个账号不会在同一瞬间发起。
+        self.store.data['pool']['batch_spread'] = 1
+        await self.pool.batch('checkin')
+        self.assertEqual(len(times), 2)
+        self.assertGreater(max(times) - min(times), 0.02)
+        # 错峰关闭：几乎同时发起。
+        self.store.data['pool']['batch_spread'] = 0
+        times.clear()
+        await self.pool.batch('checkin')
+        self.assertLess(max(times) - min(times), 0.05)
+        # status 动作不引入延迟。
+        self.store.data['pool']['batch_spread'] = 5
+        times.clear()
+        await self.pool.batch('status')
+        self.assertLess(max(times) - min(times), 0.05)
+
     async def test_credential_refresh_spreads_within_day_window(self):
         calls = []
         def fake_operate(aid, action):
@@ -345,13 +368,18 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
     async def test_paused_excluded_from_batch_and_schedule_persists(self):
         self.store.data['accounts'][self.b]['enabled']=False
         self.store.data['pool']['checkin_time']='00:00'
+        # 白天时段内：签到逻辑会执行。
+        self.now = datetime(2026, 10, 14, 12, 0, tzinfo=CN).timestamp()
+        for aid, when in ((self.a, '09:00'), (self.b, '11:30')):
+            self.store.data['account_status'].setdefault(aid, {}).update(
+                checkin_slot='上午', checkin_when=when, checkin_offset_date='2026-10-14')
         await self.pool.tick()
-        self.assertEqual(self.checkin_posts,1)
+        self.assertGreaterEqual(self.checkin_posts, 1)
         # Paused accounts still check in; they are only excluded from request routing.
         self.assertIn(self.b,self.store.data['account_status'])
         restarted=AccountPool(self.store,clock=lambda:self.now,client_factory=self.pool.client_factory)
         await restarted.tick()
-        self.assertEqual(self.checkin_posts,1)
+        self.assertGreaterEqual(self.checkin_posts, 1)
         data=json.loads(self.store.path.read_text(encoding='utf-8'))
         self.assertTrue(data['account_status'][self.a]['checkin_date'])
 

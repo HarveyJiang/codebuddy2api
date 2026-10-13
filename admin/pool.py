@@ -84,7 +84,7 @@ class AccountPool:
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "sync_interval": 1800, "sync_window": ["10:00", "20:00"]})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "sync_interval": 1800, "sync_window": ["10:00", "20:00"], "batch_spread": 90})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -372,6 +372,11 @@ class AccountPool:
                 ids = list(self.store.data["accounts"])
             semaphore = asyncio.Semaphore(3)
             async def run(aid):
+                # 批量签到错峰：每个账号在 0~spread 秒内随机延迟后再发起，避免同时打满上游。
+                if action == "checkin":
+                    spread = max(0, int(self.store.data["pool"].get("batch_spread", 90)))
+                    if spread:
+                        await asyncio.sleep(random.uniform(0, spread))
                 async with semaphore:
                     try:
                         return await asyncio.to_thread(self.operate, aid, action)

@@ -464,6 +464,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     raise HTTPException(400, "统计时段需为两个 HH:MM 时间")
                 start, end = window
                 settings["sync_window"] = [start, end] if start <= end else [end, start]
+            if "batch_spread" in body:
+                try:
+                    spread = int(body["batch_spread"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "批量签到错峰需为整数秒")
+                if not 0 <= spread <= 600:
+                    raise HTTPException(400, "批量签到错峰需在 0-600 秒之间")
+                settings["batch_spread"] = spread
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}

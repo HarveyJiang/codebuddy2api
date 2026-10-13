@@ -55,7 +55,7 @@ function render() {
   const known = accounts.filter(a => a.remaining !== null && a.remaining !== undefined);
   $("total-credits").textContent = known.length ? known.reduce((s,a) => s + a.remaining, 0).toLocaleString("zh-CN", {maximumFractionDigits:2}) + (known.length < accounts.length ? "（部分）" : "") : "待查询";
   if (!$("pool-settings").contains(document.activeElement)) {
-    $("pool-routing").value = overview.pool?.routing || "manual"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("sync-interval").value = Math.round((overview.pool?.sync_interval ?? 1800) / 60); const w = overview.pool?.sync_window || ["10:00","20:00"]; $("sync-start").value = w[0]; $("sync-end").value = w[1];
+    $("pool-routing").value = overview.pool?.routing || "manual"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("sync-interval").value = Math.round((overview.pool?.sync_interval ?? 1800) / 60); $("batch-spread").value = overview.pool?.batch_spread ?? 90; const w = overview.pool?.sync_window || ["10:00","20:00"]; $("sync-start").value = w[0]; $("sync-end").value = w[1];
   }
   $("keys-body").innerHTML = keys.map(k => { const u = k.usage || {}; const limited = k.daily_limit !== null && k.daily_limit !== undefined; const ratio = limited && k.daily_limit > 0 ? (u.count || 0) / k.daily_limit : 0; const warn = ratio >= 1 ? "red" : ratio >= 0.8 ? "amber" : ""; return `<tr><td><strong>${esc(k.name)}</strong></td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td class="align-right"><div class="actions"><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`; }).join("");
   const selected = $("model").value || "deepseek-v4-flash";
@@ -127,16 +127,19 @@ $("login-form").addEventListener("submit", async e => {
 $("logout").addEventListener("click", async () => { try { await api("logout", {method:"POST"}); showLogin(); } catch (e) { toast(e.message); } });
 async function batchAction(action) {
   $("refresh").disabled = $("batch-checkin").disabled = true;
+  const spread = Math.max(0, Number(overview.pool?.batch_spread ?? 90));
+  const original = $("batch-checkin").textContent;
+  if (action === "checkin" && spread) { $("batch-checkin").textContent = `分批签到中…（≤${spread}s）`; }
   try {
     const result = await api("pool/actions/"+action,{method:"POST"});
     $("pool-result").hidden = false;
     $("pool-result").textContent = result.results.map(r => `${overview.accounts.find(a=>a.id===r.id)?.name || "账号"}：${r.message}`).join("；") || "没有启用的账号";
     await refresh();
-  } catch(e) { toast(e.message); } finally { $("refresh").disabled = $("batch-checkin").disabled = false; }
+  } catch(e) { toast(e.message); } finally { $("refresh").disabled = $("batch-checkin").disabled = false; $("batch-checkin").textContent = original; }
 }
 $("refresh").addEventListener("click", () => page === "accounts" ? batchAction("status") : refresh().catch(e=>toast(e.message)));
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,sync_interval:Number($("sync-interval").value),sync_window:[$("sync-start").value,$("sync-end").value]}});await refresh();toast("账号池设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,sync_interval:Number($("sync-interval").value),sync_window:[$("sync-start").value,$("sync-end").value],batch_spread:Number($("batch-spread").value)}});await refresh();toast("账号池设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);
 document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 $("go-guide").addEventListener("click", () => goPage("guide"));
