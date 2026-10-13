@@ -448,14 +448,6 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(body["checkin_time"], str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", body["checkin_time"]):
                     raise HTTPException(400, "请选择有效的签到时间")
                 settings["checkin_time"] = body["checkin_time"]
-            if "checkin_window" in body:
-                try:
-                    window = int(body["checkin_window"])
-                except (TypeError, ValueError):
-                    raise HTTPException(400, "签到随机窗口无效")
-                if not 0 <= window <= 600:
-                    raise HTTPException(400, "签到随机窗口需在 0-600 分钟之间")
-                settings["checkin_window"] = window
             if "sync_interval" in body:
                 try:
                     interval = int(body["sync_interval"])

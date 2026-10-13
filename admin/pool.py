@@ -84,7 +84,7 @@ class AccountPool:
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3, "sync_interval": 1800, "sync_window": ["10:00", "20:00"]})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "sync_interval": 1800, "sync_window": ["10:00", "20:00"]})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -183,6 +183,7 @@ class AccountPool:
                         "daily_rate": consumption["daily_rate"] if consumption else None,
                         "days_to_empty": round(remaining / consumption["daily_rate"], 1) if consumption and isinstance(remaining, (int, float)) and consumption["daily_rate"] > 0 else None,
                         "expire_unused": expire_unused,
+                        "checkin_slot": status.get("checkin_slot"), "checkin_when": status.get("checkin_when"),
                         "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
                         "request_count": status.get("request_count", 0)})
@@ -378,19 +379,30 @@ class AccountPool:
                         return {"id": aid, "ok": False, "message": "账号已移除"}
             return {"results": await asyncio.gather(*(run(aid) for aid in ids))}
 
+    CHECKIN_SLOTS = [("上午", "08:00", "11:00"), ("中午", "11:00", "14:00"), ("下午", "14:00", "18:00"), ("晚间", "18:00", "22:00")]
+
     def checkin_offset(self, aid, today, window_minutes):
-        """Per-account deterministic random minute offset within the daily window,
-        regenerated each day so签到时间不像固定整点那样容易被风控。"""
+        """每账号每天在上午/中午/下午/晚间中随机选一个时段，再在时段内随机取分钟，
+        全天分散签到，避免所有账号集中在同一时刻触发风控。返回 (时段名, HH:MM)。"""
         with self.store.lock:
             status = self.store.data["account_status"].setdefault(aid, {})
-            offset = status.get("checkin_offset")
-            if offset is not None and status.get("checkin_offset_date") == today:
-                return offset
-            offset = random.randint(0, max(0, window_minutes))
-            status["checkin_offset"] = offset
+            slot = status.get("checkin_slot")
+            when = status.get("checkin_when")
+            if when and status.get("checkin_offset_date") == today:
+                return slot, when
+            name, start, end = random.choice(self.CHECKIN_SLOTS)
+            lo = int(start[:2]) * 60 + int(start[3:])
+            hi = int(end[:2]) * 60 + int(end[3:])
+            # 每个时段内再取一个不早于配置签到时间的随机点。
+            floor = int(self.store.data["pool"].get("checkin_time", "09:00")[:2]) * 60 + int(self.store.data["pool"].get("checkin_time", "09:00")[3:])
+            lo = max(lo, floor) if floor < hi else lo
+            minute = random.randint(lo, max(lo, hi))
+            when = f"{minute // 60:02d}:{minute % 60:02d}"
+            status["checkin_slot"] = name
+            status["checkin_when"] = when
             status["checkin_offset_date"] = today
-            self.store.save()
-            return offset
+            self.dirty = True
+            return name, when
 
     async def tick(self):
         now = datetime.fromtimestamp(self.clock(), CN)
@@ -398,11 +410,8 @@ class AccountPool:
             cfg = dict(self.store.data["pool"])
             due = [aid for aid, item in self.store.data["accounts"].items() if self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
         if cfg["auto_checkin"]:
-            window = int(cfg.get("checkin_window", 30))
-            start = datetime.strptime(cfg["checkin_time"], "%H:%M")
             for aid in due:
-                offset = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), window)
-                due_time = (start + timedelta(minutes=offset)).strftime("%H:%M")
+                _, due_time = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), 0)
                 if now.strftime("%H:%M") >= due_time:
                     self.update(aid, auto_attempt=int(self.clock()))
                     try:

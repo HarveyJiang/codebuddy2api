@@ -71,21 +71,34 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result['earliest_expiry_remaining'], 4.61)
         self.assertEqual(result['remaining'], 154.61)
 
-    async def test_checkin_random_window_per_account(self):
+    async def test_checkin_spreads_across_day_slots(self):
         self.store.data['pool']['auto_checkin'] = True
         self.store.data['pool']['checkin_time'] = '09:00'
-        self.store.data['pool']['checkin_window'] = 30
-        # 09:10 Beijing time: inside the window.
-        now_cn = datetime(2026, 10, 14, 9, 10, tzinfo=CN)
-        self.now = now_cn.timestamp()
-        # Force a deterministic offset: one account due now, one later.
-        for aid, offset in ((self.a, 0), (self.b, 25)):
-            self.store.data['account_status'].setdefault(aid, {})
-            self.store.data['account_status'][aid]['checkin_offset'] = offset
-            self.store.data['account_status'][aid]['checkin_offset_date'] = '2026-10-14'
+        # Pin account b to an evening slot, account a to a morning slot.
+        a = self.store.data['account_status'].setdefault(self.a, {})
+        a.update(checkin_slot='上午', checkin_when='09:10', checkin_offset_date='2026-10-14')
+        b = self.store.data['account_status'].setdefault(self.b, {})
+        b.update(checkin_slot='晚间', checkin_when='19:30', checkin_offset_date='2026-10-14')
+        # 09:30: only the morning account is due.
+        self.now = datetime(2026, 10, 14, 9, 30, tzinfo=CN).timestamp()
         await self.pool.tick()
         self.assertEqual(self.checkin_posts, 1)
-        self.assertIn(self.pool.checkin_offset(self.a, '2026-10-14', 30), range(31))
+        # 19:45: the evening account fires too.
+        self.checked = False  # 上游按账号返回状态，重置以免误判 b 已签到
+        self.now = datetime(2026, 10, 14, 19, 45, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        self.assertEqual(self.checkin_posts, 2)
+
+    def test_checkin_slots_cover_all_day_and_respect_floor(self):
+        self.store.data['pool']['checkin_time'] = '09:00'
+        for _ in range(120):
+            slot, when = self.pool.checkin_offset(self.a, '2026-10-14', 0)
+            self.assertIn(slot, [s[0] for s in self.pool.CHECKIN_SLOTS])
+            self.assertGreaterEqual(when, '09:00')
+            self.assertLessEqual(when, '22:00')
+            # Same day returns the same slot.
+            self.assertEqual(self.pool.checkin_offset(self.a, '2026-10-14', 0), (slot, when))
+            self.store.data['account_status'][self.a].pop('checkin_offset_date')
 
     async def test_sync_only_inside_configured_window(self):
         self.store.data['pool']['sync_window'] = ['10:00', '20:00']
@@ -113,10 +126,10 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
     async def test_checkin_retry_cap_and_success_reset(self):
         self.store.data['pool']['auto_checkin'] = True
         self.store.data['pool']['checkin_time'] = '00:00'
-        self.store.data['pool']['checkin_window'] = 0
         status = self.store.data['account_status'].setdefault(self.a, {})
         status['checkin_fails'] = 5
-        status['checkin_offset'] = 0
+        status['checkin_slot'] = '上午'
+        status['checkin_when'] = '00:00'
         status['checkin_offset_date'] = '2026-10-14'
         # Also pin b so it does not check in and pollute the counter.
         bstatus = self.store.data['account_status'].setdefault(self.b, {})
