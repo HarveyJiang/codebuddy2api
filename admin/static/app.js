@@ -57,7 +57,7 @@ function render() {
   if (!$("pool-settings").contains(document.activeElement)) {
     $("pool-routing").value = overview.pool?.routing || "manual"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("checkin-window").value = overview.pool?.checkin_window ?? 30;
   }
-  $("keys-body").innerHTML = keys.map(k => { const u = k.usage || {}; const limited = k.daily_limit !== null && k.daily_limit !== undefined; return `<tr><td><strong>${esc(k.name)}</strong></td><td><code>${esc(k.hint)}</code></td><td>${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small></td><td class="align-right"><div class="actions"><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`; }).join("");
+  $("keys-body").innerHTML = keys.map(k => { const u = k.usage || {}; const limited = k.daily_limit !== null && k.daily_limit !== undefined; const ratio = limited && k.daily_limit > 0 ? (u.count || 0) / k.daily_limit : 0; const warn = ratio >= 1 ? "red" : ratio >= 0.8 ? "amber" : ""; return `<tr><td><strong>${esc(k.name)}</strong></td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td class="align-right"><div class="actions"><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`; }).join("");
   const selected = $("model").value || "deepseek-v4-flash";
   $("model").replaceChildren(...models.map(model => { const o = document.createElement("option"); o.value = o.textContent = model; return o; }));
   if (models.includes(selected)) $("model").value = selected;
@@ -91,7 +91,17 @@ $("dash-base").textContent=location.origin+"/v1";
 $("dash-copy").addEventListener("click",()=>copy(location.origin+"/v1"));
 function renderAccounts() {
   const query = $("account-search").value.toLowerCase(), filter = $("account-filter").value;
-  const rows = overview.accounts.filter(a => (!query || [a.name,a.nickname,a.uid].join(" ").toLowerCase().includes(query)) && (filter === "all" || a.pool_state === filter));
+  // 快过期的排前面：先按最早过期时间升序，再按状态严重度，最后按剩余积分升序。
+  const severity = {invalid: 0, exhausted: 1, cooling: 2, paused: 3, available: 4};
+  const rows = overview.accounts
+    .filter(a => (!query || [a.name,a.nickname,a.uid].join(" ").toLowerCase().includes(query)) && (filter === "all" || a.pool_state === filter))
+    .sort((x, y) => {
+      const xe = x.earliest_expiry ?? Infinity, ye = y.earliest_expiry ?? Infinity;
+      if (xe !== ye) return xe - ye;
+      const xs = severity[x.pool_state] ?? 9, ys = severity[y.pool_state] ?? 9;
+      if (xs !== ys) return xs - ys;
+      return (x.remaining ?? Infinity) - (y.remaining ?? Infinity);
+    });
   const labels = {available:["可用","green"],cooling:["冷却中","amber"],paused:["已暂停",""],exhausted:["积分耗尽","amber"],invalid:["凭据异常","red"]};
   $("accounts-body").innerHTML = rows.map(a => {
     const status = labels[a.pool_state] || ["待查询", ""];

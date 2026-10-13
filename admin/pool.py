@@ -79,6 +79,10 @@ class AccountPool:
         self.cursor = 0
         self.jobs = asyncio.Lock()
         self.last_sync = 0
+        self.affinity_hits = 0
+        self.affinity_rebinds = 0
+        self.dirty = False
+        self.last_flush = 0
         with store.lock:
             store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3})
             store.data.setdefault("account_status", {})
@@ -103,7 +107,15 @@ class AccountPool:
         with self.store.lock:
             if aid in self.store.data["accounts"]:
                 self.store.data["account_status"].setdefault(aid, {}).update(values)
+                self.dirty = True
+
+    def flush(self, force=False):
+        """Debounced persistence: per-request updates only mark dirty; tick flushes every 5s."""
+        with self.store.lock:
+            if self.dirty and (force or self.clock() - self.last_flush >= 5):
                 self.store.save()
+                self.dirty = False
+                self.last_flush = self.clock()
 
     def state(self, row):
         status = self.store.data["account_status"].get(row["id"], {})
@@ -155,6 +167,7 @@ class AccountPool:
             if bound in {row["id"] for row in candidates} and self.store.data["pool"]["routing"] != "manual":
                 # 亲和默认保持以命中上游缓存；但若绑定账号的最早过期积分离过期还远，
                 # 而其他账号的积分将在阈值内过期，则改绑过去，避免积分白白清零。
+                self.affinity_hits += 1
                 threshold = now + int(self.store.data["pool"].get("affinity_expiry_days", 3)) * 86400
                 status_of = self.store.data["account_status"]
                 bound_expiry = status_of.get(bound, {}).get("earliest_expiry")
@@ -163,6 +176,7 @@ class AccountPool:
                           and expiry <= threshold]
                 if urgent and (bound_expiry is None or bound_expiry > threshold):
                     bound = min(urgent, key=lambda row: status_of[row["id"]]["earliest_expiry"])["id"]
+                    self.affinity_rebinds += 1
                     bindings[affinity_key] = {"account_id": bound, "expires": now + 86400}
             if bound in {row["id"] for row in candidates}:
                 aid = bound
@@ -184,11 +198,19 @@ class AccountPool:
             data = self.store.data["account_status"].setdefault(aid, {})
             data["request_count"] = data.get("request_count", 0) + 1
             data["last_request"] = int(self.clock())
-            if status in (401, 403):
-                data.update(cooldown_until=self.clock() + 300, last_error="上游认证或访问被拒绝，已冷却 5 分钟")
-            elif status in (402, 429):
-                data.update(cooldown_until=self.clock() + 1800, last_error="上游额度或频率限制，已冷却 30 分钟")
-            self.store.save()
+            if status in (401, 403, 402, 429):
+                # 指数退避：连续失败翻倍冷却时长，上限 2 小时；成功请求重置计数。
+                fails = data.get("consecutive_fails", 0) + 1
+                data["consecutive_fails"] = fails
+                base = 300 if status in (401, 403) else 1800
+                cooldown = min(base * (2 ** (fails - 1)), 7200)
+                label = "上游认证或访问被拒绝" if status in (401, 403) else "上游额度或频率限制"
+                data.update(cooldown_until=self.clock() + cooldown, last_error=f"{label}，已冷却 {cooldown // 60} 分钟")
+                if status == 402:
+                    data["credits_updated"] = 0  # 触发下个周期立即重新查询积分
+            else:
+                data["consecutive_fails"] = 0
+            self.dirty = True
 
     def billing(self, client, headers, path, body=None):
         response = client.post(BILLING + path, headers=headers, json=body or {})
@@ -328,7 +350,7 @@ class AccountPool:
         now = datetime.fromtimestamp(self.clock(), CN)
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
-            due = [aid for aid, item in self.store.data["accounts"].items() if self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800]
+            due = [aid for aid, item in self.store.data["accounts"].items() if self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
         if cfg["auto_checkin"]:
             window = int(cfg.get("checkin_window", 30))
             start = datetime.strptime(cfg["checkin_time"], "%H:%M")
@@ -338,12 +360,27 @@ class AccountPool:
                 if now.strftime("%H:%M") >= due_time:
                     self.update(aid, auto_attempt=int(self.clock()))
                     try:
-                        await asyncio.to_thread(self.operate, aid, "checkin")
+                        result = await asyncio.to_thread(self.operate, aid, "checkin")
+                        fails = 0 if result.get("ok") else self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) + 1
+                        self.update(aid, checkin_fails=fails)
                     except HTTPException:
                         pass
+        # 低峰凭据预刷新：expiresAt 2 小时内到期的账号提前刷新，避免请求撞上 401 再冷却。
+        if now.hour in (4, 5):
+            stale = [aid for aid, item in self.store.data["accounts"].items()
+                     if item["enabled"] and self.store.data["account_status"].get(aid, {}).get("token_refreshed", 0) < self.clock() - 86400
+                     and (row := next((r for r in self.store.account_rows() if r["id"] == aid), None))
+                     and row.get("refresh_available") and not row.get("expired")
+                     and 0 < row["expires_at"] / 1000 - self.clock() < 7200]
+            for aid in stale:
+                try:
+                    await asyncio.to_thread(self.operate, aid, "refresh")
+                except HTTPException:
+                    pass
         if self.clock() - self.last_sync > 300 and not self.jobs.locked():
             await self.batch("status")
             self.last_sync = self.clock()
+        self.flush()
 
 
 def request_affinity(headers, body):
@@ -427,6 +464,13 @@ class PoolMiddleware:
         token = REQUEST_CREDENTIAL.set(manager)
         status = 200
         buffer = b""
+        usage_tokens = 0
+        def extract_usage(obj):
+            nonlocal usage_tokens
+            usage = obj.get("usage") if isinstance(obj, dict) else None
+            total = usage.get("total_tokens") if isinstance(usage, dict) else None
+            if isinstance(total, (int, float)):
+                usage_tokens = max(usage_tokens, int(total))  # 流式里 usage 块通常在最后，取最大值即总量
         async def observe(message):
             nonlocal status, buffer
             if message["type"] == "http.response.start":
@@ -438,6 +482,7 @@ class PoolMiddleware:
                     if line.startswith(b"data:"):
                         try:
                             obj = json.loads(line[5:])
+                            extract_usage(obj.get("response") or obj)
                             err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
                             code = err.get("code") if isinstance(err, dict) else None
                             if isinstance(code, str) and code.isdigit():
@@ -455,4 +500,5 @@ class PoolMiddleware:
             REQUEST_CREDENTIAL.reset(token)
             self.pool.record(aid, status)
             if kid is not None:
-                self.pool.store.record_key_usage(kid)
+                self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
+            self.pool.flush()

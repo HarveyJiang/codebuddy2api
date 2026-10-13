@@ -87,6 +87,21 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.checkin_posts, 1)
         self.assertIn(self.pool.checkin_offset(self.a, '2026-10-14', 30), range(31))
 
+    async def test_checkin_retry_cap_and_success_reset(self):
+        self.store.data['pool']['auto_checkin'] = True
+        self.store.data['pool']['checkin_time'] = '00:00'
+        self.store.data['pool']['checkin_window'] = 0
+        status = self.store.data['account_status'].setdefault(self.a, {})
+        status['checkin_fails'] = 5
+        status['checkin_offset'] = 0
+        status['checkin_offset_date'] = '2026-10-14'
+        # Also pin b so it does not check in and pollute the counter.
+        bstatus = self.store.data['account_status'].setdefault(self.b, {})
+        bstatus['checkin_date'] = '2026-10-14'
+        self.now = datetime(2026, 10, 14, 10, 0, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        self.assertEqual(self.checkin_posts, 0)  # failed 5 times today: stop retrying
+
     def test_key_daily_limit_blocks_after_quota(self):
         kid, value = self.store.add_key('limited', daily_limit=2)
         self.store.save()
@@ -139,6 +154,40 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.now += 86401
         self.pool.select()
         self.assertNotIn(key, self.store.data['session_bindings'])
+
+    def test_record_exponential_backoff_and_reset(self):
+        self.pool.record(self.a, 429)
+        first = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertEqual(first - self.now, 1800)
+        self.now += 1
+        self.pool.record(self.a, 429)
+        second = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertEqual(second - self.now, 3600)
+        self.now += 1
+        self.pool.record(self.a, 429)
+        third = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertEqual(third - self.now, 7200)  # capped at 2h
+        self.pool.record(self.a, 200)
+        self.assertEqual(self.store.data['account_status'][self.a]['consecutive_fails'], 0)
+        # 402 invalidates credit freshness so next sync re-queries immediately.
+        self.pool.update(self.a, credits_updated=self.now)
+        self.pool.record(self.a, 402)
+        self.assertEqual(self.store.data['account_status'][self.a]['credits_updated'], 0)
+
+    def test_flush_debounce_and_force(self):
+        self.pool.update(self.a, last_error=None)
+        self.assertTrue(self.pool.dirty)
+        self.pool.flush()
+        self.assertFalse(self.pool.dirty)
+        self.pool.update(self.a, last_error='x')
+        self.pool.flush()  # within 5s window: no write
+        self.assertTrue(self.pool.dirty)
+        self.now += 6
+        self.pool.flush()
+        self.assertFalse(self.pool.dirty)
+        self.pool.update(self.a, last_error='y')
+        self.pool.flush(force=True)
+        self.assertFalse(self.pool.dirty)
 
     def test_affinity_rebinds_to_soonest_expiring_account(self):
         key = request_affinity({b'authorization': b'Bearer api-test'}, {'model': 'm', 'prompt_cache_key': 'session-one'})
