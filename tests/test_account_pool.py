@@ -140,6 +140,27 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.pool.select()
         self.assertNotIn(key, self.store.data['session_bindings'])
 
+    def test_affinity_rebinds_to_soonest_expiring_account(self):
+        key = request_affinity({b'authorization': b'Bearer api-test'}, {'model': 'm', 'prompt_cache_key': 'session-one'})
+        self.pool.select(key)
+        # Bound account's credits expire far out; another account expires within 3 days → rebind.
+        self.pool.update(self.a, earliest_expiry=self.now + 30*86400, remaining=100, packages=1, credits_updated=self.now)
+        self.pool.update(self.b, earliest_expiry=self.now + 2*86400, remaining=100, packages=1, credits_updated=self.now)
+        self.assertEqual(self.pool.select(key)[0], self.b)
+        # Both far from expiry → affinity stays.
+        self.pool.update(self.b, earliest_expiry=self.now + 10*86400)
+        self.assertEqual(self.pool.select(key)[0], self.b)
+        # Bound account itself is the urgent one → no rebind away from it.
+        self.pool.update(self.b, earliest_expiry=self.now + 2*86400)
+        self.pool.update(self.a, earliest_expiry=self.now + 10*86400)
+        # b was bound above; its own credits expire soon, keep affinity for cache hits.
+        self.assertEqual(self.pool.select(key)[0], self.b)
+        # Threshold disabled (0) → affinity always stays.
+        self.store.data['pool']['affinity_expiry_days'] = 0
+        self.pool.update(self.b, earliest_expiry=self.now + 30*86400)
+        self.pool.update(self.a, earliest_expiry=self.now + 86400)
+        self.assertEqual(self.pool.select(key)[0], self.b)
+
     def test_affinity_is_scoped_to_caller_model_and_session(self):
         headers = {b'authorization': b'Bearer one'}
         body = {'model': 'm', 'prompt_cache_key': 'secret-session'}

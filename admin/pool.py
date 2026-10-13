@@ -80,7 +80,7 @@ class AccountPool:
         self.jobs = asyncio.Lock()
         self.last_sync = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "checkin_window": 30, "affinity_expiry_days": 3})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -152,6 +152,18 @@ class AccountPool:
                 if bindings[key].get("expires", 0) <= now:
                     del bindings[key]
             bound = bindings.get(affinity_key, {}).get("account_id")
+            if bound in {row["id"] for row in candidates} and self.store.data["pool"]["routing"] != "manual":
+                # 亲和默认保持以命中上游缓存；但若绑定账号的最早过期积分离过期还远，
+                # 而其他账号的积分将在阈值内过期，则改绑过去，避免积分白白清零。
+                threshold = now + int(self.store.data["pool"].get("affinity_expiry_days", 3)) * 86400
+                status_of = self.store.data["account_status"]
+                bound_expiry = status_of.get(bound, {}).get("earliest_expiry")
+                urgent = [row for row in candidates if row["id"] != bound
+                          and (expiry := status_of.get(row["id"], {}).get("earliest_expiry")) is not None
+                          and expiry <= threshold]
+                if urgent and (bound_expiry is None or bound_expiry > threshold):
+                    bound = min(urgent, key=lambda row: status_of[row["id"]]["earliest_expiry"])["id"]
+                    bindings[affinity_key] = {"account_id": bound, "expires": now + 86400}
             if bound in {row["id"] for row in candidates}:
                 aid = bound
             else:
