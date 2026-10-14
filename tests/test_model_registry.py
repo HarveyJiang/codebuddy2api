@@ -96,10 +96,13 @@ class ModelRegistryTests(unittest.TestCase):
         snap = registry.snapshot()
         ids = [m["id"] for m in snap["models"]]
         # disabled 上游模型与不在 cli agent 列表里的 ghost 均不出现；
-        # 三档智能路由固定附加在末尾。
-        self.assertEqual(ids, ["glm-5.2", "step-5-preview", "space-bunny",
-                               "fast-model", "balanced-model", "deep-model"])
-        glm = snap["models"][0]
+        # 三档智能路由固定附加；展示按单价升序（None 视为 0）。
+        self.assertEqual(ids, ["step-5-preview", "space-bunny", "fast-model",
+                               "balanced-model", "glm-5.2", "deep-model"])
+        # 上游无 descriptionZh 时用内置中文描述兜底，且不掺英文。
+        self.assertEqual(snap["models"][0]["description"],
+                         BUILTIN_MODELS["step-5-preview"]["description"])
+        glm = next(m for m in snap["models"] if m["id"] == "glm-5.2")
         self.assertEqual(glm["credits"], 0.79)
         self.assertEqual(glm["max_input_tokens"], 1000000)
         self.assertEqual(glm["source"], "upstream")
@@ -108,6 +111,41 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(len(registry.promotions), 1)
         self.assertEqual(registry.promotions[0]["label"], "夜间折扣")
         self.assertEqual(registry.promotions[0]["factor"], 0.5)
+
+    def test_description_chinese_only(self):
+        """描述只保留中文：有 descriptionZh 时不掺英文，缺失时用内置兜底。"""
+        payload = upstream_payload()
+        payload["models"] = [
+            {"id": "glm-5.2", "name": "GLM-5.2", "credits": "x0.79", "maxInputTokens": 1000000,
+             "descriptionZh": "旗舰模型，擅长复杂软件工程", "descriptionEn": "Flagship model"},
+            # 上游无任何描述 -> 内置中文兜底。
+            {"id": "space-bunny", "name": "Space-Bunny", "credits": "", "maxInputTokens": 64000},
+        ]
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = payload
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            self.assertTrue(registry.fetch())
+        desc = {m["id"]: m["description"] for m in registry.snapshot()["models"]}
+        self.assertEqual(desc["glm-5.2"], "旗舰模型，擅长复杂软件工程")
+        self.assertEqual(desc["space-bunny"], BUILTIN_MODELS["space-bunny"]["description"])
+
+    def test_snapshot_orders_disabled_last(self):
+        """展示排序：启用的在前、禁用的在后；组内按单价升序（None 视为 0）。"""
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = upstream_payload()
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+        # 禁用掉最便宜（step-5-preview ×0.00）与最贵（deep-model ×1.20）的。
+        registry.set_enabled("step-5-preview", False)
+        registry.set_enabled("deep-model", False)
+        ids = [m["id"] for m in registry.snapshot()["models"]]
+        # 启用组按单价升序；禁用组排在最后，也按单价升序。
+        self.assertEqual(ids, ["space-bunny", "fast-model", "balanced-model", "glm-5.2",
+                               "step-5-preview", "deep-model"])
 
     def test_fetch_failure_keeps_previous_snapshot(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())

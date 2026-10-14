@@ -9,6 +9,10 @@ data.agents[] where the "cli" agent lists the model ids shown in the official UI
 
 Refresh policy: fetch on startup, then refresh on an interval. Failures keep the last
 good snapshot; if nothing was ever fetched, fall back to BUILTIN_MODELS.
+
+Display rules (admin model catalog): descriptions are Chinese-only — the official
+descriptionZh, with the built-in Chinese text as fallback when upstream omits it;
+rows are ordered by unit price (credits) ascending with disabled models last.
 """
 import json
 import threading
@@ -39,18 +43,11 @@ def _credits_multiplier(text):
 
 
 def _label(model):
-    """Build a display description from official fields."""
-    parts = []
-    name = model.get("name")
-    if isinstance(name, str) and name and name != model.get("id"):
-        parts.append(name)
-    elif isinstance(name, str) and name:
-        parts.append(name)
-    for key in ("descriptionZh", "descriptionEn"):
-        value = model.get(key)
-        if isinstance(value, str) and value and value not in parts:
-            parts.append(value)
-    return " · ".join(parts) if parts else None
+    """展示用描述：只取官方中文描述（descriptionZh），不掺英文。"""
+    value = model.get("descriptionZh")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 class ModelRegistry:
@@ -174,9 +171,15 @@ class ModelRegistry:
                     available.append(mid)
                     continue
                 max_in = raw.get("maxInputTokens")
+                # 上游缺中文描述时用内置官方描述兜底（保证只有中文描述）。
+                description = _label(raw)
+                if not description:
+                    builtin = BUILTIN_MODELS.get(mid)
+                    if builtin is not None and builtin.get("description"):
+                        description = builtin["description"]
                 catalog[mid] = {
                     "name": raw.get("name") if isinstance(raw.get("name"), str) else mid,
-                    "description": _label(raw),
+                    "description": description,
                     "credits": _credits_multiplier(raw.get("credits")),
                     "max_input_tokens": max_in if isinstance(max_in, int) else None,
                     "source": "upstream",
@@ -219,7 +222,11 @@ class ModelRegistry:
 
     # -- queries -----------------------------------------------------------
     def snapshot(self):
-        """Full catalog with management flags and current promo, for the admin UI."""
+        """Full catalog with management flags and current promo, for the admin UI.
+
+        排序规则：启用的在前、禁用的在后；同组内按单价（credits）升序，
+        None（按标准计费）视为 0，与免费模型并列最前。
+        """
         now = datetime.now(CN)
         with self._lock:
             models = []
@@ -232,6 +239,11 @@ class ModelRegistry:
                     entry["promo"] = {"label": promo[0], "factor": promo[1],
                                       "credits": round(entry["credits"] * promo[1], 4)}
                 models.append(entry)
+            models.sort(key=lambda m: (
+                not m["enabled"],
+                m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,
+                self._available.index(m["id"]),
+            ))
             return {"updated": self._updated, "error": self._error, "models": models}
 
     def enabled_models(self):
