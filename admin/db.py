@@ -611,6 +611,66 @@ class Database:
             (limit,))
         return [{column: row[column] for column in LOG_COLUMNS} for row in rows]
 
+    def page_request_logs(self, limit=50, offset=0, since=None, until=None,
+                          source=None, outcome=None):
+        """分页读请求日志（按 id 倒序），返回 {rows, total, limit, offset}。
+
+        total 是不带 limit/offset 的同条件总数，供前端画页码。条件都用参数绑定，
+        不接受 SQL 片段，避免拼接注入。
+        """
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        clauses, params = [], []
+        if since is not None:
+            clauses.append("time >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("time < ?")
+            params.append(int(until))
+        if source:
+            clauses.append("source = ?")
+            params.append(str(source))
+        if outcome:
+            clauses.append("outcome = ?")
+            params.append(str(outcome))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        total = self.query(f"SELECT COUNT(*) AS n FROM request_logs{where}", tuple(params))[0]["n"]
+        rows = self.query(
+            f"SELECT id, {', '.join(LOG_COLUMNS)} FROM request_logs{where}"
+            " ORDER BY id DESC LIMIT ? OFFSET ?", (*params, limit, offset))
+        return {"rows": [{"id": row["id"], **{column: row[column] for column in LOG_COLUMNS}}
+                         for row in rows],
+                "total": total, "limit": limit, "offset": offset}
+
+    def request_log_summary(self, since=None, until=None):
+        """仪表盘用的累计口径（跨重启、来自 request_logs）。
+
+        api/test 分列计数，避免把后台测试算进「对话请求」。
+        """
+        clauses, params = [], []
+        if since is not None:
+            clauses.append("time >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("time < ?")
+            params.append(int(until))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        row = self.query(
+            "SELECT COUNT(*) AS n, SUM(outcome='success') AS ok,"
+            " SUM(source='api') AS api, SUM(source='test') AS test,"
+            " SUM(status IS NOT NULL AND status >= 200 AND status < 300) AS http_ok,"
+            " AVG(duration_ms) AS avg, MIN(time) AS first_time"
+            f" FROM request_logs{where}", tuple(params))[0]
+        total = row["n"] or 0
+        success = row["ok"] or 0
+        http_ok = row["http_ok"] or 0
+        return {"completed": total, "succeeded": success, "failed": total - success,
+                "api_count": row["api"] or 0, "test_count": row["test"] or 0,
+                "success_rate": round(100 * success / total, 1) if total else None,
+                "http_success_rate": round(100 * http_ok / total, 1) if total else None,
+                "avg_duration_ms": round(row["avg"]) if row["avg"] is not None else None,
+                "first_time": row["first_time"]}
+
     # 分组维度 -> SQL 表达式。name 只是列名，不带用户输入，可安全拼接。
     LOG_GROUPS = {
         "day": "date(time, 'unixepoch', '+8 hours')",

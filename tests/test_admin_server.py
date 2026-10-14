@@ -130,6 +130,70 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"expires_at": None})).status_code, 200)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 200)
 
+    async def test_key_scope_models_and_accounts(self):
+        """密钥的模型/账号白名单：可写入、可读回、空白名单表示不限制。"""
+        await self.login()
+        created = await self.client.post("/admin/api/keys", json={"name": "范围测试"})
+        kid = created.json()["id"]
+        overview = (await self.client.get("/admin/api/overview")).json()
+        account_id = overview["accounts"][0]["id"]
+        models = [m["id"] for m in overview["models"]["models"] if m["enabled"]][:2]
+        result = await self.client.patch("/admin/api/keys/" + kid, json={"models": models, "accounts": [account_id]})
+        self.assertEqual(result.status_code, 200, result.text)
+        keys = (await self.client.get("/admin/api/overview")).json()["keys"]
+        item = next(k for k in keys if k["id"] == kid)
+        self.assertEqual(item["models"], models)
+        self.assertEqual(item["accounts"], [account_id])
+        # 空列表 = 不限制。
+        await self.client.patch("/admin/api/keys/" + kid, json={"models": [], "accounts": []})
+        keys = (await self.client.get("/admin/api/overview")).json()["keys"]
+        item = next(k for k in keys if k["id"] == kid)
+        self.assertEqual(item["models"], [])
+        self.assertEqual(item["accounts"], [])
+        # 创建时可直接指定范围。
+        created = await self.client.post("/admin/api/keys", json={"name": "带范围", "models": models, "accounts": [account_id]})
+        keys = (await self.client.get("/admin/api/overview")).json()["keys"]
+        item = next(k for k in keys if k["id"] == created.json()["id"])
+        self.assertEqual(item["models"], models)
+        self.assertEqual(item["accounts"], [account_id])
+
+    async def test_logs_pagination_and_sqlite_summary(self):
+        """logs 分页接口与 overview 的累计统计都来自 request_logs。"""
+        await self.login()
+        store = self.app.state.store
+        now = int(time.time())
+        store.db.append_request_logs([
+            {"time": now - i, "source": "api" if i % 2 else "test", "path": "/v1/chat/completions",
+             "status": 200, "outcome": "success" if i % 3 else "stream_error",
+             "duration_ms": 100 + i, "key_id": "k1", "account_id": "a1", "account_name": "账号",
+             "model_id": "deepseek-v4-flash", "model_name": "V4", "upstream_request_id": None}
+            for i in range(25)])
+        # 分页：第一页 10 条，按 id 倒序 => 最新一条在最前。
+        page = await self.client.get("/admin/api/logs?limit=10&offset=0")
+        self.assertEqual(page.status_code, 200, page.text)
+        data = page.json()
+        self.assertEqual(len(data["rows"]), 10)
+        self.assertEqual(data["total"], 25)
+        self.assertTrue(all(r["ok"] == (r["outcome"] == "success") for r in data["rows"]))
+        second = (await self.client.get("/admin/api/logs?limit=10&offset=10")).json()
+        self.assertEqual(len(second["rows"]), 10)
+        self.assertNotEqual(data["rows"][0]["id"], second["rows"][0]["id"])
+        # 非法参数被拒（不落成 500）。
+        self.assertEqual((await self.client.get("/admin/api/logs?limit=abc")).status_code, 400)
+        # source 过滤。
+        only_test = (await self.client.get("/admin/api/logs?source=test&limit=50")).json()
+        self.assertTrue(all(r["source"] == "test" for r in only_test["rows"]))
+        # overview 的计数来自库，不随进程重启清零。
+        metrics = (await self.client.get("/admin/api/overview")).json()["metrics"]
+        self.assertEqual(metrics["completed"], 25)
+        self.assertEqual(metrics["failed"], 25 - sum(1 for i in range(25) if i % 3))
+        self.assertIn("first_time", metrics)
+        await self.client.aclose()
+        self.make_app()
+        await self.login()
+        metrics = (await self.client.get("/admin/api/overview")).json()["metrics"]
+        self.assertEqual(metrics["completed"], 25)
+
     async def test_credit_refresh_endpoint_and_settings(self):
         # 未登录不可用。
         self.assertEqual((await self.client.post("/admin/api/pool/refresh-credits")).status_code, 401)

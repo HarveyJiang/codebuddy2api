@@ -65,6 +65,16 @@ def _id_list(value):
     return result
 
 
+def _log_rows(rows):
+    """请求日志行 → 前端结构：补 ok 布尔（新表只存 outcome，不再存 ok）。"""
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["ok"] = item.get("outcome") == "success"
+        result.append(item)
+    return result
+
+
 # save() 里 kv 脏标记的初始值：与任何真实值都不同，保证首次一定写入。
 _MISSING = object()
 
@@ -599,14 +609,37 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def overview(req: Request):
         store.require_admin(req)
         # recent 直接读 request_logs（跨重启保留、含账号/密钥/模型维度）。
-        recent = []
-        for row in store.db.recent_request_logs(100):
-            item = dict(row)
-            item["ok"] = item.get("outcome") == "success"
-            recent.append(item)
+        recent = _log_rows(store.db.recent_request_logs(100))
+        # 仪表盘累计口径同样来自 request_logs：内存 metrics 每次重启清零，
+        # 这里用库内统计覆盖计数类字段，只保留 in_flight 这种进程内的实时值。
+        summary = store.db.request_log_summary()
         with store.lock:
             keys = [{"id": kid, "usage": item.get("usage") or {}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            live = metrics.snapshot()
+            merged = {**live, **summary,
+                      "in_flight": live["in_flight"], "started_at": summary["first_time"] or live["started_at"],
+                      "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+
+    @app.get("/admin/api/logs")
+    async def logs(req: Request):
+        """分页读请求日志（sqlite，跨重启保留）。"""
+        store.require_admin(req)
+        params = req.query_params
+
+        def as_int(name, default=None):
+            raw = params.get(name)
+            if raw in (None, ""):
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                raise HTTPException(400, f"{name} 需为整数")
+        result = store.db.page_request_logs(
+            limit=as_int("limit", 50), offset=as_int("offset", 0),
+            since=as_int("since"), until=as_int("until"),
+            source=params.get("source") or None, outcome=params.get("outcome") or None)
+        return {**result, "rows": _log_rows(result["rows"])}
 
     @app.get("/admin/api/logs/stats")
     async def log_stats(req: Request):
@@ -804,7 +837,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             # 未撤销的，否则累计撤销到 100 枚后再也无法新建（与 revoke_key 口径一致）。
             if len([k for k, v in store.data["keys"].items() if not v.get("revoked_at")]) >= 100:
                 raise HTTPException(400, "最多保存 100 枚 API Key")
-            kid, key = store.add_key(name, daily_limit=body.get("daily_limit"))
+            kid, key = store.add_key(name, daily_limit=body.get("daily_limit"),
+                                     models=body.get("models"), accounts=body.get("accounts"))
             store.save()
         return {"id": kid, "key": key}
 

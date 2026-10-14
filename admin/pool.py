@@ -702,6 +702,12 @@ class PoolMiddleware:
                 model = body.get("model")
                 if isinstance(model, str) and model and model not in self.model_registry.enabled_models() and model in self.model_registry.snapshot_ids():
                     raise HTTPException(400, f"模型 {model} 已在管理页禁用")
+            # 密钥的模型白名单：空白名单 = 不限制；显式列了模型则只放行列表内的。
+            if kid is not None and isinstance(body, dict):
+                model = body.get("model")
+                allowed_models = self.pool.store.key_bindings(kid)[0]
+                if allowed_models and isinstance(model, str) and model and model not in allowed_models:
+                    raise HTTPException(403, f"该密钥无权使用模型 {model}")
             affinity_key = request_affinity(headers, body)
             original_receive = receive
             delivered = False

@@ -71,7 +71,9 @@ function render() {
     const routing = k.routing || "";
     const revoked = !!k.revoked_at;
     const expired = !!k.expires_at && k.expires_at <= now;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${revoked ? "—" : `<select class="routing-select" data-routing="${k.id}" title="该密钥的账号分配策略"><option value=""${routing === "" ? " selected" : ""}>跟随默认</option><option value="round_robin"${routing === "round_robin" ? " selected" : ""}>轮转</option><option value="random"${routing === "random" ? " selected" : ""}>随机</option><option value="expiry_first"${routing === "expiry_first" ? " selected" : ""}>优先快过期</option></select>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
+    const scope = (list, noun) => (Array.isArray(list) && list.length)
+      ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<select class="routing-select" data-routing="${k.id}" title="该密钥的账号分配策略"><option value=""${routing === "" ? " selected" : ""}>跟随默认</option><option value="round_robin"${routing === "round_robin" ? " selected" : ""}>轮转</option><option value="random"${routing === "random" ? " selected" : ""}>随机</option><option value="expiry_first"${routing === "expiry_first" ? " selected" : ""}>优先快过期</option></select>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型与账号">权限</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
   }).join("");
   renderModels();
   const modelIds = Array.isArray(models?.models) ? models.models.filter(m => m.enabled).map(m => m.id) : [];
@@ -104,18 +106,37 @@ function renderDashboard() {
   $("dash-credits").textContent = known.length ? fmt(known.reduce((s,a)=>s+a.remaining,0)) : "—";
   $("dash-credit-note").textContent = known.length < accounts.length ? `已查询 ${known.length}/${accounts.length} 个账号，余额可能不完整` : accounts.some(a=>a.credits_stale) ? "包含待刷新余额，以最近一次查询为准" : "以最近一次上游查询为准";
   $("dash-requests").textContent = fmt(m.completed || 0);
-  $("dash-request-note").textContent = `API ${m.api_count || 0} · 后台测试 ${m.test_count || 0}`;
+  $("dash-request-note").textContent = `API ${m.api_count || 0} · 后台测试 ${m.test_count || 0}（历史累计）`;
   $("dash-success").textContent = rate(m.success_rate); $("dash-http").textContent = rate(m.http_success_rate);
-  $("dash-failed").textContent = m.failed || 0; $("dash-inflight").textContent = m.in_flight || 0;
+  $("dash-failed").textContent = fmt(m.failed || 0); $("dash-inflight").textContent = m.in_flight || 0;
   $("dash-latency").textContent = m.avg_duration_ms === null || m.avg_duration_ms === undefined ? "—" : fmt(m.avg_duration_ms) + " ms";
-  $("dash-since").textContent = "统计开始于 " + stamp((m.started_at || 0)*1000);
+  $("dash-since").textContent = m.first_time ? "统计最早记录于 " + stamp(m.first_time * 1000) : "尚无历史请求记录";
   $("dash-routing").textContent = ({round_robin:"按权重轮流分配请求，自动跳过不可用账号", random:"在可用账号中随机分配", expiry_first:"优先消耗最早到期的积分"}[pool?.default_routing] || "按各密钥的分配策略选择账号");
   const states={available:"可用",paused:"已暂停",cooling:"冷却中",exhausted:"积分耗尽",invalid:"凭据异常"};
   $("dash-account-list").innerHTML = accounts.slice(0,8).map(a=>`<div class="dashboard-account"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong>${a.nickname ? `<small class="cell-note">${esc(a.nickname)}</small>` : ""}</div><div class="dashboard-account-credit"><strong>${a.remaining === null || a.remaining === undefined ? "待查询" : fmt(a.remaining)}</strong><small class="cell-note">积分</small></div><span class="pill ${a.pool_state === 'available' ? 'green' : 'amber'}">${states[a.pool_state] || '待查询'}</span></div>`).join("") || '<p class="history-empty">尚未添加账号，点击“添加账号”开始。</p>';
   if(accounts.length > 8) $("dash-account-list").insertAdjacentHTML("beforeend",'<p class="muted">更多账号请前往账号池查看。</p>');
-  const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
-  $("dash-recent-body").innerHTML=(m.recent || []).map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === 'test' ? '后台测试' : 'API'}<small class="cell-note mono">${esc(r.path)}</small></td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${fmt(r.duration_ms)} ms</td></tr>`).join("") || '<tr><td colspan="4" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }
+const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
+let logOffset = 0, logTotal = 0;
+function renderLogRows(rows) {
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === 'test' ? '后台测试' : 'API'}<small class="cell-note mono">${esc(r.path)}</small></td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+}
+async function loadLogs(offset) {
+  const size = Number($("dash-page-size").value) || 50;
+  try {
+    const data = await api(`logs?limit=${size}&offset=${offset}`);
+    logOffset = data.offset; logTotal = data.total;
+    renderLogRows(data.rows);
+    const pages = Math.max(1, Math.ceil(logTotal / size));
+    const current = Math.floor(data.offset / size) + 1;
+    $("dash-page-info").textContent = logTotal ? `第 ${current} / ${pages} 页 · 共 ${logTotal.toLocaleString("zh-CN")} 条` : "暂无记录";
+    $("dash-prev").disabled = data.offset <= 0;
+    $("dash-next").disabled = data.offset + size >= logTotal;
+  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(e.message)}</td></tr>`; }
+}
+$("dash-prev").addEventListener("click", () => loadLogs(Math.max(0, logOffset - Number($("dash-page-size").value))));
+$("dash-next").addEventListener("click", () => loadLogs(logOffset + Number($("dash-page-size").value)));
+$("dash-page-size").addEventListener("change", () => loadLogs(0));
 document.querySelectorAll("[data-dashboard-page]").forEach(b=>b.addEventListener("click",()=>goPage(b.dataset.dashboardPage)));
 $("dash-add").addEventListener("click",()=>openAccount());
 $("dash-base").textContent=location.origin+"/v1";
@@ -148,6 +169,7 @@ async function refresh(loadCredits) {
   try {
     if (loadCredits) { try { await api("pool/refresh-credits", {method:"POST"}); } catch(e) {} }
     overview = await api("overview"); render(); $("load-error").hidden = true;
+    if (page === "dashboard") loadLogs(logOffset);
   }
   catch (e) { $("load-error").textContent = e.message; $("load-error").hidden = false; throw e; }
   finally { $("refresh").disabled = false; }
@@ -293,6 +315,8 @@ $("keys-body").addEventListener("change", e => {
     .then(() => refresh()).catch(err => { toast(err.message); refresh(); });
 });
 $("keys-body").addEventListener("click", e => {
+  const bind = e.target.closest("[data-bind]");
+  if (bind) { openKeyBind(overview.keys.find(x => x.id === bind.dataset.bind)); return; }
   const limit = e.target.closest("[data-limit]");
   if (limit) { const k = overview.keys.find(x => x.id === limit.dataset.limit); confirmAction("设置每日请求上限", "每天最多允许的请求数，0 或留空表示不限制。超限的请求会返回 429。", () => api("keys/" + k.id, {method:"PATCH", body:{daily_limit:Number($("rename-value").value) || null}}), k.daily_limit ?? ""); return; }
   const toggle = e.target.closest("[data-toggle]");
@@ -300,6 +324,44 @@ $("keys-body").addEventListener("click", e => {
   const b = e.target.closest("[data-revoke]"); if (!b) return; const k = overview.keys.find(x => x.id === b.dataset.revoke); confirmAction("撤销客户端密钥？", `使用「${k.name}」的客户端将无法发起新请求。此操作不可撤销。`, () => api("keys/" + k.id, {method:"DELETE"}));
 });
 $("add-key").addEventListener("click", () => { $("key-form").hidden = false; $("created-key").hidden = true; $("key-dialog").showModal(); });
+function openKeyBind(k) {
+  if (!k) return;
+  $("key-bind-name").textContent = `密钥「${k.name}」· ${k.hint}`;
+  $("key-bind-error").textContent = "";
+  const list = (host, items, selected, render) => {
+    host.replaceChildren(...items.map(item => {
+      const label = document.createElement("label");
+      label.className = "check-item";
+      const box = document.createElement("input");
+      box.type = "checkbox"; box.value = item.value; box.checked = selected.includes(item.value);
+      const span = document.createElement("span");
+      span.textContent = render(item);
+      label.append(box, span);
+      return label;
+    }));
+    if (!items.length) { const p = document.createElement("p"); p.className = "muted"; p.textContent = "暂无可选项。"; host.replaceChildren(p); }
+  };
+  const models = (overview.models?.models || []).filter(m => m.enabled).map(m => ({value:m.id, name:m.name || ""}));
+  list($("key-bind-models"), models, Array.isArray(k.models) ? k.models : [], m => m.name ? `${m.value}（${m.name}）` : m.value);
+  const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state}));
+  list($("key-bind-accounts"), accounts, Array.isArray(k.accounts) ? k.accounts : [], a => `${a.name}（${a.value.slice(0,6)}…）`);
+  $("key-bind-routing").value = k.routing || "";
+  $("key-bind-dialog").dataset.kid = k.id;
+  $("key-bind-dialog").showModal();
+}
+const checkedValues = host => [...host.querySelectorAll("input:checked")].map(b => b.value);
+$("key-bind-form").addEventListener("submit", async e => {
+  e.preventDefault(); e.submitter.disabled = true; $("key-bind-error").textContent = "";
+  const kid = $("key-bind-dialog").dataset.kid;
+  try {
+    await api("keys/" + kid, {method:"PATCH", body:{
+      models: checkedValues($("key-bind-models")),
+      accounts: checkedValues($("key-bind-accounts")),
+      routing: $("key-bind-routing").value || null}});
+    $("key-bind-dialog").close(); await refresh(); toast("密钥权限已保存");
+  } catch (err) { $("key-bind-error").textContent = err.message; }
+  finally { e.submitter.disabled = false; }
+});
 $("key-dialog").addEventListener("close", () => { $("key-form").reset(); $("new-key-value").textContent = ""; $("key-error").textContent = ""; });
 $("key-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { const d = await api("keys", {method:"POST",body:{name:$("key-name").value}}); $("key-form").hidden = true; $("created-key").hidden = false; $("new-key-value").textContent = d.key; await refresh(); } catch (err) { $("key-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 async function copy(value) { try { await navigator.clipboard.writeText(value); toast("已复制"); } catch { toast("无法自动复制，请手动选择文本复制"); } }
