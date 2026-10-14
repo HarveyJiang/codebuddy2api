@@ -13,7 +13,7 @@ const labels = {
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   models: ["模型管理", "MODEL CATALOG", "与官方客户端一致的模型列表，可按需启用或禁用。"],
-  test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
+  test: ["连接测试", "CONNECTION LAB", "经账号池按路由规则发起请求，确认模型能否正常响应。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
 };
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -53,7 +53,7 @@ function render() {
   const rotating = overview.pool?.routing === "round_robin";
   $("active-name").textContent = rotating ? "账号池轮转" : active?.name || "未选择账号";
   $("active-state").textContent = rotating ? "新请求轮流分配，跳过暂停与冷却账号" : "新请求使用手动指定账号";
-  $("test-account").textContent = active?.name || "尚未选择";
+  $("test-account").textContent = rotating ? "账号池轮转 · 自动选择可用账号" : ("手动指定：" + (active?.name || "未选择账号"));
   $("uptime").textContent = uptime < 60 ? "已启动不到 1 分钟" : `持续运行 ${Math.floor(uptime / 3600)} 小时 ${Math.floor(uptime % 3600 / 60)} 分钟`;
   $("accounts-empty").hidden = accounts.length > 0;
   renderAccounts();
@@ -70,7 +70,7 @@ function render() {
   const selected = $("model").value || "deepseek-v4-flash";
   $("model").replaceChildren(...modelIds.map(model => { const o = document.createElement("option"); o.value = o.textContent = model; return o; }));
   if (modelIds.includes(selected)) $("model").value = selected;
-  $("test-submit").disabled = !active || busy;
+  $("test-submit").disabled = !accounts.some(a => a.enabled) || busy;
   $("test-history").innerHTML = events.length ? events.map(e => `<div class="history-row"><span class="mono muted">${esc(stamp(e.time * 1000))}</span><strong>${esc(e.model)}</strong><span class="pill ${e.ok ? "green" : "red"}">${e.ok ? "成功" : "失败"}</span><span class="mono">${e.seconds}s</span></div>`).join("") : '<p class="history-empty">暂无测试记录，发送第一条测试消息。</p>';
 }
 function renderModels() {

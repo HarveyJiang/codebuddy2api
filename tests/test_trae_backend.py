@@ -611,6 +611,33 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert msg["tool_calls"][0]["function"]["name"] == "read"
         assert body["usage"]["total_tokens"] == 163
 
+    async def test_admin_api_test_routes_trae_via_pool(self):
+        """回归：/admin/api/test 内部调用须走账号池。活跃账号为 workbuddy 时，
+        测 trae 模型仍应由池选中 trae 账号成功返回，而非被后端一致性闸门挡成 503。"""
+        from core.backends import trae as T
+        await self.client.post("/admin/api/login", json={"key": ADMIN})
+        csrf = (await self.client.get("/admin/api/session")).json()["csrf"]
+        H = {"X-CSRF-Token": csrf}
+        # 活跃账号切成 workbuddy，复现旧 bug 触发条件（CONFIG["cred"]=wb，与 trae 后端不匹配）。
+        wb_aid = next(aid for aid, it in self.app.state.store.data["accounts"].items() if it.get("backend", "workbuddy") == "workbuddy")
+        r = await self.client.patch(f"/admin/api/accounts/{wb_aid}", json={"active": True}, headers=H)
+        assert r.status_code == 200, r.text
+        assert getattr(self.admin_server.converter.CONFIG["cred"], "backend_name", "workbuddy") != "trae"
+        # 直接 mock TraeBackend.astream 产出标准 SOLO SSE，避开真实上游与 httpx patch 冲突。
+        async def fake_astream(self_, headers, body, *, timeout=None, raise_on_error=False):
+            async for chunk in T.normalize_solo_stream(_achunks(SOLO_SSE), model=str(body.get("model") or "glm-5.2")):
+                yield chunk
+        orig = T.TraeBackend.astream
+        T.TraeBackend.astream = fake_astream
+        try:
+            r = await self.client.post("/admin/api/test", json={"model": "trae/glm-5.2", "prompt": "请只回复：连接成功"}, headers=H)
+        finally:
+            T.TraeBackend.astream = orig
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True, body
+        assert "Hello" in (body.get("answer") or "")
+
     async def test_e2e_responses_stream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/responses", headers={"Authorization": "Bearer " + API},

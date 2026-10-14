@@ -962,7 +962,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 has_trae = any(it.get("backend", "workbuddy") == "trae" and it["enabled"] for it in store.data["accounts"].values())
             if not has_trae:
                 raise HTTPException(400, "请先启用一个 Trae 账号")
-        elif converter.CONFIG.get("cred") is None:
+        elif store.any_enabled_manager() is None:
             raise HTTPException(400, "请先导入并启用一个账号")
         async with store.test_lock:
             started = time.monotonic()
@@ -970,8 +970,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             with store.lock:
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
+            # 内部调用穿过 PoolMiddleware：与真实客户端一致，按路由规则（轮转/亲和/冷却/耗尽）
+            # 自动选择匹配该模型后端的账号，而非固定"当前账号"。
+            internal_app = PoolMiddleware(converter.app, pool=pool, model_registry=model_registry)
             try:
-                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(internal_app, metrics, source="test")), base_url="http://internal") as client:
                     result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
                 data = result.json()
                 answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") if result.status_code == 200 else ""
