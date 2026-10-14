@@ -680,6 +680,11 @@ class PoolMiddleware:
 
         # 排队自动切号：只有在尚未向客户端发出任何字节时才能安全重放请求。
         # 一旦开始输出内容，便不再切换账号（重复输出会破坏流）。
+        # 排队自动切号：只有在尚未向客户端发出任何字节时才能安全重放请求。
+        # 一旦开始输出内容，便不再切换账号（重复输出会破坏流）。
+        # 实现：扣留 response.start（连同后续 body）做排队判定；判定为排队则换号重放。
+        # 关键安全：无论上游如何响应，middleware 都必须向客户端完成一次完整响应——
+        # 因此在 self.app 返回后，若仍处于扣留状态（start 未发出），finally 会补发。
         while True:
             token = REQUEST_CREDENTIAL.set(manager)
             state = {"status": 200, "buffer": b"", "emitted": False, "held": False,
@@ -690,7 +695,8 @@ class PoolMiddleware:
                     _s["status"] = message["status"]
                     _s["headers"] = message.get("headers", [])
                     if failover_on and not _s["emitted"] and not _s["held"]:
-                        _s["held"] = True  # 扣留响应头，先判定是否为排队错误
+                        # 扣留响应头，等第一个 body 判定是否排队
+                        _s["held"] = True
                         return
                     await send(message)
                     return
@@ -706,15 +712,16 @@ class PoolMiddleware:
                                 _s["queue"] = True  # 交给外层换号重试，本响应不回给客户端
                                 return
                             _s["held"] = False
+                            _s["emitted"] = True
                             await send({"type": "http.response.start", "status": _s["status"], "headers": _s["headers"]})
                             await send({"type": "http.response.body", "body": _s["buffer"], "more_body": False})
-                            _s["emitted"] = True
                             return
                         if len(_s["buffer"]) > 256 * 1024:
-                            _s["held"] = False  # 攒太多还没结束，判定为正常流，放行
+                            # 攒太多还没结束，判定为正常流，放行
+                            _s["held"] = False
+                            _s["emitted"] = True
                             await send({"type": "http.response.start", "status": _s["status"], "headers": _s["headers"]})
                             await send({"type": "http.response.body", "body": _s["buffer"], "more_body": True})
-                            _s["emitted"] = True
                         return
                     if not _s["emitted"]:
                         _s["emitted"] = True
@@ -753,6 +760,22 @@ class PoolMiddleware:
                         continue
                     except Exception:
                         return await JSONResponse({"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
+                # 兜底：无论哪种情况（排队重试外的所有路径），必须向客户端完成一次完整响应。
+                # 若仍处于扣留状态（start 未发出），补发 start + body；若 start 已发出但
+                # body 未结束，补空 body 收尾，避免 ASGI「callable returned without
+                # completing response」。
+                if not state["emitted"] and not state["queue"]:
+                    try:
+                        await send({"type": "http.response.start", "status": state["status"], "headers": state["headers"]})
+                        await send({"type": "http.response.body", "body": state["buffer"], "more_body": False})
+                        state["emitted"] = True
+                    except Exception:
+                        pass
+                elif not state["emitted"]:
+                    try:
+                        await send({"type": "http.response.body", "body": b"", "more_body": False})
+                    except Exception:
+                        pass
                 self.pool.record(aid, state["status"])
                 if kid is not None:
                     self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
