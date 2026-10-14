@@ -51,20 +51,22 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.client.headers.pop("X-CSRF-Token")
         self.assertEqual((await self.client.post("/admin/api/keys", json={"name": "bad"})).status_code, 403)
 
-    async def test_account_import_switch_disable_delete_and_restart(self):
+    async def test_account_import_disable_delete_and_restart(self):
         await self.login()
         first = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
         result = await self.client.post("/admin/api/accounts", json={"name": "Second", "credential": credential("two")})
         self.assertEqual(result.status_code, 200)
         aid = result.json()["id"]
-        self.assertTrue(first["active"])
-        result = await self.client.patch("/admin/api/accounts/" + aid, json={"active": True})
-        self.assertEqual(result.status_code, 200)
-        self.assertEqual(admin_server.converter.CONFIG["cred"].path.name, aid + ".info")
+        # 全局 active 已移除：账号行不再带 active 徽标。
+        self.assertNotIn("active", first)
+        # CONFIG['cred'] 现在指向「任一启用账号」，只用来判断有没有可用账号。
+        self.assertIsNotNone(admin_server.converter.CONFIG["cred"])
         await self.client.patch("/admin/api/accounts/" + aid, json={"enabled": False})
+        await self.client.patch("/admin/api/accounts/" + first["id"], json={"name": "Primary"})
+        # 全部停用后不再有可用凭据。
+        await self.client.patch("/admin/api/accounts/" + first["id"], json={"enabled": False})
         self.assertIsNone(admin_server.converter.CONFIG["cred"])
-        self.assertEqual((await self.client.patch("/admin/api/accounts/" + aid, json={"active": True})).status_code, 400)
-        await self.client.patch("/admin/api/accounts/" + first["id"], json={"active": True, "name": "Primary"})
+        await self.client.patch("/admin/api/accounts/" + first["id"], json={"enabled": True})
         await self.client.delete("/admin/api/accounts/" + aid)
         self.assertTrue(list((self.root / "management/trash").glob("*/credential.json")))
         await self.client.aclose()
@@ -72,7 +74,7 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         accounts = (await self.client.get("/admin/api/overview")).json()["accounts"]
         self.assertEqual(len(accounts), 1)
-        self.assertTrue(accounts[0]["active"])
+        self.assertNotIn("active", accounts[0])
         self.assertEqual(accounts[0]["name"], "Primary")
 
     async def test_key_revocation_persists_and_no_secret_leak(self):
@@ -97,6 +99,36 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.make_app()
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + API})).status_code, 401)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + newkey})).status_code, 200)
+
+    async def test_key_routing_enabled_and_expiry(self):
+        await self.login()
+        created = await self.client.post("/admin/api/keys", json={"name": "策略测试"})
+        self.assertEqual(created.status_code, 200)
+        kid, value = created.json()["id"], created.json()["key"]
+        # 默认 routing 为 NULL，跟随 settings.default_routing。
+        keys = (await self.client.get("/admin/api/overview")).json()["keys"]
+        item = next(k for k in keys if k["id"] == kid)
+        self.assertIsNone(item["routing"])
+        self.assertEqual(item["enabled"], 1)
+        self.assertIsNone(item["expires_at"])
+        # 设置策略。
+        for routing in ("round_robin", "random", "expiry_first", None):
+            resp = await self.client.patch("/admin/api/keys/" + kid, json={"routing": routing})
+            self.assertEqual(resp.status_code, 200)
+            keys = (await self.client.get("/admin/api/overview")).json()["keys"]
+            self.assertEqual(next(k for k in keys if k["id"] == kid)["routing"], routing)
+        # 非法策略被拒。
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"routing": "manual"})).status_code, 400)
+        # 停用后立即无法调用。
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"enabled": False})).status_code, 200)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 401)
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"enabled": True})).status_code, 200)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 200)
+        # 过期时间设为过去 → 调用被拒；设回 NULL → 恢复。
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"expires_at": 1})).status_code, 200)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 401)
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"expires_at": None})).status_code, 200)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 200)
 
     async def test_credit_refresh_endpoint_and_settings(self):
         # 未登录不可用。

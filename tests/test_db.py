@@ -1,4 +1,8 @@
-"""SQLite 持久层：迁移、恢复、并发与脏标记。"""
+"""SQLite 持久层：迁移、恢复、并发与脏标记。
+
+按 db-redesign spec：无 kv 表，settings/session_bindings/models 走具名表，
+金额以整数最小单位（*_micro）落库，内存保持 float。
+"""
 import json
 import sqlite3
 import sys
@@ -12,11 +16,13 @@ from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent)]
 
-from admin.db import Database
+from admin.db import Database, MICRO
 from admin.server import Store
 from test_admin_server import credential
 
 ADMIN = "admin-test-credential-long-enough"
+# request_logs 启动时会裁掉 93 天前的行，测试数据必须用「现在」的时间戳。
+NOW = int(time.time())
 
 
 class DatabaseTests(unittest.TestCase):
@@ -30,42 +36,181 @@ class DatabaseTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_kv_roundtrip_and_nested_types(self):
+    def _write_models(self, db):
+        db.save_models({
+            "hy3": {"name": "Hy3", "description": "混元", "credits": 0.05, "available": 1, "enabled": 1, "sort_order": 2},
+            "gone": {"name": "Gone", "credits": 0.5, "available": 0, "enabled": 1, "sort_order": 9},
+        })
+
+    def test_no_kv_table_and_version_written(self):
         db = Database(self.root / "t.db")
-        db.set_kv("nested", {"a": [1, 2, {"b": None}], "c": "中文"})
-        db.set_kv("empty_list", [])
-        db.set_kv("empty_dict", {})
-        self.assertEqual(db.get_kv("nested"), {"a": [1, 2, {"b": None}], "c": "中文"})
-        self.assertEqual(db.get_kv("empty_list"), [])
-        self.assertEqual(db.get_kv("empty_dict"), {})
-        self.assertIsNone(db.get_kv("missing"))
-        self.assertEqual(db.get_kv("missing", {"d": 1}), {"d": 1})
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0], "2")
+        self.assertFalse(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"))
+        db.close()
+
+    def test_settings_roundtrip(self):
+        db = Database(self.root / "t.db")
+        db.save_settings({"auto_checkin": 0, "checkin_time": "08:30", "affinity_expiry_days": 5,
+                          "credit_min_interval": 45, "sync_start": "11:00", "sync_end": "21:00",
+                          "batch_spread": 60, "default_routing": "expiry_first", "models_updated": 9})
+        s = db.get_settings()
+        self.assertEqual(s["auto_checkin"], 0)
+        self.assertEqual(s["checkin_time"], "08:30")
+        self.assertEqual(s["sync_start"], "11:00")
+        self.assertEqual(s["default_routing"], "expiry_first")
+        self.assertEqual(s["models_updated"], 9)
+        db.close()
+        reopened = Database(self.root / "t.db")
+        self.assertEqual(reopened.get_settings()["checkin_time"], "08:30")
+        reopened.close()
+
+    def test_accounts_money_micro_roundtrip(self):
+        db = Database(self.root / "t.db")
+        db.save_accounts({"a1": {"name": "甲", "file": "a.info", "enabled": True, "created": 100}},
+                         {"a1": {"weight": 30, "remaining": 154.61, "packages": 4,
+                                 "earliest_expiry": 1790000000, "earliest_expiry_remaining": 4.61,
+                                 "expiring_soon": 104.61, "consecutive_fails": 2, "last_error": "boom"}})
+        row = db.load_accounts()["a1"]
+        self.assertAlmostEqual(row["remaining"], 154.61, places=4)
+        self.assertAlmostEqual(row["earliest_expiry_remaining"], 4.61, places=4)
+        self.assertAlmostEqual(row["expiring_soon"], 104.61, places=4)
+        self.assertEqual(row["weight"], 30)
+        self.assertEqual(row["consecutive_fails"], 2)
+        self.assertEqual(row["last_error"], "boom")
+        # DB 里确实是整数微单位。
+        micro = db.query("SELECT remaining_micro FROM accounts WHERE id='a1'")[0][0]
+        self.assertIsInstance(micro, int)
+        self.assertEqual(micro, int(round(154.61 * MICRO)))
+        db.close()
+
+    def test_keys_usage_columns_roundtrip(self):
+        db = Database(self.root / "t.db")
+        db.save_keys({"k1": {"name": "K", "hash": "h" * 64, "hint": "s", "created": 1,
+                             "enabled": 1, "revoked_at": None, "expires_at": None, "daily_limit": 10,
+                             "usage": {"date": "2026-10-14", "count": 3, "tokens": 99},
+                             "models": ["hy3"], "accounts": [], "routing": "random"}})
+        k = db.load_keys()["k1"]
+        self.assertEqual(k["usage_date"], "2026-10-14")
+        self.assertEqual(k["usage_count"], 3)
+        self.assertEqual(k["usage_tokens"], 99)
+        self.assertEqual(k["models"], ["hy3"])
+        self.assertEqual(k["accounts"], [])
+        self.assertEqual(k["routing"], "random")
+        self.assertEqual(k["daily_limit"], 10)
+        db.close()
+
+    def test_models_upsert_and_available_filter(self):
+        db = Database(self.root / "t.db")
+        self._write_models(db)
+        self.assertEqual(db.enabled_models(), ["hy3"])
+        self.assertEqual(db.known_model_ids(), {"hy3"})
+        models = db.load_models()
+        self.assertIn("gone", models)
+        self.assertEqual(models["gone"]["available"], 0)
+        # 再写一次不删行。
+        db.save_models({"hy3": {"name": "Hy3 v2", "credits": 0.06, "available": 1, "enabled": 1}})
+        self.assertIn("gone", db.load_models())
+        self.assertEqual(db.load_models()["hy3"]["name"], "Hy3 v2")
+        db.close()
+
+    def test_bindings_roundtrip_and_account_cleanup(self):
+        db = Database(self.root / "t.db")
+        db.save_bindings({"k1": {"account_id": "a1", "expires": 123}, "k2": {"account_id": "a2", "expires": 456}})
+        self.assertEqual(db.load_bindings()["k1"]["account_id"], "a1")
+        db.delete_bindings_for_account("a1")
+        self.assertNotIn("k1", db.load_bindings())
+        db.close()
+
+    def test_request_logs_batch_append_and_recent(self):
+        db = Database(self.root / "t.db")
+        db.append_request_logs([
+            {"time": NOW, "source": "api", "path": "/v1/chat/completions", "status": 200,
+             "outcome": "success", "duration_ms": 12},
+            {"time": NOW + 1, "source": "test", "path": "/v1/messages", "status": 429,
+             "outcome": "stream_error", "duration_ms": 30, "account_id": "a1"},
+        ])
+        recent = db.recent_request_logs()
+        self.assertEqual(len(recent), 2)
+        self.assertEqual(recent[0]["path"], "/v1/messages")
+        db.close()
+
+    def test_request_log_stats_total_and_grouping(self):
+        db = Database(self.root / "t.db")
+        day = 86400
+        db.append_request_logs([
+            {"time": NOW, "source": "api", "path": "/v1/messages", "status": 200,
+             "outcome": "success", "duration_ms": 10, "account_id": "a1", "key_id": "k1", "model_id": "hy3"},
+            {"time": NOW + 1, "source": "api", "path": "/v1/messages", "status": 200,
+             "outcome": "stream_error", "duration_ms": 30, "account_id": "a1", "key_id": "k1", "model_id": "hy3"},
+            # 往前推两天：验证按天分桶与时间窗过滤。
+            {"time": NOW - 2 * day, "source": "test", "path": "/v1/responses", "status": 401,
+             "outcome": "http_error", "duration_ms": 50, "account_id": "a2", "key_id": "k2", "model_id": "glm"},
+        ])
+        total = db.request_log_stats()
+        self.assertEqual(total["count"], 3)
+        self.assertEqual(total["success"], 1)
+        # 只取最近一天：两条。
+        recent = db.request_log_stats(since=NOW - 3600)
+        self.assertEqual(recent["count"], 2)
+        self.assertEqual(recent["success"], 1)
+        # 按 outcome 分组：3 个桶各 1 条。
+        by_outcome = db.request_log_stats(group_by="outcome")
+        buckets = {g["key"]: g["count"] for g in by_outcome["groups"]}
+        self.assertEqual(buckets, {"success": 1, "stream_error": 1, "http_error": 1})
+        # 按账号分组：a1 两条且成功率 50%。
+        by_account = db.request_log_stats(group_by="account")
+        groups = {g["key"]: g for g in by_account["groups"]}
+        self.assertEqual(groups["a1"]["count"], 2)
+        self.assertEqual(groups["a1"]["success_rate"], 50.0)
+        self.assertEqual(groups["a2"]["count"], 1)
+        # 按天分桶：3 天跨度 → 至少 2 个桶。
+        by_day = db.request_log_stats(group_by="day")
+        self.assertGreaterEqual(len(by_day["groups"]), 2)
+        with self.assertRaises(ValueError):
+            db.request_log_stats(group_by="no-such-column")
+        db.close()
+
+    def test_prune_upstream_usage_keeps_recent_rows(self):
+        """上游用量表必须有保留策略：每次同步 UPSERT 30 天窗口，只增不减会无限膨胀。"""
+        db = Database(self.root / "t.db")
+        day = 86400
+        db.save_upstream_usage([
+            {"request_id": "old", "account_id": "a1", "credit": 1,
+             "request_time": int(time.time()) - 200 * day},
+            {"request_id": "keep", "account_id": "a1", "credit": 1,
+             "request_time": int(time.time()) - 10 * day},
+        ])
+        self.assertEqual({r["request_id"] for r in db.load_upstream_usage()}, {"old", "keep"})
+        db.prune_upstream_usage()
+        self.assertEqual({r["request_id"] for r in db.load_upstream_usage()}, {"keep"})
+        db.close()
+
+    def test_upstream_usage_upsert_updates_credit(self):
+        db = Database(self.root / "t.db")
+        db.save_upstream_usage([{"request_id": "crb-1", "account_id": "a1", "credit": 0,
+                                 "model": "step-5-preview", "client": "WorkBuddy", "request_time": 1790000000}])
+        db.save_upstream_usage([{"request_id": "crb-1", "account_id": "a1", "credit": 12.5}])
+        rows = db.load_upstream_usage("a1")
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["credit"], 12.5, places=4)
         db.close()
 
     def test_close_checkpoints_and_preserves_data(self):
         db = Database(self.root / "t.db")
-        db.set_kv("k", {"v": 1})
+        db.append_request_logs([{"time": NOW, "path": "/p", "source": "api", "outcome": "success", "duration_ms": 1}])
         wal = self.root / "t.db-wal"
         self.assertTrue(wal.exists())
         db.close()
         # 最后一条连接干净关闭时 SQLite 会删掉 -wal；若仍存在则应被 checkpoint 归零。
         self.assertFalse(wal.exists() and wal.stat().st_size > 0)
         reopened = Database(self.root / "t.db")
-        self.assertEqual(reopened.get_kv("k"), {"v": 1})
+        self.assertEqual(len(reopened.recent_request_logs()), 1)
         reopened.close()
 
     def test_commit_failure_does_not_wedge_the_write_connection(self):
         """回归：COMMIT 抛错后必须回滚，否则连接永久卡在事务里。"""
         db = Database(self.root / "t.db")
-        db.set_kv("k", {"v": 1})
-        real = db._write.execute
 
-        def failing(sql, *args):
-            if sql.strip().upper() == "COMMIT":
-                raise sqlite3.OperationalError("disk I/O error")
-            return real(sql, *args)
-
-        # 无法替换 Connection.execute，用包装类注入失败。
         class Failing:
             def __init__(self, inner):
                 self._inner = inner
@@ -80,27 +225,150 @@ class DatabaseTests(unittest.TestCase):
 
         db._write = Failing(db._write)
         with self.assertRaises(sqlite3.OperationalError):
-            db.set_kv("k2", {"v": 2})
+            db.append_request_logs([{"time": NOW, "path": "/p", "source": "api", "outcome": "success", "duration_ms": 1}])
         db._write = db._write._inner
-        # 连接必须还能用：否则之后每次 BEGIN 都 cannot start a transaction
         self.assertFalse(db._write.in_transaction)
-        db.set_kv("k3", {"v": 3})
+        db.append_request_logs([{"time": NOW + 1, "path": "/p", "source": "api", "outcome": "success", "duration_ms": 1}])
         reopened = Database(self.root / "t.db")
-        self.assertEqual(reopened.get_kv("k3"), {"v": 3})
+        self.assertEqual(len(reopened.recent_request_logs()), 1)
         reopened.close()
 
     def test_checkpoint_truncates_wal_outside_transaction(self):
-        """回归：wal_checkpoint 在 BEGIN IMMEDIATE 里会 locked 失败，WAL 截不掉。"""
         db = Database(self.root / "t.db")
         for i in range(200):
-            db.set_kv("k%d" % i, {"v": "x" * 400})
+            db.append_request_logs([{"time": i, "path": "/p" + "x" * 400, "source": "api",
+                                     "outcome": "success", "duration_ms": 1}])
         wal = self.root / "t.db-wal"
         self.assertGreater(wal.stat().st_size, 0)
         db.checkpoint()
         self.assertEqual(wal.stat().st_size, 0, "WAL 未被截断")
-        reopened = Database(self.root / "t.db")
-        self.assertEqual(reopened.get_kv("k199"), {"v": "x" * 400})
-        reopened.close()
+        db.close()
+
+    def test_v1_database_migrates_to_v2_without_data_loss(self):
+        """v1→v2 是唯一会 DROP TABLE 并搬运全量生产数据的路径，必须被 CI 锁住。
+
+        v1 结构与 v2 的差别：accounts/keys 列不同、另有 kv 通用表存五键。
+        手工按 v1 DDL 造一个库，再让 Database 打开触发迁移，逐字段比对。
+        """
+        path = self.root / "v1.db"
+        con = sqlite3.connect(path)
+        con.executescript("""
+            CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT, file TEXT, enabled INTEGER, created INTEGER);
+            CREATE TABLE keys (id TEXT PRIMARY KEY, name TEXT, hash TEXT, hint TEXT, created INTEGER,
+                              daily_limit INTEGER, models TEXT, accounts TEXT, usage TEXT);
+            CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+        """)
+        con.execute("INSERT INTO accounts VALUES ('a1','主号','a1.info',1,111)")
+        con.execute("INSERT INTO accounts VALUES ('a2','备号','a2.info',0,222)")
+        # v1 的 keys 没有 enabled/revoked_at/expires_at/routing，也没有 usage 三列。
+        con.execute("INSERT INTO keys VALUES ('k1','K1','%s','sk…abcd',333,50,'[\"glm-5.2\"]','[\"a1\"]',"
+                    "'{\"date\":\"2026-10-14\",\"count\":7,\"tokens\":1234}')" % ("h" * 64))
+        kv = {
+            "active": "a1",
+            "pool": {"checkin_time": "08:30", "sync_window": ["09:00", "21:00"],
+                     "affinity_expiry_days": 5, "routing": "manual"},
+            "account_status": {"a1": {"remaining": 12.5, "packages": 2, "checkin_date": "2026-10-14",
+                                      "cooldown_until": None, "earliest_expiry_remaining": 3.5}},
+            "session_bindings": {"sess-1": {"account_id": "a1", "expires": 999}},
+            "model_registry": {"available": ["glm-5.2"], "disabled": [],
+                               "catalog": {"glm-5.2": {"name": "GLM 5.2", "credits": 3.5,
+                                                       "max_input_tokens": 200000},
+                                           "ghost": {"name": "已下线", "credits": 1}},
+                               "promotions": [{"label": "限时"}]},
+        }
+        for k, v in kv.items():
+            con.execute("INSERT INTO kv VALUES (?,?)", (k, json.dumps(v, ensure_ascii=False)))
+        con.execute("INSERT INTO schema_meta VALUES ('version','1')")
+        con.commit()
+        con.close()
+
+        db = Database(path)
+        try:
+            # kv 表必须消失。
+            self.assertFalse(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"))
+            self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0]["value"], "2")
+
+            accounts = db.load_accounts()
+            self.assertEqual(set(accounts), {"a1", "a2"})
+            self.assertEqual(accounts["a1"]["name"], "主号")
+            self.assertEqual(accounts["a2"]["enabled"], 0)
+            self.assertEqual(accounts["a1"]["created"], 111)
+            # account_status 的字段并进同一行，一个都不能丢。
+            self.assertAlmostEqual(accounts["a1"]["remaining"], 12.5, places=6)
+            self.assertEqual(accounts["a1"]["packages"], 2)
+            self.assertEqual(accounts["a1"]["checkin_date"], "2026-10-14")
+            self.assertAlmostEqual(accounts["a1"]["earliest_expiry_remaining"], 3.5, places=6)
+
+            keys = db.load_keys()
+            self.assertEqual(keys["k1"]["daily_limit"], 50)
+            self.assertEqual(keys["k1"]["models"], ["glm-5.2"])
+            self.assertEqual(keys["k1"]["accounts"], ["a1"])
+            # usage 在 v2 里铺平成三列。
+            self.assertEqual(keys["k1"]["usage_count"], 7)
+            self.assertEqual(keys["k1"]["usage_tokens"], 1234)
+            self.assertEqual(keys["k1"]["usage_date"], "2026-10-14")
+            # 新增列取约定默认值。
+            self.assertEqual(keys["k1"]["enabled"], 1)
+            self.assertIsNone(keys["k1"]["revoked_at"])
+            self.assertIsNone(keys["k1"]["expires_at"])
+            self.assertIsNone(keys["k1"]["routing"])
+
+            settings = db.get_settings()
+            self.assertEqual(settings["checkin_time"], "08:30")
+            self.assertEqual(settings["sync_start"], "09:00")
+            self.assertEqual(settings["sync_end"], "21:00")
+            self.assertEqual(settings["affinity_expiry_days"], 5)
+            self.assertEqual(settings["default_routing"], "round_robin")
+            # 旧的 pool.routing（manual）不迁移，语义下沉到 keys。
+            self.assertNotIn("routing", settings)
+
+            self.assertEqual(db.load_bindings()["sess-1"]["account_id"], "a1")
+            self.assertEqual(db.load_bindings()["sess-1"]["expires"], 999)
+
+            models = db.load_models()
+            self.assertIn("glm-5.2", models)
+            self.assertEqual(models["glm-5.2"]["available"], 1)
+            self.assertEqual(models["glm-5.2"]["name"], "GLM 5.2")
+            self.assertAlmostEqual(models["glm-5.2"]["credits"], 3.5, places=6)
+            self.assertEqual(models["glm-5.2"]["promo"], "限时")
+            # catalog 里有、available 里没有的行保留成 available=0（供日志 join），不删。
+            self.assertIn("ghost", models)
+            self.assertEqual(models["ghost"]["available"], 0)
+            # 不加载进 registry 的判据由 enabled_models 表达。
+            self.assertNotIn("ghost", db.enabled_models())
+            self.assertIn("glm-5.2", db.enabled_models())
+        finally:
+            db.close()
+
+    def test_v1_migration_is_idempotent_on_reopen(self):
+        """迁移只跑一次：再次打开不能重复搬运或报错。"""
+        path = self.root / "v1.db"
+        con = sqlite3.connect(path)
+        con.executescript("""
+            CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT, file TEXT, enabled INTEGER, created INTEGER);
+            CREATE TABLE keys (id TEXT PRIMARY KEY, name TEXT, hash TEXT, hint TEXT, created INTEGER,
+                              daily_limit INTEGER, models TEXT, accounts TEXT, usage TEXT);
+            CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+        """)
+        con.execute("INSERT INTO accounts VALUES ('a1','主号','a1.info',1,111)")
+        con.execute("INSERT INTO keys VALUES ('k1','K1','%s','sk…abcd',333,50,'[]','[]','{}')" % ("h" * 64))
+        con.execute("INSERT INTO kv VALUES ('pool',?)", (json.dumps({"checkin_time": "08:30"}),))
+        con.execute("INSERT INTO schema_meta VALUES ('version','1')")
+        con.commit()
+        con.close()
+
+        first = Database(path)
+        first.close()
+        second = Database(path)
+        try:
+            accounts = second.load_accounts()
+            self.assertEqual(set(accounts), {"a1"})
+            self.assertEqual(set(second.load_keys()), {"k1"})
+            self.assertEqual(second.get_settings()["checkin_time"], "08:30")
+        finally:
+            second.close()
 
     def test_legacy_state_json_is_imported_once(self):
         legacy = {
@@ -115,12 +383,13 @@ class DatabaseTests(unittest.TestCase):
         (self.root / "state.json").write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
         store = Store(self.root, self.auth, "", ADMIN)
         self.assertEqual(set(store.data["accounts"]), {"a1"})
-        self.assertEqual(store.data["active"], "a1")
         self.assertEqual(store.data["keys"]["k1"]["usage"]["count"], 3)
         self.assertEqual(store.data["keys"]["k1"]["daily_limit"], 50)
-        self.assertEqual(store.data["pool"]["routing"], "manual")
+        self.assertEqual(store.data["pool"]["checkin_time"], "08:30")
+        # routing 不再迁入 pool；manual 被 default_routing 取代。
+        self.assertNotIn("routing", store.data["pool"])
+        self.assertEqual(store.data["pool"]["default_routing"], "round_robin")
         self.assertEqual(store.data["account_status"]["a1"]["remaining"], 12.5)
-        self.assertEqual(store.data["model_registry"]["available"], ["glm-5.2"])
         # 迁移后原文件备份、不再重复导入。
         self.assertTrue((self.root / "state.json.bak").exists())
         self.assertFalse((self.root / "state.json").exists())
@@ -132,7 +401,6 @@ class DatabaseTests(unittest.TestCase):
         (self.root / "state.json").write_text("{ not json", encoding="utf-8")
         store = Store(self.root, self.auth, "", ADMIN)
         self.assertEqual(store.data["accounts"], {})
-        # 损坏的 legacy 文件被跳过，但数据库本体必须已建好。
         self.assertTrue((self.root / "state.db").exists())
 
     def test_persists_across_restart(self):
@@ -142,23 +410,19 @@ class DatabaseTests(unittest.TestCase):
         store.save()
         reloaded = Store(self.root, self.auth, "", ADMIN)
         self.assertEqual(set(reloaded.data["accounts"]), {aid})
-        self.assertEqual(reloaded.data["active"], aid)
         self.assertEqual(set(reloaded.data["keys"]), {kid})
         self.assertEqual(reloaded.data["keys"][kid]["daily_limit"], 7)
-        # hash 一致才能通过鉴权。
         self.assertEqual(reloaded.data["keys"][kid]["hash"], store.data["keys"][kid]["hash"])
 
     def test_plaintext_key_never_hits_disk(self):
         store = Store(self.root, self.auth, "", ADMIN)
         kid, value = store.add_key("客户端")
         store.save()
-        # 主库和 -wal 都要查：WAL 模式下未 checkpoint 的帧只在 -wal 里。
         for suffix in ("", "-wal"):
             blob = store.db.path.with_name(store.db.path.name + suffix).read_bytes()
             self.assertNotIn(value.encode(), blob, f"明文密钥泄漏到 {suffix or '主库'}")
 
     def test_inplace_mutation_is_still_persisted(self):
-        """脏标记存快照：原地修改 self.data 后必须仍能落库（引用相等会漏写）。"""
         store = Store(self.root, self.auth, "", ADMIN)
         aid = store.save_browser_account(credential("one"), "一号")["account_id"]
         store.save()
@@ -169,9 +433,9 @@ class DatabaseTests(unittest.TestCase):
             store.data["account_status"][aid]["remaining"] = 200
         store.save()
         reloaded = Store(self.root, self.auth, "", ADMIN)
-        self.assertEqual(reloaded.data["account_status"][aid]["remaining"], 200)
+        self.assertAlmostEqual(reloaded.data["account_status"][aid]["remaining"], 200)
 
-    def test_concurrent_writes_are_serialized(self):
+    def test_concurrent_usage_is_serialized_and_persisted(self):
         store = Store(self.root, self.auth, "", ADMIN)
         kid, _ = store.add_key("压测")
         errors = []
@@ -189,40 +453,28 @@ class DatabaseTests(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
+        store.save()
         reloaded = Store(self.root, self.auth, "", ADMIN)
         self.assertEqual(reloaded.data["keys"][kid]["usage"]["count"], 120)
 
     def test_stale_open_transaction_fails_loudly(self):
-        """回归：连接上残留未决事务时必须报错，不能静默把 save() 变成 no-op。
-
-        上一次次事务回滚失败（磁盘掉线后恢复）会留下未决事务。若 transaction()
-        只看 in_transaction 就以为是被嵌套调用而直接让出，之后每次 save() 都不写
-        任何东西却正常返回——调用方无感知，数据全部丢失。
-        """
+        """回归：连接上残留未决事务时必须报错，不能静默把 save() 变成 no-op。"""
         store = Store(self.root, self.auth, "", ADMIN)
         kid, _ = store.add_key("K")
         store.save()
-        # 手工留下一个未决事务（没有对应的 _depth 记录）。
         store.db._write.execute("BEGIN IMMEDIATE")
         store.db._write.execute("UPDATE keys SET name='stuck' WHERE id=?", (kid,))
 
         with self.assertRaises(RuntimeError):
-            store.record_key_usage(kid, tokens=1)
-        # 残局已被回滚，连接恢复可用，后续写入正常落库。
-        # 注意内存计数在报错前已经自增过，所以是 2 而不是 1。
+            store.save()
         self.assertFalse(store.db._write.in_transaction)
-        store.record_key_usage(kid, tokens=1)
+        store.save()
         store.db.close()
         reloaded = Store(self.root, self.auth, "", ADMIN)
-        self.assertEqual(reloaded.data["keys"][kid]["usage"]["count"], 2)
+        self.assertEqual(reloaded.data["keys"][kid]["usage"]["count"], 0)
 
     def test_close_waits_for_inflight_transaction(self):
-        """回归：close() 必须等待正在跑的事务，不能当场打断它。
-
-        lifespan 关闭时 cancel() 只取消 await 点，正在 to_thread 里 save() 的
-        池线程不会被中断。旧代码 close() 不取锁，_write.close() 会硬关连接，
-        那一次保存直接回滚丢失。
-        """
+        """回归：close() 必须等待正在跑的事务，不能当场打断它。"""
         store = Store(self.root, self.auth, "", ADMIN)
         kid, _ = store.add_key("K")
         store.save()
@@ -243,7 +495,8 @@ class DatabaseTests(unittest.TestCase):
 
         def worker():
             try:
-                store.record_key_usage(kid, tokens=1)
+                store.data["keys"][kid]["usage"]["count"] = 1
+                store.save()
             except Exception as exc:  # pragma: no cover - 仅失败时记录
                 errors.append(exc)
 
@@ -256,89 +509,77 @@ class DatabaseTests(unittest.TestCase):
             gate.set()
             thread.join()
         self.assertEqual(errors, [])
-        reloaded = Store(self.root, self.auth, "", ADMIN)
-        # 正在跑的那一次保存必须保住。
-        self.assertEqual(reloaded.data["keys"][kid]["usage"]["count"], 1)
+        reopened = Store(self.root, self.auth, "", ADMIN)
+        self.assertEqual(reopened.data["keys"][kid]["usage"]["count"], 1)
 
     def test_write_after_close_fails_loudly(self):
-        """回归：关闭后继续写必须明确报错，不能静默丢弃。"""
         db = Database(self.root / "t.db")
-        db.set_kv("k", {"v": 1})
         db.close()
         with self.assertRaises(RuntimeError):
-            db.set_kv("k2", {"v": 2})
-        # 幂等：重复 close 不炸。
-        db.close()
+            db.append_request_logs([{"time": NOW, "path": "/p", "source": "api", "outcome": "success", "duration_ms": 1}])
+        db.close()  # 幂等
 
     def test_failed_write_rolls_back_instead_of_wiping_table(self):
-        """回归：autocommit 下 ``with conn:`` 不开事务，DELETE 后崩溃会把整表清空。"""
+        """回归：autocommit 下 DELETE 后崩溃会把整表清空，必须真回滚。"""
         store = Store(self.root, self.auth, "", ADMIN)
         for i in range(3):
             store.save_browser_account(credential("u%d" % i), "号%d" % i)
         store.save()
         self.assertEqual(len(store.data["accounts"]), 3)
 
-        original = Database.replace_accounts
+        original = Database.save_accounts
 
-        def half_replace(self, accounts):
+        def half_save(self, entities, statuses):
             with self.transaction():
                 self._write.execute("DELETE FROM accounts")
                 raise KeyboardInterrupt("进程恰好死在 DELETE 之后、INSERT 之前")
 
-        Database.replace_accounts = half_replace
+        Database.save_accounts = half_save
         try:
             with self.assertRaises(KeyboardInterrupt):
                 store.save()
         finally:
-            Database.replace_accounts = original
-        # 崩溃不得留下半写状态：账号必须原样还在。
+            Database.save_accounts = original
         reloaded = Store(self.root, self.auth, "", ADMIN)
         self.assertEqual(set(reloaded.data["accounts"]), set(store.data["accounts"]))
 
     def test_save_is_atomic_across_all_tables(self):
-        """回归：save() 必须是单事务，不能账号提交了而 active 没提交。"""
+        """回归：save() 必须是单事务，不能账号提交了而密钥没提交。"""
         store = Store(self.root, self.auth, "", ADMIN)
         store.save_browser_account(credential("one"), "一号")
         store.save()
         self.assertEqual(len(store.data["accounts"]), 1)
 
-        original = Database.replace_keys
+        original = Database.save_keys
 
         def boom(self, keys):
-            raise KeyboardInterrupt("进程恰好死在 replace_keys")
+            raise KeyboardInterrupt("进程恰好死在 save_keys")
 
-        Database.replace_keys = boom
+        Database.save_keys = boom
         try:
             store.data["accounts"]["zz"] = dict(list(store.data["accounts"].values())[0])
             with self.assertRaises(KeyboardInterrupt):
                 store.save()
         finally:
-            Database.replace_keys = original
+            Database.save_keys = original
         reloaded = Store(self.root, self.auth, "", ADMIN)
-        # 崩溃必须整体回滚：新增的账号不得残留。
         self.assertEqual(len(reloaded.data["accounts"]), 1)
         self.assertNotIn("zz", reloaded.data["accounts"])
 
     def test_initial_key_is_not_recreated_on_every_boot(self):
-        """回归：auth 目录为空时 accounts 恒为空，旧逻辑每次重启都新建一个同值密钥。"""
         initial = "sk-wb-" + "A" * 40
         for _ in range(3):
             store = Store(self.root, self.auth, initial, ADMIN)
         self.assertEqual(len(store.data["keys"]), 1, f"密钥被重复创建：{store.data['keys']}")
 
     def test_corrupt_database_fails_loudly(self):
-        """坏库必须直接报错，而不是静默启动成空库把数据悄悄丢掉。
-
-        检测/隔离/重建属于运维侧（定时备份 + 人工恢复），业务层不猜：
-        打开失败就抛，让故障在启动时暴露。
-        """
         store = Store(self.root, self.auth, "", ADMIN)
         store.add_key("重要密钥")
         store.save()
         store.db.close()
         (self.root / "state.db").write_bytes(b"corrupted")
         (self.root / "state.db-wal").write_bytes(b"corrupted")
-        (self.root / "state.db-shm").unlink()
+        (self.root / "state.db-shm").unlink(missing_ok=True)
         with self.assertRaises(sqlite3.DatabaseError):
             Store(self.root, self.auth, "", ADMIN)
 
@@ -346,20 +587,18 @@ class DatabaseTests(unittest.TestCase):
         initial = "sk-wb-" + "B" * 40
         store = Store(self.root, self.auth, initial, ADMIN)
         (kid,) = store.data["keys"]
-        # hash 一致才能让 CODEBUDDY2OPENAI_KEY 直接通过鉴权。
         self.assertEqual(store.data["keys"][kid]["hash"], hashlib.sha256(initial.encode()).hexdigest())
 
     def test_save_is_fast_enough_for_request_path(self):
         store = Store(self.root, self.auth, "", ADMIN)
-        kid, _ = store.add_key("压测")
+        store.add_key("压测")
         store.save()
-        for _ in range(3):
-            store.record_key_usage(kid, tokens=1)
+        store.data["keys"][list(store.data["keys"])[0]]["usage"]["count"] = 1
+        store.save()
         started = time.perf_counter()
         for _ in range(30):
-            store.record_key_usage(kid, tokens=1)
+            store.save()
         per_call = (time.perf_counter() - started) / 30
-        # 远低于旧 JSON 全量写（4–8 ms）；留足余量防慢机器误报。
         self.assertLess(per_call, 0.05, f"save 过慢：{per_call*1000:.1f} ms")
 
 

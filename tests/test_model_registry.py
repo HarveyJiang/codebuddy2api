@@ -195,7 +195,8 @@ class ModelRegistryTests(unittest.TestCase):
         with patch("admin.models.httpx.Client") as client_cls:
             client_cls.return_value.__enter__.return_value.get.return_value = response
             registry.fetch()
-        state = registry.set_enabled("step-5-preview", False)
+        registry.set_enabled("step-5-preview", False)
+        state = registry.export_state()
         self.assertEqual(registry.enabled_models(),
                          ["glm-5.2", "space-bunny", "fast-model", "balanced-model", "deep-model"])
         self.assertIn("step-5-preview", registry.snapshot_ids())
