@@ -44,6 +44,11 @@ IDE_VERSION_CODE = "20260716"
 DEVICE_BRAND = "83DG"
 OS_VERSION = "Windows 11 Pro"
 FUNCTION = "solo_work_lite"
+# SOLO chat 的 function 参数决定「哪些模型可用」，两套互补（实测同一模型只在其中一套可调）：
+#   solo_work_lite  ：qwen3.8-max 可用，Doubao-Seed-Code 报 4001
+#   solo_agent_remote：Doubao-Seed-Code 可用，qwen3.8-max 报 4001
+# 因此请求时按模型自适应（先 work_lite，4001 再换 agent_remote，结果缓存）。
+FUNCTION_FALLBACK = "solo_agent_remote"
 CLIENT_UA = f"Trae/{IDE_VERSION}"
 
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
@@ -52,9 +57,11 @@ EP_MODELS = "/api/ide/v1/get_detail_param"
 REMOTE_MODELS_HOST = "https://work.trae.cn"
 EP_REMOTE_MODELS = "/api/remote/v1/models"
 REMOTE_MODELS_FUNCTIONS = "solo_agent_remote,solo_work_remote,solo_design_remote"
-# 同名模型在不同 function 组里的上下文/倍率可能不同（实测 design=232768 vs work/agent=256000），
-# 按优先级取首个，保证结果确定；本网关走 solo_work_lite，故 work 组优先。
-REMOTE_MODELS_FUNCTION_ORDER = ("solo_work_remote", "solo_agent_remote", "solo_design_remote")
+# 官网界面展示的是 solo_agent_remote 组（craft 模式）——目录以此组为准。
+# 同名模型在不同组里的上下文/倍率可能不同（实测 design=232768 vs work/agent=256000），
+# 且上游分组顺序不固定，故按此优先级排序去重，保证结果确定。
+REMOTE_MODELS_FUNCTION_ORDER = ("solo_agent_remote", "solo_work_remote", "solo_design_remote")
+CATALOG_FUNCTION = "solo_agent_remote"
 EP_EXCHANGE = "/cloudide/api/v3/trae/oauth/ExchangeToken"
 EP_USERINFO = "/cloudide/api/v3/trae/GetUserInfo"
 EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
@@ -72,14 +79,21 @@ _OWNED_BY = "trae-solo"
 _CREATED = 1753600000
 _CTX = 131072
 
-# 静态兜底表（冷启动 / 上游不可用时）：
-# 只保留「官方客户端菜单可见 且 solo_work_lite 可调用」的模型；隐藏/别名的 config_name
-# （custom_model_*、*subagent、summary、seed-code-pro-0430 等）不入表 —— 官网界面并不显示它们。
+# 静态兜底表（冷启动 / 上游不可用时）：= 官方菜单 solo_agent_remote 组（官网界面所见 20 个）。
+# 隐藏/别名的 config_name（custom_model_*、*subagent、summary、seed-code-pro-0430 等）不入表。
 _TRAE_STATIC_SPECS = (
     ("Doubao-Seed-Evolving", "Seed-Evolving", 256000),
     ("Doubao-Seed-2.1-Pro", "Seed-2.1-Pro-0915", 256000),
     ("Doubao-Seed-2.1-Turbo", "Seed-2.1-Turbo", 256000),
+    ("Doubao-Seed-Code", "Seed-Code", 256000),
+    ("mimo-v2.6-flash", "MiMo-V2.6-Flash", 200000),
+    ("mimo-v2.6-pro", "MiMo-V2.6-Pro", 200000),
+    ("step-5-preview", "Step-5-Preview", 200000),
+    ("glm-5.3-flashx", "GLM-5.3-FlashX", 200000),
+    ("glm-5.3-flash", "GLM-5.3-Flash", 200000),
+    ("glm-5.3", "GLM-5.3", 200000),
     ("glm-5.2", "GLM-5.2", 200000),
+    ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 200000),
     ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash", 200000),
     ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro", 200000),
     ("kimi-k3", "Kimi-K3", 200000),
@@ -241,13 +255,16 @@ def _normalize_tools(obj: dict) -> None:
         obj["tools"] = out
 
 
-def prepare_solo_body(body: dict) -> dict:
-    """OpenAI → SOLO llm_utils_chat 请求体（单 pass 改写）。非 dict 原样返回。"""
+def prepare_solo_body(body: dict, function: str | None = None) -> dict:
+    """OpenAI → SOLO llm_utils_chat 请求体（单 pass 改写）。非 dict 原样返回。
+
+    function 缺省用 FUNCTION；按模型自适应时由调用方传入。
+    """
     if not isinstance(body, dict):
         return body
     obj = dict(body)
     obj["stream"] = True
-    obj["function"] = FUNCTION
+    obj["function"] = function or FUNCTION
 
     msgs = obj.get("messages")
     if isinstance(msgs, list):
@@ -507,6 +524,7 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
             seen.add(mid)
             ctx = (item.get("context_window_tokens") or {}).get("dev")
             out.append({"id": mid, "name": str(item.get("display_name") or mid),
+                        "function": str(group.get("function") or ""),
                         "context_length": int(ctx) if isinstance(ctx, (int, float)) and ctx else None,
                         "credits": _feature_rate(item.get("features"))})
     if not out:
@@ -514,27 +532,59 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
     return out
 
 
-def build_trae_catalog(detail: list[dict] | None, menu: list[dict] | None) -> list[dict]:
-    """构建 Trae 模型目录 = **官方菜单（可见）∩ get_detail_param（本 function 可调用）**。
+# ---------------------------------------------------------------------------
+# 请求侧 function 自适应：同一模型在不同 function 下可用性不同（4001 param invalid）
+# ---------------------------------------------------------------------------
 
-    两个来源各管一件事，缺一不可：
+_FUNCTION_CACHE: dict[str, str] = {}
+_FUNCTION_LOCK = threading.Lock()
 
-    - 官方菜单 `/api/remote/v1/models`：官网界面显示的模型（「可见」的权威），并带倍率
-      （`consumption_rate`，会员折扣生效取实付倍率）与上下文。
-    - `get_detail_param`：按 `solo_work_lite` 过滤的 config_name（「可调用」的权威），
-      但它含隐藏/别名项——`custom_model_*`、`*subagent`、`summary`、`seed-code-pro-0430`
-      （展示名竟与 Doubao-Seed-2.1-Pro 重名）等，官网界面并不显示，故不入目录。
 
-    两个方向的差异都要排除：纯菜单独有的模型（`mimo-*`、`glm-5.3*`、`step-5-preview` 等 8 个）
-    属其它 function，本 function 调用必回 `4001 param is invalid`。
+def function_chain(model: str) -> list[str]:
+    """该模型要依次尝试的 function 链（缓存的可用值优先，其余按序兜底）。"""
+    with _FUNCTION_LOCK:
+        first = _FUNCTION_CACHE.get(str(model or ""), FUNCTION)
+    order = [first] + [f for f in (FUNCTION, FUNCTION_FALLBACK) if f != first]
+    return order
+
+
+def remember_function(model: str, fn: str) -> None:
+    with _FUNCTION_LOCK:
+        _FUNCTION_CACHE[str(model or "")] = fn
+
+
+def _is_param_invalid(err: BackendHTTPError) -> bool:
+    """上游 4001 ＝ function 与模型不匹配（param invalid），可换 function 重试。"""
+    try:
+        return b"4001" in (err.body or b"")
+    except Exception:
+        return False
+
+
+def _param_invalid_body(model: str) -> bytes:
+    """两个 function 都试过仍 4001：该模型当前账号不可用（多为尚未开放/需更新客户端）。"""
+    return json.dumps({
+        "error": {
+            "message": f"模型 {model} 当前不可用：上游拒绝了该模型的参数校验（4001）。"
+                       f"可能该模型尚未对当前账号开放。",
+            "type": "invalid_request_error",
+            "code": 4001,
+        }
+    }, ensure_ascii=False).encode("utf-8")
+
+
+def build_trae_catalog(menu: list[dict] | None) -> list[dict]:
+    """构建 Trae 模型目录 = **官方菜单的 solo_agent_remote 组**（= 官网界面展示的模型集合）。
+    该组即客户端 craft 模式的模型菜单，带倍率（`consumption_rate`，会员/补贴折扣生效取实付倍率）
+    与上下文。同名模型若也出现在其它组，已按 `REMOTE_MODELS_FUNCTION_ORDER` 取该组的值。
+    该组缺失时退回全部组；内部槽位（custom_model_*/subagent/工具）始终剔除。
     """
-    callable_ids = {str(e.get("id") or "").strip() for e in detail or [] if isinstance(e, dict)}
+    groups = [g for g in menu or [] if isinstance(g, dict)]
+    picked = [e for e in groups if str(e.get("function") or "") == CATALOG_FUNCTION] or groups
     out, seen = [], set()
-    for entry in menu or []:
-        if not isinstance(entry, dict):
-            continue
+    for entry in picked:
         mid = str(entry.get("id") or "").strip()
-        if not mid or mid in seen or mid not in callable_ids or _is_internal_slot(mid):
+        if not mid or mid in seen or _is_internal_slot(mid):
             continue
         seen.add(mid)
         out.append({"id": mid, "name": entry.get("name") or mid,
@@ -768,17 +818,16 @@ class TraeCredentialManager:
             return h
 
     def fetch_models(self) -> list[dict]:
-        """Trae 模型目录：官方菜单（可见 + 倍率）∩ get_detail_param（本 function 可调用）。
+        """Trae 模型目录 = 官方菜单 solo_agent_remote 组（与官网界面一致，含倍率/上下文）。
 
-        两套来源缺一不可：菜单定「官网界面显示什么」并给倍率/上下文，detail_param 定
-        「本网关能不能调」。任一失败即抛错，由调用方保留上次快照——
-        宁可少刷新一次，也不把隐藏/不可调用的 config_name 当模型暴露出去。
+        不再依赖 get_detail_param：它返回的是「本 function 可调用」超集，含官网不显示的
+        隐藏/别名 config_name（custom_model_*、*subagent、summary、seed-code-pro-0430 等），
+        而那部分有效性已由请求时的 function 自适应解决（见 function_chain）。
+        菜单拉取失败即抛错，由调用方保留上次快照。
         """
-        solo = self.get_headers(stream=False)
         with httpx.Client(timeout=20) as client:
             menu = fetch_remote_models(client, self.ug_headers())
-            detail = fetch_models(client, solo)
-        return build_trae_catalog(detail, menu)
+        return build_trae_catalog(menu)
 
     def checkin_status(self, client) -> dict:
         return checkin_status(client, self.ug_headers())
@@ -998,8 +1047,36 @@ class TraeBackend(BackendSpec):
     def make_credential(self, path):
         return TraeCredentialManager(path)
 
+    def function_for(self, model: str) -> str:
+        """该模型首选 function（自适应结果缓存优先，默认 FUNCTION）。"""
+        with _FUNCTION_LOCK:
+            return _FUNCTION_CACHE.get(str(model or ""), FUNCTION)
+
     async def astream(self, headers, body, *, timeout=None, raise_on_error=False):
-        prepared = prepare_solo_body(body)
+        model = str((body or {}).get("model") or "")
+        chain = function_chain(model)
+        for idx, fn in enumerate(chain):
+            prepared = prepare_solo_body(body, function=fn)
+            emitted = False
+            try:
+                async for chunk in self._stream(prepared, headers, timeout=timeout, raise_on_error=raise_on_error):
+                    emitted = True
+                    yield chunk
+                return
+            except BackendHTTPError as e:
+                # 4001 ＝ function 与模型不匹配（param invalid）→ 换下一个 function 重试，
+                # 并把可用 function 记住。仅在「尚未向客户端吐出 chunk」时重试，
+                # 避免流中途换号导致内容重复。
+                if (idx + 1 < len(chain) and not e.emitted and not emitted and _is_param_invalid(e)):
+                    with _FUNCTION_LOCK:
+                        _FUNCTION_CACHE[model] = chain[idx + 1]
+                    continue
+                if _is_param_invalid(e) and not e.emitted and not emitted:
+                    # 两个 function 都试过仍失败 → 给出可读原因（避免直接抛上游原文）
+                    raise BackendHTTPError(400, _param_invalid_body(model)) from e
+                raise
+
+    async def _stream(self, prepared, headers, *, timeout=None, raise_on_error=False):
         url = self.chat_url()
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:

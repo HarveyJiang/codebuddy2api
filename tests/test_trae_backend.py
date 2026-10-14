@@ -194,8 +194,8 @@ def test_map_model_unknown_raises():
 
 
 def test_trae_static_models_count():
-    assert len(TRAE_MODELS := T.TRAE_STATIC_MODELS) == 12
-    assert len(trae_model_ids()) == 12
+    assert len(TRAE_MODELS := T.TRAE_STATIC_MODELS) == 20
+    assert len(trae_model_ids()) == 20
     assert all(m["owned_by"] == "trae-solo" for m in TRAE_MODELS)
 
 
@@ -548,7 +548,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert r.status_code == 200
         data = r.json()["data"]
         trae = [m for m in data if m["id"].startswith("trae/")]
-        assert len(trae) == 12
+        assert len(trae) == 20
         assert all(m["owned_by"] == "trae-solo" for m in trae)
         assert any(m["id"] == "trae/glm-5.2" for m in trae)
 
@@ -1066,15 +1066,16 @@ def test_feature_rate_prefers_discount_then_base():
 
 def test_fetch_remote_models_parses_menu_and_dedupes():
     payload = _menu(
-        ("solo_design_remote", [  # 同名不同值：应被 work 组覆盖
+        ("solo_design_remote", [  # 同名不同值：agent 组优先，应被覆盖
             {"name": "glm-5.3", "display_name": "GLM-5.3(design)", "context_window_tokens": {"dev": 232768},
              "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.9}}}'}]),
         ("solo_work_remote", [
+            {"name": "glm-5.3", "display_name": "GLM-5.3(work)", "context_window_tokens": {"dev": 233000},
+             "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.5}}}'}]),
+        ("solo_agent_remote", [
             {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000},
              "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'},
             {"name": "glm-5.3", "display_name": "重复项", "features": "{}"},
-        ]),
-        ("solo_agent_remote", [
             {"name": "Doubao-Seed-Code", "display_name": "Seed-Code",
              "context_window_tokens": {"dev": 256000},
              "features": '{"activity_discount":{"enable":true,"data":{"current":{"consumption_rate":0.03}}}}'},
@@ -1083,9 +1084,10 @@ def test_fetch_remote_models_parses_menu_and_dedupes():
     with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
         models = T.fetch_remote_models(client, {})
     assert [m["id"] for m in models] == ["glm-5.3", "Doubao-Seed-Code"]
-    # work 组优先 → 取 work 的上下文/倍率，且组内去重
-    assert models[0] == {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}
-    assert models[1]["credits"] == 0.03
+    # agent 组优先 → 取 agent 的上下文/倍率，组内去重，且带 function 标记
+    assert models[0] == {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39,
+                         "function": "solo_agent_remote"}
+    assert models[1]["credits"] == 0.03 and models[1]["context_length"] == 256000
 
 
 def test_fetch_remote_models_errors():
@@ -1101,41 +1103,43 @@ def test_fetch_remote_models_errors():
             T.fetch_remote_models(client, {})
 
 
-def test_build_trae_catalog_is_menu_intersect_detail():
-    """目录 = 官方菜单（可见）∩ detail_param（本 function 可调用）：两个方向的差异都要排除。"""
-    menu = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78},
-            {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}]  # 仅菜单→其它 function，会 4001
-    detail = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 131072},
-              {"id": "seed-code-pro-0430", "name": "Doubao-Seed-2.1-Pro", "context_length": 131072},  # 仅 detail→官网不显示的隐藏项
-              {"id": "summary"}, {"id": "custom_model_gpt-5"}, {"id": "explore_sub_agent_v2"}]
-    catalog = T.build_trae_catalog(detail, menu)
-    assert [m["id"] for m in catalog] == ["glm-5.2"]
+def test_build_trae_catalog_uses_agent_group():
+    """目录取官方菜单的 solo_agent_remote 组（= 官网界面所见），而非其它 function 组。"""
+    menu = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78,
+             "function": "solo_agent_remote"},
+            {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39,
+             "function": "solo_agent_remote"},
+            {"id": "design-only", "name": "Design", "context_length": 1000, "credits": 0.1,
+             "function": "solo_design_remote"}]
+    catalog = T.build_trae_catalog(menu)
+    assert [m["id"] for m in catalog] == ["glm-5.2", "glm-5.3"]
     assert catalog[0] == {"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78}
-    # 菜单缺失 → 无法确定可见集合 → 空目录（调用方保留上次快照）
-    assert T.build_trae_catalog(detail, None) == []
-    assert T.build_trae_catalog(None, menu) == []
-    # 静态兜底表只含官网可见模型
+    # 该组缺失 → 退回全部组；内部槽位始终剔除
+    only_design = [{"id": "design-only", "name": "D", "context_length": 1000, "credits": 0.1,
+                    "function": "solo_design_remote"},
+                   {"id": "custom_model_gpt-5", "name": "x", "credits": None, "function": "solo_design_remote"}]
+    assert [m["id"] for m in T.build_trae_catalog(only_design)] == ["design-only"]
+    assert T.build_trae_catalog(None) == []
     assert all(not T._is_internal_slot(m["id"]) for m in T.TRAE_STATIC_MODELS)
     assert "seed-code-pro-0430" not in {m["id"] for m in T.TRAE_STATIC_MODELS}
 
 
-def test_manager_fetch_models_menu_intersect_detail(tmp_path):
+def test_manager_fetch_models_uses_agent_group(tmp_path):
     doc = trae_credential()
     p = tmp_path / "t.info"
     p.write_text(json.dumps(doc), encoding="utf-8")
     mgr = T.TraeCredentialManager(p)
 
     def handler(req):
-        if "/api/remote/v1/models" in str(req.url):
-            return httpx.Response(200, json=_menu(("solo_work_remote", [
-                {"name": "glm-5.2", "display_name": "GLM-5.2", "context_window_tokens": {"dev": 200000},
-                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.78}}}'},
+        return httpx.Response(200, json=_menu(
+            ("solo_work_remote", [
+                {"name": "qwen3.8-max", "display_name": "Qwen3.8-Max", "context_window_tokens": {"dev": 200000},
+                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":1.5}}}'}]),
+            ("solo_agent_remote", [
                 {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000},
-                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'}])))
-        return httpx.Response(200, json={"config_info_list": [
-            {"config_name": "glm-5.2", "display_config": {"display_name": "GLM-5.2"}},
-            {"config_name": "seed-code-pro-0430", "display_config": {"display_name": "Doubao-Seed-2.1-Pro"}},
-            {"config_name": "summary", "display_config": {"display_name": "summary"}}]})
+                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'},
+                {"name": "qwen3.8-max", "display_name": "Qwen3.8-Max", "context_window_tokens": {"dev": 200000},
+                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":1.5}}}'}])))
 
     real = _REAL_SYNC_CLIENT
     orig = httpx.Client
@@ -1144,43 +1148,96 @@ def test_manager_fetch_models_menu_intersect_detail(tmp_path):
         models = mgr.fetch_models()
     finally:
         httpx.Client = orig
-    # glm-5.3 仅菜单（其它 function）、seed-code-pro-0430 仅 detail（官网不显示）、summary 内部槽位 → 全部剔除
-    assert [m["id"] for m in models] == ["glm-5.2"]
-    assert models[0]["credits"] == 0.78 and models[0]["context_length"] == 200000
+    assert [m["id"] for m in models] == ["glm-5.3", "qwen3.8-max"]
+    assert models[0]["credits"] == 0.39 and models[0]["context_length"] == 200000
 
 
-def test_manager_fetch_models_failure_raises(tmp_path):
-    """任一来源不可用即抛错（保留上次快照），不拿单边数据冒充可用模型。"""
+def test_manager_fetch_models_menu_failure_raises(tmp_path):
+    """菜单不可用即抛错（保留上次快照），不拿单边数据冒充可用模型。"""
     doc = trae_credential()
     p = tmp_path / "t.info"
     p.write_text(json.dumps(doc), encoding="utf-8")
     mgr = T.TraeCredentialManager(p)
 
-    def detail_down(req):
-        if "/api/remote/v1/models" in str(req.url):
-            return httpx.Response(200, json=_menu(("solo_work_remote", [{"name": "glm-5.3"}])))
-        return httpx.Response(500, text="boom")
-
     real = _REAL_SYNC_CLIENT
     orig = httpx.Client
-    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(detail_down), **kw)
+    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(lambda req: httpx.Response(503, text="boom")), **kw)
     try:
         with pytest.raises(T.TraeAPIError):
             mgr.fetch_models()
     finally:
         httpx.Client = orig
 
-    def menu_down(req):
-        if "/api/remote/v1/models" in str(req.url):
-            return httpx.Response(503, text="boom")
-        return httpx.Response(200, json={"config_info_list": [{"config_name": "glm-5.2"}]})
 
-    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(menu_down), **kw)
+def test_function_chain_prefers_cached_and_retries():
+    """function 自适应：默认 work_lite，记住 agent 后优先 agent。"""
+    assert T.function_chain("brand-new-model") == ["solo_work_lite", "solo_agent_remote"]
+    T.remember_function("brand-new-model", "solo_agent_remote")
     try:
-        with pytest.raises(T.TraeAPIError):
-            mgr.fetch_models()
+        assert T.function_chain("brand-new-model") == ["solo_agent_remote", "solo_work_lite"]
     finally:
-        httpx.Client = orig
+        T._FUNCTION_CACHE.pop("brand-new-model", None)
+
+
+def test_is_param_invalid_detects_4001():
+    from core.backends.base import BackendHTTPError
+    assert T._is_param_invalid(BackendHTTPError(400, b'{"code":4001,"message":"param is invalid"}'))
+    assert not T._is_param_invalid(BackendHTTPError(400, b'{"code":1005}'))
+    assert not T._is_param_invalid(BackendHTTPError(400, None))
+
+
+def test_astream_retries_with_fallback_function(monkeypatch):
+    """work_lite 回 4001 → 自动换 agent_remote 重试成功，并记住该模型的 function。"""
+    backend = T.TraeBackend()
+    calls = []
+
+    async def fake_stream(prepared, headers, *, timeout=None, raise_on_error=False):
+        calls.append(prepared["function"])
+        if len(calls) == 1:
+            from core.backends.base import BackendHTTPError
+            raise BackendHTTPError(400, b'{"code":4001,"message":"param is invalid"}')
+        yield b"data: [DONE]\n\n"
+
+    async def run():
+        return [c async for c in backend.astream({}, {"model": "probe-model"})]
+
+    monkeypatch.setattr(backend, "_stream", fake_stream)
+    try:
+        chunks = asyncio.run(run())
+        assert calls == ["solo_work_lite", "solo_agent_remote"]
+        assert chunks == [b"data: [DONE]\n\n"]
+        assert T.function_chain("probe-model")[0] == "solo_agent_remote"
+    finally:
+        T._FUNCTION_CACHE.pop("probe-model", None)
+
+
+def test_astream_does_not_retry_after_emitting(monkeypatch):
+    """已向客户端吐出 chunk 后不再换 function 重试（避免重复内容）。"""
+    from core.backends.base import BackendHTTPError
+    backend = T.TraeBackend()
+    calls = []
+
+    async def fake_stream(prepared, headers, *, timeout=None, raise_on_error=False):
+        calls.append(prepared["function"])
+        yield b'data: {"choices":[]}\n\n'
+        raise BackendHTTPError(400, b'{"code":4001}', emitted=True)
+
+    async def run():
+        got = []
+        try:
+            async for c in backend.astream({}, {"model": "emit-model"}):
+                got.append(c)
+        except BackendHTTPError:
+            pass
+        return got
+
+    monkeypatch.setattr(backend, "_stream", fake_stream)
+    try:
+        got = asyncio.run(run())
+        assert calls == ["solo_work_lite"] and len(got) == 1
+        assert T.function_chain("emit-model")[0] == "solo_work_lite"
+    finally:
+        T._FUNCTION_CACHE.pop("emit-model", None)
 
 
 def test_checkin_status_and_claim_and_ent_usage(tmp_path):
@@ -1222,15 +1279,33 @@ def test_manager_fetch_models_uses_solo_headers(tmp_path):
     mgr = T.TraeCredentialManager(p)
     seen = {}
 
+def test_manager_solo_headers_non_stream(tmp_path):
+    """get_headers(stream=False) 是 chat/SOLO 用的头（Accept: application/json）。"""
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mgr = T.TraeCredentialManager(p)
+    headers = mgr.get_headers(stream=False)
+    assert headers["Accept"] == "application/json"
+    assert headers["Authorization"] == "Cloud-IDE-JWT TRAE-ACCESS"
+    assert headers.get("X-Uid") == "trae-user"
+
+
+def test_manager_fetch_models_uses_ug_headers(tmp_path):
+    """模型菜单走 ug 头（X-User-Region/X-Device-Id），端点 /api/remote/v1/models。"""
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mgr = T.TraeCredentialManager(p)
+    seen = {}
+
     def handler(req):
-        if "/api/remote/v1/models" in str(req.url):
-            return httpx.Response(200, json=_menu(("solo_work_remote", [
-                {"name": "glm-5.2", "display_name": "GLM-5.2", "context_window_tokens": {"dev": 200000}}])))
-        seen["accept"] = req.headers["Accept"]
-        seen["uid"] = req.headers.get("X-Uid")
+        seen["url"] = str(req.url)
         seen["auth"] = req.headers["Authorization"]
-        seen["body"] = req.content
-        return httpx.Response(200, json={"config_info_list": [{"config_name": "glm-5.2", "display_config": {"display_name": "GLM"}}]})
+        seen["region"] = req.headers.get("X-User-Region")
+        seen["device"] = req.headers.get("X-Device-Id")
+        return httpx.Response(200, json=_menu(("solo_agent_remote", [
+            {"name": "glm-5.2", "display_name": "GLM-5.2", "context_window_tokens": {"dev": 200000}}])))
 
     real = _REAL_SYNC_CLIENT
     orig = httpx.Client
@@ -1240,10 +1315,9 @@ def test_manager_fetch_models_uses_solo_headers(tmp_path):
     finally:
         httpx.Client = orig
     assert [m["id"] for m in models] == ["glm-5.2"]
-    assert seen["accept"] == "application/json"  # 非流式
-    assert seen["uid"] == "trae-user"
+    assert "/api/remote/v1/models" in seen["url"] and "solo_agent_remote" in seen["url"]
     assert seen["auth"] == "Cloud-IDE-JWT TRAE-ACCESS"
-    assert json.loads(seen["body"])["function"] == "solo_work_lite"
+    assert seen["region"] == "CN" and seen["device"] == "d" * 32
 
 
 def test_ug_api_error_paths():
@@ -1308,7 +1382,7 @@ def test_catalog_provider_exception_falls_back_static():
         raise RuntimeError("registry gone")
     T.set_catalog_provider(boom)
     try:
-        assert len(T.trae_model_catalog()) == 12
+        assert len(T.trae_model_catalog()) == 20
         assert T.map_model("glm-5.2") == "glm-5.2"
     finally:
         T.set_catalog_provider(None)
@@ -1325,12 +1399,12 @@ def test_registry_trae_builtin_seed_and_disable():
     reg = _registry()
     reg.ensure_trae_builtin()
     ids = reg.snapshot_ids()
-    assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 12
+    assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 20
     enabled = reg.enabled_models()
     assert "trae/glm-5.2" in enabled
     snap = reg.snapshot()["models"]
     trae_rows = [m for m in snap if m.get("backend") == "trae"]
-    assert len(trae_rows) == 12 and all(m["enabled"] for m in trae_rows)
+    assert len(trae_rows) == 20 and all(m["enabled"] for m in trae_rows)
     # 禁用 trae/glm-5.2
     state = reg.set_enabled("trae/glm-5.2", False)
     assert "trae/glm-5.2" not in reg.enabled_models()
@@ -1504,3 +1578,31 @@ async def _e2e_dynamic_catalog_replaces_static(self):
 
 TraeEndToEnd.test_e2e_batch_checkin_covers_trae = _e2e_batch_checkin_covers_trae
 TraeEndToEnd.test_e2e_dynamic_catalog_replaces_static = _e2e_dynamic_catalog_replaces_static
+
+
+def test_astream_param_invalid_after_both_functions(monkeypatch):
+    """两个 function 都 4001 → 抛 400 且给出可读原因（不冷却账号：400 不在冷却集合）。"""
+    from core.backends.base import BackendHTTPError
+    backend = T.TraeBackend()
+    calls = []
+
+    async def fake_stream(prepared, headers, *, timeout=None, raise_on_error=False):
+        calls.append(prepared["function"])
+        raise BackendHTTPError(400, b'{"code":4001,"message":"param is invalid"}')
+        yield b""  # pragma: no cover
+
+    async def run():
+        try:
+            async for _ in backend.astream({}, {"model": "never-model"}):
+                pass
+        except BackendHTTPError as e:
+            return e
+        return None
+
+    monkeypatch.setattr(backend, "_stream", fake_stream)
+    try:
+        err = asyncio.run(run())
+        assert calls == ["solo_work_lite", "solo_agent_remote"]
+        assert err.status == 400 and b"4001" in err.body and "不可用".encode() in err.body
+    finally:
+        T._FUNCTION_CACHE.pop("never-model", None)
