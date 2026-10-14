@@ -281,6 +281,22 @@ class AdminMiddleware:
         await self.app(scope, replay, secure_send)
 
 
+def _stale_catalog(registry):
+    """缓存 catalog 是否为旧格式（描述含英文、或未按单价升序）时需重新拉取。"""
+    models = registry.snapshot().get("models") or []
+    if not models:
+        return False
+    for entry in models:
+        desc = entry.get("description") or ""
+        # 旧逻辑把 descriptionEn 用「 · 」拼在后面。
+        if " · " in desc:
+            return True
+    # 旧逻辑直接沿用上游 cli 菜单顺序，未按单价升序重排。
+    credits = [m.get("credits") if isinstance(m.get("credits"), (int, float)) else 0
+               for m in models]
+    return credits != sorted(credits)
+
+
 def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=True):
     store = Store(root or os.environ.get("MANAGEMENT_DATA_DIR", "/data/management"), auth_dir or os.environ.get("CODEBUDDY_AUTH_DIR", "/data/auth"), initial_key if initial_key is not None else os.environ.get("CODEBUDDY2OPENAI_KEY", ""), admin_key or os.environ.get("ADMIN_KEY", ""))
     converter._check_auth = store.check_api
@@ -291,14 +307,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     model_registry = ModelRegistry(get_credential=store.any_enabled_manager)
     model_registry.import_state(store.data.get("model_registry"))
     model_registry.ensure_builtin()
-    app_state_seed = store.data.get("model_registry") or {}
-    if not app_state_seed.get("available"):
-        # First boot (or previous fetch never succeeded): try once synchronously so
-        # /v1/models is correct immediately, then fall back to builtin if offline.
+    # 缓存里的描述是旧逻辑（中文+英文拼接、上游原始顺序）时重新拉取一次，
+    # 让展示立即变成「只有中文 + 按单价升序」。
+    if _stale_catalog(model_registry):
         model_registry.fetch()
         model_registry.ensure_builtin()
-        store.data["model_registry"] = model_registry.export_state()
-        store.save()
+        with store.lock:
+            store.data["model_registry"] = model_registry.export_state()
+            store.save()
     @asynccontextmanager
     async def lifespan(app):
         async def reap():

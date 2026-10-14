@@ -108,6 +108,20 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         # 旧的积分同步间隔字段已移除。
         self.assertNotIn("sync_interval", (await self.client.get("/admin/api/overview")).json()["pool"])
 
+    def test_stale_catalog_detection(self):
+        """旧格式缓存（描述含英文、或未按单价升序）需重新拉取；新格式不需要。"""
+        from admin.models import ModelRegistry, BUILTIN_ORDER
+        registry = ModelRegistry(get_credential=lambda: None)
+        registry.ensure_builtin()
+        # 内置列表：三档智能路由排在末尾，未按单价升序 -> 判定为旧格式。
+        self.assertTrue(admin_server._stale_catalog(registry))
+        # 描述换成纯中文、顺序按单价升序后，不再判定为旧格式。
+        catalog = {mid: dict(info, description="中文描述") for mid, info in registry._catalog.items()}
+        registry._catalog = catalog
+        registry._available = sorted(BUILTIN_ORDER, key=lambda m: (
+            catalog[m].get("credits") if isinstance(catalog[m].get("credits"), (int, float)) else 0))
+        self.assertFalse(admin_server._stale_catalog(registry))
+
     async def test_invalid_credentials_and_limits(self):
         await self.login()
         for doc in [{}, {"auth": {}, "account": {}}, {**credential(), "account": {"uid": "bad\r\nheader"}}, {**credential(), "auth": {**credential()["auth"], "expiresAt": "not-time"}}]:
