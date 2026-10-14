@@ -22,7 +22,7 @@ from core import converter
 from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
-from .models import ModelRegistry
+from .models import CN, ModelRegistry
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
