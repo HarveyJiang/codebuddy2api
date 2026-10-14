@@ -73,7 +73,10 @@ BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 # 与官方 CLI 一致（admin/models.py 同值）：上游按 UA 识别客户端，
 # 自定 UA 会导致用量接口 client 为空。
-USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
+# 真实 WorkBuddy 桌面端 spawn 内置 CLI 时通过环境变量注入身份，最终拼装成：
+#   User-Agent: WorkBuddy/<product_ver> CLI/<cli_ver>
+# 上游用量接口的 client 字段即从 UA 首段解析。
+USER_AGENT = "WorkBuddy/5.8.2 CLI/2.161.0"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -215,6 +218,7 @@ class CredentialManager:
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
+            "X-IDE-Type": "workbuddy",
             "User-Agent": USER_AGENT,
         }
         return h
