@@ -1,0 +1,720 @@
+"""TraeBackend — 字节 TRAE Work SOLO 免费通道（私有协议）→ OpenAI Chat SSE。
+
+移植自 Go 项目 traework2api（internal/upstream/*）。上游是私有协议而非
+OpenAI 形状，因此本模块把：
+  1. OpenAI 请求体改写为 SOLO 形状（prepare_solo_body，对应 Go PrepareBody）；
+  2. SOLO 自定义 SSE（metadata/timing_cost/output/extra_info/token_usage/done/error）
+     归一化为标准 OpenAI Chat SSE chunk（normalize_solo_stream，对应 Go Stream）；
+  3. 上游错误分类为 HTTP 语义码（classify_*）。
+
+有意偏离 Go（记录在案）：
+- chunk/completion 的 model 盖章为请求 config_name（Go 为 ""）；
+- map_model 大小写不敏感兜底（修 Go normalizeModelName → DeepSeek-V4-Pro 不匹配的 bug）；
+- 流内错误发 OpenAI 形状 error chunk（Go 发 `event: error` + 字符串），让
+  PoolMiddleware 的 SSE 扫描命中 → 冷却账号；
+- 不在请求内换号重试（Go MaxRotate=3）；
+- 1005→402 走既有指数退避（Go 平铺 12h）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from pathlib import Path
+
+import httpx
+
+from .base import BackendHTTPError, BackendSpec
+
+# ---------------------------------------------------------------------------
+# 常量（SPEC §1，来自实测，禁止随意改动）
+# ---------------------------------------------------------------------------
+
+AGENT_HOST = "https://trae-api-cn.mchost.guru"
+UG_HOST = "https://api.trae.cn"
+OAUTH_HOST = "https://api.trae.com.cn"
+CONSOLE_HOST = "https://www.trae.cn"
+
+CLIENT_ID = "en1oxy7wnw8j9n"  # SOLO stable
+APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+IDE_VERSION = "0.1.43"
+IDE_VERSION_CODE = "20260716"
+DEVICE_BRAND = "83DG"
+OS_VERSION = "Windows 11 Pro"
+FUNCTION = "solo_work_lite"
+CLIENT_UA = f"Trae/{IDE_VERSION}"
+
+EP_CHAT = "/api/agent/v3/llm_utils_chat"
+EP_MODELS = "/api/ide/v1/get_detail_param"
+EP_EXCHANGE = "/cloudide/api/v3/trae/oauth/ExchangeToken"
+EP_USERINFO = "/cloudide/api/v3/trae/GetUserInfo"
+EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
+EP_CHECKIN_CLAIM = "/trae/api/v2/ug/checkin_credits/claim"
+EP_ENT_USAGE = "/trae/api/v2/pay/ide_user_ent_usage"
+
+DEFAULT_CONFIG_NAME = "glm-5.2"
+REFRESH_SKEW_SECONDS = 24 * 3600  # token 预刷新窗口（Go RefreshSkew=24h）
+
+# ---------------------------------------------------------------------------
+# 静态模型表（SPEC P3：32 个 config_name，来自逆向报告；动态拉取失败时回退）
+# ---------------------------------------------------------------------------
+
+_OWNED_BY = "trae-solo"
+_CREATED = 1753600000
+_CTX = 131072
+
+TRAE_STATIC_MODELS = [
+    {"id": mid, "object": "model", "created": _CREATED, "owned_by": _OWNED_BY, "context_length": _CTX}
+    for mid in (
+        "Doubao-Seed-2.1-Pro",
+        "seed-code-pro-0430",
+        "Doubao-Seed-2.1-Turbo",
+        "Doubao-Seed-2.0-Code",
+        "DeepSeek-V4-Flash-Official",
+        "browser_use_subagent",
+        "glm-5.2",
+        "glm-5-turbo",
+        "glm-5",
+        "DeepSeek-V4-Pro",
+        "DeepSeek-V4-Flash",
+        "kimi-k3",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "minimax-m3",
+        "qwen-3.7-plus",
+        "sagitta",
+        "aquila",
+        "custom_model_gemini",
+        "custom_model_placeholder",
+        "custom_model_1M_text",
+        "custom_model_1M",
+        "custom_model_kimi",
+        "custom_model_claude",
+        "custom_model_gpt-5",
+        "custom_model_no-fc",
+        "custom_model_deepseek_chat",
+        "custom_model_deepseek_reasoner",
+        "custom_model_deepseek_v4",
+        "explore_sub_agent_v13",
+        "explore_sub_agent_v2",
+        "summary",
+    )
+]
+
+_TRAE_MODEL_IDS = {m["id"] for m in TRAE_STATIC_MODELS}
+_TRAE_MODEL_IDS_LOWER = {m["id"].lower(): m["id"] for m in TRAE_STATIC_MODELS}
+
+
+class UnknownTraeModel(Exception):
+    """客户端请求了静态模型表里没有的 Trae 模型。"""
+
+
+def normalize_model_name(s: str) -> str:
+    """下划线内部名 → config_name 风格（每段首字母大写、横线连接）。
+
+    deepseek_v4_pro → Deepseek-V4-Pro（与表内 DeepSeek-V4-Pro 大小写不同，
+    故 map_model 还需大小写不敏感兜底）。
+    """
+    parts = []
+    for p in s.split("_"):
+        if not p:
+            continue
+        parts.append(p[:1].upper() + p[1:].lower())
+    return "-".join(parts)
+
+
+def map_model(model: str) -> str:
+    """客户端 model → 上游 config_name。
+
+    "glm-5.2"（config_name） → 直用
+    "glm-5.2__dev"（内部名） → 去后缀
+    "auto" / "" / "default"  → 默认模型 glm-5.2
+    "deepseek_v4_pro"        → 大小写兜底命中 DeepSeek-V4-Pro
+    其他                      → UnknownTraeModel
+    """
+    name = (model or "").strip()
+    if name.startswith("trae/"):
+        name = name[len("trae/"):].strip()
+    if name in ("", "auto", "default"):
+        return DEFAULT_CONFIG_NAME
+    if "__" in name:
+        name = name.split("__", 1)[0]
+    if name in _TRAE_MODEL_IDS:
+        return name
+    norm = normalize_model_name(name)
+    if norm in _TRAE_MODEL_IDS:
+        return norm
+    # 大小写不敏感兜底（只影响原本会失败的请求）
+    return _TRAE_MODEL_IDS_LOWER.get(name.lower()) or _TRAE_MODEL_IDS_LOWER.get(norm.lower()) or _unknown(name, model)
+
+
+def _unknown(name, original):
+    raise UnknownTraeModel(original)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI 请求体 → SOLO 形状（对应 Go PrepareBody）
+# ---------------------------------------------------------------------------
+
+
+def _normalize_tool_choice(obj: dict) -> None:
+    def suppress():
+        obj.pop("tools", None)
+        obj.pop("functions", None)
+
+    if "tool_choice" not in obj:
+        return
+    tc = obj["tool_choice"]
+    if isinstance(tc, str):
+        if tc.strip().lower() == "none":
+            obj.pop("tool_choice", None)
+            suppress()
+        return
+    if isinstance(tc, dict):
+        typ = str(tc.get("type") or "").strip().lower()
+        if typ == "none":
+            obj.pop("tool_choice", None)
+            suppress()
+        elif typ in ("auto", "required"):
+            obj["tool_choice"] = typ
+        elif typ == "function":
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = fn.get("name") or tc.get("name") or ""
+            name = str(name).strip()
+            obj["tool_choice"] = name if name else "auto"
+        else:
+            obj.pop("tool_choice", None)
+        return
+    obj.pop("tool_choice", None)
+
+
+def _normalize_tools(obj: dict) -> None:
+    raw = obj.get("tools")
+    if not isinstance(raw, list) or not raw:
+        return
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function")
+        if not isinstance(fn, dict):
+            continue
+        params = fn.get("parameters")
+        if isinstance(params, dict):
+            # 上游 Go struct 里 parameters 是 string（OpenAI 标准是 object）
+            fn["parameters"] = json.dumps(params, ensure_ascii=False)
+        out.append(item)
+    if not out:
+        obj.pop("tools", None)
+    else:
+        obj["tools"] = out
+
+
+def prepare_solo_body(body: dict) -> dict:
+    """OpenAI → SOLO llm_utils_chat 请求体（单 pass 改写）。非 dict 原样返回。"""
+    if not isinstance(body, dict):
+        return body
+    obj = dict(body)
+    obj["stream"] = True
+    obj["function"] = FUNCTION
+
+    msgs = obj.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "assistant" and isinstance(m.get("tool_calls"), list):
+                kept = []
+                for tc in m["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    if isinstance(tc.get("function"), dict):
+                        tc = dict(tc)
+                        tc["function_call"] = tc.pop("function")
+                    fc = tc.get("function_call")
+                    if isinstance(fc, dict) and not str(fc.get("name") or "").strip():
+                        continue  # 上游要求 FunctionCall.Name 必填，缺则剔除
+                    kept.append(tc)
+                if kept:
+                    m["tool_calls"] = kept
+                else:
+                    m.pop("tool_calls", None)
+            if "content" not in m or m.get("content") is None:
+                continue
+            content = m["content"]
+            if isinstance(content, str):
+                m["content"] = [{"type": "text", "text": content}]
+            # 已是数组 → 透传（多模态，保守透传，未实测）
+    model = str(obj.get("model") or "").strip() or DEFAULT_CONFIG_NAME
+    obj["config_name"] = model
+    obj["model"] = model
+
+    _normalize_tool_choice(obj)
+    _normalize_tools(obj)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# 错误分类
+# ---------------------------------------------------------------------------
+
+
+def classify_http_status(status: int, body_text: str = "") -> int:
+    """HTTP 状态 + body → HTTP 语义码（SPEC §4.3）。
+
+    1005 权益不足 → 402（额度耗尽）；401 会话失效 → 401；429 → 429；
+    404 → 404；5xx → 500；其他 4xx → 400。
+    """
+    text = body_text or ""
+    lower = text.lower()
+    if '"code":1005' in text or ("1005" in text and "plan" in lower):
+        return 402
+    if status == 401:
+        return 401
+    if status == 429:
+        return 429
+    if status == 404:
+        return 404
+    if status >= 500:
+        return 500
+    if status >= 400:
+        return 400
+    return status
+
+
+def classify_stream_code(code) -> int:
+    """SOLO 流内 event:error 业务码 → HTTP 语义码。1005（额度耗尽）→ 402。"""
+    if code == 1005:
+        return 402
+    if code == 401:
+        return 401
+    if code == 429:
+        return 429
+    if code == 404:
+        return 404
+    if isinstance(code, int) and 500 <= code < 600:
+        return 500
+    return 400
+
+
+# ---------------------------------------------------------------------------
+# HTTP 辅助（刷新 / 用户信息）
+# ---------------------------------------------------------------------------
+
+
+def normalize_expires_at(v) -> int:
+    """ExchangeToken 的 TokenExpireAt 毫秒 → Unix 秒（1.7e12 vs 1.7e9，用 1e12 区分）。"""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return v // 1000 if v > 1_000_000_000_000 else v
+
+
+def _oauth_headers() -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": CLIENT_UA,
+    }
+
+
+def exchange_token(client: httpx.Client, api_host: str, refresh_token: str) -> dict:
+    """调 ExchangeToken（refreshToken 轮换）。返回 Result dict；失败抛 RuntimeError。"""
+    host = api_host or OAUTH_HOST
+    body = {"ClientID": CLIENT_ID, "RefreshToken": refresh_token, "ClientSecret": "-", "UserID": ""}
+    r = client.post(host + EP_EXCHANGE, headers=_oauth_headers(), json=body)
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"ExchangeToken 返回非 JSON（HTTP {r.status_code}）")
+    result = data.get("Result") or {}
+    if not result.get("Token"):
+        raise RuntimeError(f"refresh_failed: no token in response（HTTP {r.status_code}）— 需重新登录")
+    return result
+
+
+def get_user_info(client: httpx.Client, api_host: str, token: str) -> tuple[str, str, str]:
+    """调 GetUserInfo。返回 (uid, nickname, enterprise_id)。"""
+    host = api_host or OAUTH_HOST
+    headers = _oauth_headers()
+    headers["X-Cloudide-Token"] = token
+    r = client.post(
+        host + EP_USERINFO,
+        headers=headers,
+        json={"ReqSource": "IDE", "IDEVersion": IDE_VERSION},
+    )
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"GetUserInfo 返回非 JSON（HTTP {r.status_code}）")
+    result = data.get("Result") or data
+    return (
+        str(result.get("UserID") or ""),
+        str(result.get("ScreenName") or ""),
+        str(result.get("EnterpriseID") or ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 凭据管理（对应 Go internal/auth.Auth + client.RefreshToken）
+# ---------------------------------------------------------------------------
+
+
+class TraeCredentialManager:
+    """Trae auth 文件（嵌套形 {"auth":{...},"account":{...}}）读取 + token 自动刷新。
+
+    并发模型与 CredentialManager 一致：单写者（服务进程），锁内整段刷新 + 原子写回。
+    expiresAt 为 **Unix 秒**（Trae 惯例）；预刷新窗口 24h。
+    """
+
+    backend_name = "trae"
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._cached: dict | None = None
+        self._mtime: float = 0.0
+
+    # -- 读取 --
+
+    def _read_raw(self) -> dict:
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_if_stale(self):
+        try:
+            mt = self.path.stat().st_mtime
+        except OSError:
+            return
+        if self._cached is None or mt != self._mtime:
+            self._cached = self._read_raw()
+            self._mtime = mt
+
+    def _session(self) -> dict:
+        self._load_if_stale()
+        if self._cached is None:
+            raise RuntimeError(f"无法读取 Trae auth 文件：{self.path}")
+        return self._cached
+
+    def _auth(self) -> dict:
+        return self._session().get("auth") or {}
+
+    def _account(self) -> dict:
+        return self._session().get("account") or {}
+
+    def access_token(self) -> str:
+        return str(self._auth().get("accessToken") or "")
+
+    def expires_at(self) -> int:
+        try:
+            return int(self._auth().get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _is_expired(self, within: int = REFRESH_SKEW_SECONDS) -> bool:
+        exp = self.expires_at()
+        if exp <= 0:
+            return True
+        return time.time() + within >= exp
+
+    # -- 刷新 --
+
+    def _refresh(self):
+        auth = self._auth()
+        refresh_token = str(auth.get("refreshToken") or "")
+        if not refresh_token.strip():
+            raise RuntimeError("Trae 凭据缺少 refreshToken，请重新登录")
+        api_host = str(auth.get("apiHost") or OAUTH_HOST)
+        with httpx.Client(timeout=20) as client:
+            result = exchange_token(client, api_host, refresh_token)
+        new_auth = dict(auth)
+        new_auth["accessToken"] = result["Token"]
+        if result.get("RefreshToken"):
+            new_auth["refreshToken"] = result["RefreshToken"]
+        exp = normalize_expires_at(result.get("TokenExpireAt") or 0)
+        if exp <= 0 and result.get("TokenExpireDuration"):
+            exp = int(time.time()) + int(result["TokenExpireDuration"])
+        if exp > 0:
+            new_auth["expiresAt"] = exp
+        self._session()["auth"] = new_auth
+        self._save_atomic()
+
+    def _save_atomic(self):
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._cached, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+        self._mtime = self.path.stat().st_mtime
+
+    # -- 对外 --
+
+    def _solo_headers(self, stream: bool) -> dict:
+        auth = self._auth()
+        account = self._account()
+        token = str(auth.get("accessToken") or "")
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if stream else "application/json",
+            "User-Agent": CLIENT_UA,
+            "Authorization": f"Cloud-IDE-JWT {token}",
+            "X-Cloudide-Token": token,
+            "X-Ide-Token": token,
+            "X-App-Id": APP_ID,
+            "X-App-Version": "default",
+            "X-Ide-Version": IDE_VERSION,
+            "X-Ide-Version-Code": IDE_VERSION_CODE,
+            "X-App-Version-Code": IDE_VERSION_CODE,
+            "X-Ide-Version-Type": "stable",
+            "X-Device-Type": "windows",
+            "X-OS-Version": OS_VERSION,
+            "X-Device-Brand": DEVICE_BRAND,
+            "Request-Traffic-Type": "prod",
+        }
+        uid = str(account.get("uid") or "")
+        if uid:
+            h["X-Uid"] = uid
+        machine_id = str(auth.get("machineId") or "")
+        if machine_id:
+            h["X-Machine-Id"] = machine_id
+        device_id = str(auth.get("deviceId") or "")
+        if device_id:
+            h["X-Device-Id"] = device_id
+        return h
+
+    def get_headers(self) -> dict:
+        with self._lock:
+            if self._is_expired():
+                self._refresh()
+            return self._solo_headers(stream=True)
+
+    def summary(self) -> dict:
+        acct = self._account()
+        return {
+            "uid": acct.get("uid"),
+            "nickname": acct.get("nickname"),
+            "enterpriseName": acct.get("enterpriseName"),
+            "token_expires_at": self.expires_at(),
+            "token_expired": self._is_expired(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# SOLO SSE → OpenAI SSE 归一化
+# ---------------------------------------------------------------------------
+
+
+class _SseState:
+    __slots__ = ("event", "data")
+
+    def __init__(self):
+        self.event = ""
+        self.data = []
+
+    def reset(self):
+        self.event = ""
+        self.data = []
+
+
+def _parse_solo_event(event: str, data: str) -> dict | None:
+    """解析一条 SOLO 事件（event 行为事件名，data 行为 JSON）。"""
+    ev = {"event": (event or "").strip()}
+    if not data:
+        return ev
+    try:
+        raw = json.loads(data)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    name = ev["event"]
+    if name == "output":
+        ev["response"] = raw.get("response") if isinstance(raw.get("response"), str) else ""
+        ev["reasoning"] = raw.get("reasoning_content") if isinstance(raw.get("reasoning_content"), str) else ""
+        ev["tool_calls"] = raw.get("tool_calls")
+    elif name == "token_usage":
+        ev["usage"] = raw
+    elif name == "done":
+        fr = raw.get("finish_reason")
+        ev["finish_reason"] = fr if isinstance(fr, str) else ""
+    elif name == "error":
+        code = raw.get("code")
+        ev["error_code"] = int(code) if isinstance(code, (int, float)) else 0
+        msg = raw.get("message")
+        ev["error_message"] = msg if isinstance(msg, str) else ""
+    return ev
+
+
+def _scan_line(state: _SseState, line: str) -> dict | None:
+    """处理一行；事件边界（空行）时解析并返回事件。"""
+    if line == "":
+        if state.event == "":
+            state.reset()
+            return None
+        ev = _parse_solo_event(state.event, "".join(state.data))
+        state.reset()
+        return ev
+    if line.startswith("event:"):
+        state.event = line[len("event:"):].strip()
+    elif line.startswith("data:"):
+        state.data.append(line[len("data:"):])
+    # ":" 注释行忽略
+    return None
+
+
+def _clean_tool_calls(raw) -> list | None:
+    """SOLO tool_calls（function_call 字段）→ OpenAI function 形状。"""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        arr = [raw]
+    elif isinstance(raw, list):
+        arr = raw
+    else:
+        return None
+    out = []
+    for call in arr:
+        if not isinstance(call, dict):
+            continue
+        call = dict(call)
+        fc = call.pop("function_call", None)
+        if isinstance(fc, dict):
+            call["function"] = {k: v for k, v in fc.items() if k not in ("namespace", "partial_arguments")}
+        fn = call.get("function")
+        if isinstance(fn, dict):
+            fn.pop("namespace", None)
+            fn.pop("partial_arguments", None)
+        out.append(call)
+    return out or None
+
+
+def _sse_chunk(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+def _error_chunk(code: int, message: str) -> bytes:
+    return _sse_chunk({"error": {"message": (message or "")[:500], "type": "upstream_error", "code": code}})
+
+
+async def normalize_solo_stream(chunks, *, model: str = "", raise_on_error: bool = False):
+    """SOLO 自定义 SSE 字节流 → OpenAI Chat SSE 字节流。
+
+    产出 chunk 的 delta 含 content / reasoning_content / tool_calls（标准 function 形状）。
+    usage 挂到 done chunk 上（token_usage 事件先缓存，随下一个 chunk 发出）。
+    上游 event:error：
+      - raise_on_error=False（流式端点）：先 yield error chunk + [DONE]，再
+        raise BackendHTTPError(emitted=True)；
+      - raise_on_error=True（非流式 / count_tokens）：直接 raise（不 emit）。
+    上游无 done 仍补 [DONE]（幂等）。
+    """
+    state = _SseState()
+    pending_usage = None
+    saw_done = False
+
+    def _chunk(delta: dict, finish: str | None = None) -> bytes:
+        nonlocal pending_usage
+        choice = {"index": 0, "delta": delta}
+        if finish:
+            choice["finish_reason"] = finish
+        payload = {
+            "id": "chatcmpl-trae",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model or "",
+            "choices": [choice],
+        }
+        if pending_usage is not None:
+            payload["usage"] = pending_usage
+            pending_usage = None
+        return _sse_chunk(payload)
+
+    async for line in _aiter_lines(chunks):
+        ev = _scan_line(state, line)
+        if ev is None:
+            continue
+        name = ev.get("event")
+        if name == "output":
+            delta: dict = {}
+            if ev.get("response"):
+                delta["content"] = ev["response"]
+            if ev.get("reasoning"):
+                delta["reasoning_content"] = ev["reasoning"]
+            tcs = _clean_tool_calls(ev.get("tool_calls"))
+            if tcs:
+                delta["tool_calls"] = tcs
+            if delta:
+                yield _chunk(delta)
+        elif name == "token_usage":
+            pending_usage = ev.get("usage")
+        elif name == "done":
+            yield _chunk({}, ev.get("finish_reason") or "stop")
+            yield b"data: [DONE]\n\n"
+            saw_done = True
+        elif name == "error":
+            code = classify_stream_code(ev.get("error_code") or 0)
+            message = ev.get("error_message") or ""
+            if raise_on_error:
+                raise BackendHTTPError(code, message, emitted=False)
+            yield _error_chunk(code, message)
+            yield b"data: [DONE]\n\n"
+            raise BackendHTTPError(code, message, emitted=True)
+
+    if not saw_done:
+        # 幂等兜底：上游中断（无 done）仍补 [DONE]；若还有未挂载的 usage（上游只发了
+        # token_usage 没有 done），先发一个携带 usage 的空 delta chunk，供 count_tokens 读取。
+        if pending_usage is not None:
+            yield _chunk({})
+        yield b"data: [DONE]\n\n"
+
+
+async def _aiter_lines(chunks):
+    """字节流 → 行（按 \\n 切，去尾部 \\r）。"""
+    buf = b""
+    async for chunk in chunks:
+        if not chunk:
+            continue
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            yield line.decode("utf-8", "replace").rstrip("\r")
+    if buf:
+        yield buf.decode("utf-8", "replace").rstrip("\r")
+
+
+# ---------------------------------------------------------------------------
+# 后端
+# ---------------------------------------------------------------------------
+
+
+class TraeBackend(BackendSpec):
+    name = "trae"
+    owned_by = "trae-solo"
+    tencent_policies = False
+
+    def chat_url(self) -> str:
+        return AGENT_HOST + EP_CHAT
+
+    def make_credential(self, path):
+        return TraeCredentialManager(path)
+
+    async def astream(self, headers, body, *, timeout=None, raise_on_error=False):
+        prepared = prepare_solo_body(body)
+        url = self.chat_url()
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                async with c.stream("POST", url, headers=headers, json=prepared) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        status = classify_http_status(r.status_code, raw.decode("utf-8", "replace"))
+                        raise BackendHTTPError(status, raw)
+                    async for chunk in normalize_solo_stream(
+                        r.aiter_bytes(),
+                        model=str(prepared.get("model") or ""),
+                        raise_on_error=raise_on_error,
+                    ):
+                        yield chunk
+        except httpx.HTTPError as e:
+            raise BackendHTTPError(502, str(e), transport=True) from e

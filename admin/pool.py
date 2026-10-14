@@ -14,6 +14,8 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
+from core.backends.registry import backend_name_for
+
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
@@ -99,6 +101,8 @@ class AccountPool:
             for item in store.data.get("keys", {}).values():
                 item.setdefault("daily_limit", None)
                 item.setdefault("usage", {})
+            for item in store.data["accounts"].values():
+                item.setdefault("backend", "workbuddy")
             store.save()
 
     def operation_lock(self, aid):
@@ -209,9 +213,13 @@ class AccountPool:
             return (-int(status.get("weight", 0)), expiry is None, expiry or 0)
         return sorted(candidates, key=key)
 
-    def select(self, affinity_key=None):
+    def select(self, affinity_key=None, backend=None):
         with self.store.lock:
             candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
+            # 按后端隔离：trae 请求只分给 Trae 账号，非 trae 请求只分给 WorkBuddy 账号。
+            # backend=None 时不过滤（旧调用/测试）。
+            if backend is not None:
+                candidates = [row for row in candidates if row.get("backend", "workbuddy") == backend]
             if self.store.data["pool"]["routing"] == "manual":
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
             if not candidates:
@@ -331,6 +339,9 @@ class AccountPool:
                         manager._refresh()
                     self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
+                # Trae 账号（v1）：刷新走 ExchangeToken 已支持；积分/签到暂不支持。
+                if item.get("backend", "workbuddy") == "trae":
+                    return {"id": aid, "ok": False, "message": "Trae 账号暂不支持积分查询与签到（v1）"}
                 headers = manager.get_headers()
                 if "workbuddy.ai" in str(headers.get("X-Domain", "")).lower():
                     return {"id": aid, "ok": False, "message": "当前仅支持国内账号积分与签到"}
@@ -424,7 +435,7 @@ class AccountPool:
         now = datetime.fromtimestamp(self.clock(), CN)
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
-            due = [aid for aid, item in self.store.data["accounts"].items() if self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
+            due = [aid for aid, item in self.store.data["accounts"].items() if item.get("backend", "workbuddy") == "workbuddy" and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
         if cfg["auto_checkin"]:
             for aid in due:
                 _, due_time = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), 0)
@@ -557,6 +568,8 @@ class PoolMiddleware:
                 model = body.get("model")
                 if isinstance(model, str) and model and model not in self.model_registry.enabled_models() and model in self.model_registry.snapshot_ids():
                     raise HTTPException(400, f"模型 {model} 已在管理页禁用")
+            # 模型名 → 后端：trae/ 前缀分给 Trae 账号，其余分给 WorkBuddy 账号。
+            backend = backend_name_for(body.get("model") if isinstance(body, dict) else None)
             affinity_key = request_affinity(headers, body)
             original_receive = receive
             delivered = False
@@ -567,14 +580,14 @@ class PoolMiddleware:
                     return {"type": "http.request", "body": raw, "more_body": False}
                 return await original_receive()
             receive = replay_receive
-            aid, manager = self.pool.select(affinity_key)
+            aid, manager = self.pool.select(affinity_key, backend)
             # Refresh before entering a stream; retry another eligible account only
             # if credential preparation fails, never replay a partially emitted response.
             try:
                 await asyncio.to_thread(manager.get_headers)
             except Exception:
                 self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
-                aid, manager = self.pool.select(affinity_key)
+                aid, manager = self.pool.select(affinity_key, backend)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)

@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from core import converter
+from core.backends.workbuddy import WorkBuddyBackend
 from core.responses_adapter import ResponsesStreamConverter, responses_request_to_chat
 
 
@@ -99,7 +100,7 @@ def test_stream_delivers_text_before_upstream_eof(monkeypatch):
 
     async def run():
         nonlocal released
-        stream = converter._stream_responses('https://upstream.test', {}, {'stream': True})
+        stream = converter._stream_responses(WorkBuddyBackend(), {}, {'stream': True})
         first = await asyncio.wait_for(anext(stream), timeout=1)
         assert b'event: response.output_text.delta' in first
         released = True
@@ -163,7 +164,7 @@ def test_stream_transport_errors_are_failed(monkeypatch, mode):
     monkeypatch.setattr(converter.httpx, 'AsyncClient', lambda **kw: real_client(transport=transport, **kw))
     monkeypatch.setattr(converter, '_log', lambda *a: None)
     async def run():
-        output = b''.join([part async for part in converter._stream_responses('https://upstream.test', {}, {})])
+        output = b''.join([part async for part in converter._stream_responses(WorkBuddyBackend(), {}, {})])
         parsed = events(output.decode())
         assert [e['type'] for e in parsed] == ['response.failed']
         assert parsed[0]['response']['error']['code'] == ('429' if mode == 'http' else '502')

@@ -53,6 +53,12 @@ from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
 )
+from .backends.base import BackendHTTPError  # noqa: F401（re-export 供测试/中间件/适配器使用）
+from .backends.registry import (  # noqa: F401（re-export 便利）
+    backend_name_for,
+    make_credential,
+    resolve_backend,
+)
 from .workbuddy_atrest_crypto import (  # issue #23：WorkBuddy 5.6.0 $wbEncrypted 信封
     decrypt_auth_field,
     encrypt_auth_field,
@@ -122,6 +128,9 @@ def find_auth_file() -> Path | None:
 
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
+
+    #: 所属后端（账号 doc 无 backend 字段时的默认归属）；池选号与端点闸门据此分派
+    backend_name = "workbuddy"
 
     def __init__(self, path: Path):
         self.path = path
@@ -533,10 +542,38 @@ def list_models(
     _check_auth(authorization, x_api_key)
     models = get_available_models()
     data = [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
+        {
+            "id": m,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "trae-solo" if m.startswith("trae/") else "codebuddy",
+        }
         for m in models
     ]
     return {"object": "list", "data": data}
+
+
+def _resolve_backend_or_http(model_raw) -> tuple:
+    """四端点共用前置：模型名 → (backend, upstream_model, cred)。
+
+    trae/<名> → TraeBackend + map_model 归一（未知模型 → 400）；
+    其余 → WorkBuddyBackend + 原模型名。
+    凭据-后端一致性闸门：池选到的账号与请求后端不匹配 → 503
+    （防独立部署模式下 Trae 账号收到 WorkBuddy 请求或反之）。
+    """
+    backend, upstream_model = resolve_backend(model_raw)
+    cred = _cred()
+    if getattr(cred, "backend_name", "workbuddy") != backend.name:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": f"当前账号不适用于 {backend.name} 后端，请检查账号类型或启用对应账号",
+                    "type": "auth_error",
+                }
+            },
+        )
+    return backend, upstream_model, cred
 
 
 @app.post("/v1/chat/completions")
@@ -570,17 +607,22 @@ async def chat_completions(
             },
         )
 
+    # 路由：模型名 → 后端（trae/ 前缀进 Trae，其余走 WorkBuddy）；并做凭据一致性闸门
+    backend, upstream_model, cred = _resolve_backend_or_http(payload.get("model") or "auto")
+
     # 构造后端 body：只透传已知的合法字段
     client_wants_stream = bool(payload.get("stream"))
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
     body.setdefault("model", "auto")
+    # 剥掉 trae/ 前缀、归一化后的上游模型名（空则保留原值，行为不变）
+    body["model"] = upstream_model or body.get("model") or "auto"
     # 后端只支持流式：始终以 stream=True 调后端，非流式由转换器聚合
     body["stream"] = True
-    if "stream_options" not in body:
+    if backend.tencent_policies and "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
     # 腾讯后端不支持 developer role，遇到会触发安全策略拦截（11128），统一映射为 system
-    if "messages" in body and isinstance(body["messages"], list):
+    if backend.tencent_policies and "messages" in body and isinstance(body["messages"], list):
         body["messages"] = [
             dict(m, role="system")
             if isinstance(m, dict) and m.get("role") == "developer"
@@ -588,11 +630,12 @@ async def chat_completions(
             for m in body["messages"]
         ]
 
-    body = filter_system_identity(body)
+    if backend.tencent_policies:
+        body = filter_system_identity(body)
 
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
-    if CONFIG.get("desensitize"):
+    if backend.tencent_policies and CONFIG.get("desensitize"):
         body = desensitize_body(
             body,
             roles=("system", "developer"),
@@ -622,40 +665,29 @@ async def chat_completions(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid),
+            _stream_upstream(backend, headers, body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=300) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    raw = await r.aread()
-                    _log(
-                        f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
-                    )
-                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
-                    raise HTTPException(
-                        status_code=r.status_code,
-                        detail=_safe_err_raw(raw, r.status_code),
-                    )
-                collected = await _collect_stream(r)
-    except HTTPException:
-        raise
-    except httpx.HTTPError as e:
-        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
+        _, raw = await _post_backend_once(backend, headers, body, timeout=300)
+        collected = await _collect_stream(
+            _aiter_str_lines(raw), keep_reasoning=backend.name == "trae"
+        )
+    except BackendHTTPError as e:
+        _log(
+            f"[{rid}] ✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+        )
+        _log(f"[{rid}] ── ERROR BODY ──\n{e.body.decode('utf-8', 'replace')}")
         raise HTTPException(
-            status_code=502,
-            detail={
-                "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
-            },
+            status_code=e.status,
+            detail=_safe_err_raw(e.body, e.status),
         )
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
@@ -700,19 +732,68 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
     )
 
 
-async def _collect_stream(response: httpx.Response) -> dict:
-    """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
+async def _aiter_str_lines(raw: bytes):
+    """已收齐的字节 → 逐行 str（供聚合消费，等价旧 response.aiter_lines()）。"""
+    for line in raw.splitlines():
+        yield line.decode("utf-8", "replace")
+
+
+async def _aiter_sse_lines(chunks):
+    """字节流 → 逐行 str（近似 httpx aiter_lines：按 \\n 切，去尾部 \\r）。"""
+    buf = b""
+    async for chunk in chunks:
+        if not chunk:
+            continue
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            yield line.decode("utf-8", "replace").rstrip("\r")
+    if buf:
+        yield buf.decode("utf-8", "replace").rstrip("\r")
+
+
+def _estimate_tokens(chat_body: dict) -> int:
+    """本地粗估 input tokens（chars/4）。Trae 的 count_tokens 默认走这里，不打上游。
+
+    SOLO 上游大概率不遵守 max_tokens=1，走真实请求会白烧生成额度；Claude Code
+    在每条消息前都调 count_tokens，因此默认本地估算，CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM=1 可逃生。
+    """
+    total = 0
+    for m in chat_body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                    total += len(blk["text"])
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                total += len(str(fn.get("name") or "")) + len(str(fn.get("arguments") or ""))
+    for tool in chat_body.get("tools") or []:
+        if isinstance(tool, dict):
+            total += len(json.dumps(tool, ensure_ascii=False))
+    return max(1, total // 4)
+
+
+async def _collect_stream(lines, *, keep_reasoning: bool = False) -> dict:
+    """消费上游 OpenAI SSE 行流，聚合成单个非流式 chat.completion 对象。
 
     合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    keep_reasoning=True（Trae）时额外累积 delta.reasoning_content → message.reasoning_content。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     # tool_calls: index -> {id, name, arguments(分片拼接)}
     tool_calls: dict[int, dict] = {}
     model: str | None = None
     finish_reason: str | None = None
     usage: dict | None = None
 
-    async for line in response.aiter_lines():
+    async for line in lines:
         line = line.strip()
         if not line or not line.startswith("data:"):
             continue
@@ -732,6 +813,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content_parts.append(delta["content"])
+            if keep_reasoning and delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(
@@ -758,6 +841,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
         finish_reason = finish_reason or "tool_calls"
 
     message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
     if tcs:
         message["tool_calls"] = tcs
     return {
@@ -787,7 +872,7 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 
 
 async def _stream_upstream(
-    url: str,
+    backend,
     headers: dict,
     body: dict,
     model_name: str = "?",
@@ -845,24 +930,25 @@ async def _stream_upstream(
                 saw_filter = True
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(
-                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                    )
-                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
-                    yield _err_event(err, r.status_code)
-                    return
-                async for chunk in r.aiter_bytes():
-                    if chunk:
-                        raw_parts.append(chunk)
-                        _feed(chunk)
-                        yield chunk
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
-        yield _err_event(str(e).encode(), 502)
+        async for chunk in backend.astream(headers, body, timeout=None):
+            if chunk:
+                raw_parts.append(chunk)
+                _feed(chunk)
+                yield chunk
+    except BackendHTTPError as e:
+        if e.emitted:
+            # Trae 流内错误：error chunk + [DONE] 已在 astream 内直通给客户端，
+            # PoolMiddleware 的 SSE 扫描已命中 → 冷却账号；此处仅记日志。
+            _log(
+                f"{prefix}✗ 上游流内错误 | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+            )
+            return
+        _log(
+            f"{prefix}✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+        )
+        _log(f"{prefix}── ERROR BODY ──\n{e.body.decode('utf-8', 'replace')}")
+        yield _err_event(e.body, e.status)
+        return
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
@@ -929,24 +1015,31 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
     )
 
 
-async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, bytes]:
-    async with httpx.AsyncClient(timeout=120) as c:
-        async with c.stream("POST", url, headers=headers, json=body) as r:
-            chunks: list[bytes] = []
-            async for chunk in r.aiter_bytes():
-                if chunk:
-                    chunks.append(chunk)
-            return r.status_code, b"".join(chunks)
+async def _post_backend_once(
+    backend, headers: dict, body: dict, *, timeout: float = 120
+) -> tuple[int, bytes]:
+    """经 backend.astream 收齐全部字节。非 2xx/传输错误 → BackendHTTPError。
+
+    成功时长恒返回 (200, raw)——astream 契约保证非 2xx 一定 raise。
+    """
+    chunks: list[bytes] = []
+    async for chunk in backend.astream(
+        headers, body, timeout=timeout, raise_on_error=True
+    ):
+        if chunk:
+            chunks.append(chunk)
+    return 200, b"".join(chunks)
 
 
 async def _post_backend_with_filter_retry(
-    url: str, headers: dict, body: dict, rid: str = "", model_name: str = "?"
+    backend, headers: dict, body: dict, rid: str = "", model_name: str = "?"
 ) -> tuple[int, bytes, dict]:
     prefix = f"[{rid}] " if rid else ""
-    status, raw = await _post_backend_once(url, headers, body)
+    status, raw = await _post_backend_once(backend, headers, body)
     text = raw.decode("utf-8", "replace")
     if (
         status == 200
+        and backend.tencent_policies
         and _looks_like_content_filter_text(text)
         and CONFIG.get("desensitize")
         and CONFIG.get("no_compact")
@@ -959,7 +1052,7 @@ async def _post_backend_with_filter_retry(
         _log(
             f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
         )
-        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body)
+        retry_status, retry_raw = await _post_backend_once(backend, headers, retry_body)
         retry_text = retry_raw.decode("utf-8", "replace")
         if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
             return retry_status, retry_raw, retry_body
@@ -1010,16 +1103,24 @@ async def create_response(
             },
         )
 
-    chat_body = filter_system_identity(chat_body)
-    chat_body, projection_stats = project_responses_chat_body(
-        chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
-    )
+    # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto")
+
+    if backend.tencent_policies:
+        chat_body = filter_system_identity(chat_body)
+        chat_body, projection_stats = project_responses_chat_body(
+            chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
+        )
+    else:
+        # Trae：跳过腾讯投影（上游是私有协议），日志用 passthrough 占位
+        projection_stats = {"mode": "passthrough"}
     chat_body.setdefault("model", "auto")
+    chat_body["model"] = upstream_model or chat_body.get("model") or "auto"
     chat_body["stream"] = True
-    if "stream_options" not in chat_body:
+    if backend.tencent_policies and "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    if os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
+    if backend.tencent_policies and os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
         chat_body = _chat_body_desensitize(chat_body)
 
     client_wants_stream = bool(payload.get("stream", False))
@@ -1044,12 +1145,11 @@ async def create_response(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_responses(url, headers, chat_body, model_name, t0, rid),
+            _stream_responses(backend, headers, chat_body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1057,28 +1157,18 @@ async def create_response(
     # 非流式：聚合后端 SSE → 非流式 Response 对象
     try:
         status_code, raw, final_body = await _post_backend_with_filter_retry(
-            url, headers, chat_body, rid, model_name
+            backend, headers, chat_body, rid, model_name
         )
-        if status_code != 200:
-            _log(
-                f"[{rid}] ✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
-            )
-            raise HTTPException(
-                status_code=status_code, detail=_safe_err_raw(raw, status_code)
-            )
         converter = ResponsesStreamConverter(model=model_name)
         for line in raw.decode("utf-8", "replace").splitlines():
             converter.feed_line(line)
         chat_body = final_body
-    except HTTPException:
-        raise
-    except httpx.HTTPError as e:
-        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
+    except BackendHTTPError as e:
+        _log(
+            f"[{rid}] ✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+        )
         raise HTTPException(
-            status_code=502,
-            detail={
-                "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
-            },
+            status_code=e.status, detail=_safe_err_raw(e.body, e.status)
         )
 
     result = converter.get_nonstream_response()
@@ -1095,7 +1185,7 @@ async def create_response(
 
 
 async def _stream_responses(
-    url: str,
+    backend,
     headers: dict,
     body: dict,
     model_name: str = "?",
@@ -1108,23 +1198,24 @@ async def _stream_responses(
 
     raw_sse_lines = []
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream("POST", url, headers=headers, json=body) as response:
-                if response.status_code != 200:
-                    raw = await response.aread()
-                    _log(f"{prefix}✗ HTTP {response.status_code} | {model_name}")
-                    yield converter.error(raw.decode("utf-8", "replace")[:500], response.status_code).encode("utf-8")
-                    return
-                async for line in response.aiter_lines():
-                    if line.strip():
-                        raw_sse_lines.append(line)
-                        raw_sse_lines = raw_sse_lines[-30:]
-                    events = converter.feed_line(line)
-                    if events:
-                        yield events.encode("utf-8")
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
-        yield converter.error(str(e)[:500], 502).encode("utf-8")
+        async for line in _aiter_sse_lines(backend.astream(headers, body, timeout=300)):
+            if line.strip():
+                raw_sse_lines.append(line)
+                raw_sse_lines = raw_sse_lines[-30:]
+            events = converter.feed_line(line)
+            if events:
+                yield events.encode("utf-8")
+    except BackendHTTPError as e:
+        if e.emitted:
+            # 流内错误 chunk 已被 feed_line 转成 response.failed；此处仅记日志
+            _log(
+                f"{prefix}✗ 上游流内错误 | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+            )
+            elapsed = time.time() - t0 if t0 else 0
+            _log(f"{prefix}◀ RESPONSES {model_name} | {elapsed:.1f}s | stream failed")
+            return
+        _log(f"{prefix}✗ HTTP {e.status} | {model_name}")
+        yield converter.error(e.body.decode("utf-8", "replace")[:500], e.status).encode("utf-8")
         return
 
     # 发送收尾事件
@@ -1193,16 +1284,21 @@ async def create_message(
             },
         )
 
+    # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto")
+
     chat_body.setdefault("model", "auto")
+    chat_body["model"] = upstream_model or chat_body.get("model") or "auto"
     # 读取用户的 stream 参数，如果未提供则默认为 True
     user_stream = payload.get("stream", True)
     # 无论用户如何设置，都向后端请求流式响应（后端只支持流式）
     chat_body["stream"] = True
-    if "stream_options" not in chat_body:
+    if backend.tencent_policies and "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    chat_body = filter_system_identity(chat_body)
-    if CONFIG.get("desensitize"):
+    if backend.tencent_policies:
+        chat_body = filter_system_identity(chat_body)
+    if backend.tencent_policies and CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
             roles=("system", "developer"),
@@ -1223,13 +1319,12 @@ async def create_message(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
     if user_stream:
         return StreamingResponse(
-            _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+            _stream_anthropic(backend, headers, chat_body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1238,13 +1333,13 @@ async def create_message(
     from fastapi.responses import JSONResponse
 
     response_data = await _collect_anthropic_nonstream(
-        url, headers, chat_body, model_name, t0, rid
+        backend, headers, chat_body, model_name, t0, rid
     )
     return JSONResponse(content=response_data)
 
 
 async def _collect_anthropic_nonstream(
-    url: str,
+    backend,
     headers: dict,
     body: dict,
     model_name: str = "?",
@@ -1256,31 +1351,22 @@ async def _collect_anthropic_nonstream(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(
-                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                    )
-                    raise HTTPException(
-                        status_code=r.status_code,
-                        detail={
-                            "error": {
-                                "message": err.decode("utf-8", "replace")[:500],
-                                "type": "api_error",
-                                "code": r.status_code,
-                            }
-                        },
-                    )
-                async for line in r.aiter_lines():
-                    converter.feed_line(line)
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+        async for line in _aiter_sse_lines(
+            backend.astream(headers, body, timeout=120.0, raise_on_error=True)
+        ):
+            converter.feed_line(line)
+    except BackendHTTPError as e:
+        _log(
+            f"{prefix}✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+        )
         raise HTTPException(
-            status_code=502,
+            status_code=e.status,
             detail={
-                "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
+                "error": {
+                    "message": e.body.decode("utf-8", "replace")[:500],
+                    "type": "api_error",
+                    "code": e.status,
+                }
             },
         ) from None
 
@@ -1290,7 +1376,7 @@ async def _collect_anthropic_nonstream(
 
 
 async def _stream_anthropic(
-    url: str,
+    backend,
     headers: dict,
     body: dict,
     model_name: str = "?",
@@ -1302,32 +1388,23 @@ async def _stream_anthropic(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(
-                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                    )
-                    error_evt = {
-                        "type": "error",
-                        "error": {
-                            "message": err.decode("utf-8", "replace")[:500],
-                            "type": "api_error",
-                            "code": r.status_code,
-                        },
-                    }
-                    yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
-                    return
-                async for line in r.aiter_lines():
-                    events = converter.feed_line(line)
-                    if events:
-                        yield events.encode("utf-8")
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+        async for line in _aiter_sse_lines(backend.astream(headers, body, timeout=None)):
+            events = converter.feed_line(line)
+            if events:
+                yield events.encode("utf-8")
+    except BackendHTTPError as e:
+        # Anthropic 适配器不认识 OpenAI 形状的 error chunk（会被忽略），
+        # 因此无论 emitted 与否，都在此处补发一条 event:error。
+        _log(
+            f"{prefix}✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+        )
         error_evt = {
             "type": "error",
-            "error": {"message": str(e)[:500], "type": "api_error", "code": 502},
+            "error": {
+                "message": e.body.decode("utf-8", "replace")[:500],
+                "type": "api_error",
+                "code": e.status,
+            },
         }
         yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
         return
@@ -1389,14 +1466,20 @@ async def count_tokens(
             },
         )
 
+    # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto")
+
     # 最小化实际生成：只需要 usage 统计
     chat_body.setdefault("model", "auto")
+    chat_body["model"] = upstream_model or chat_body.get("model") or "auto"
     chat_body["max_tokens"] = 1
     chat_body["stream"] = True  # 后端只支持流式
-    chat_body["stream_options"] = {"include_usage": True}
+    if backend.tencent_policies:
+        chat_body["stream_options"] = {"include_usage": True}
 
-    chat_body = filter_system_identity(chat_body)
-    if CONFIG.get("desensitize"):
+    if backend.tencent_policies:
+        chat_body = filter_system_identity(chat_body)
+    if backend.tencent_policies and CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
             roles=("system", "developer"),
@@ -1406,69 +1489,59 @@ async def count_tokens(
             strip_tool_metadata=True,
         )
 
+    # Trae：SOLO 上游大概率不遵守 max_tokens=1，走真实请求会白烧生成额度（Claude Code
+    # 每条消息前都调 count_tokens），默认本地 chars/4 估算；env 可逃生走上游。
+    if backend.name == "trae" and os.environ.get("CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM", "0") != "1":
+        return {"input_tokens": _estimate_tokens(chat_body)}
+
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            async with client.stream(
-                "POST", url, headers=headers, json=chat_body
-            ) as resp:
-                if resp.status_code != 200:
-                    err = await resp.aread()
-                    _log(
-                        f"✗ count_tokens HTTP {resp.status_code}: {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                    )
-                    raise HTTPException(
-                        status_code=resp.status_code,
-                        detail={
-                            "error": {
-                                "message": err.decode("utf-8", "replace")[:500],
-                                "type": "api_error",
-                                "code": resp.status_code,
-                            }
-                        },
-                    )
+        input_tokens = 0
+        async for line in _aiter_sse_lines(
+            backend.astream(headers, chat_body, timeout=30.0, raise_on_error=True)
+        ):
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data: "):
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    # message_delta 事件直接包含 usage
+                    if "usage" in chunk:
+                        usage = chunk.get("usage") or {}
+                        tokens = usage.get("prompt_tokens", 0) or usage.get(
+                            "input_tokens", 0
+                        )
+                        if tokens > 0:
+                            input_tokens = tokens
+                    # message_start 事件在 message 对象中包含 usage
+                    elif "message" in chunk and "usage" in chunk["message"]:
+                        usage = chunk["message"].get("usage") or {}
+                        tokens = usage.get("prompt_tokens", 0) or usage.get(
+                            "input_tokens", 0
+                        )
+                        if tokens > 0:
+                            input_tokens = tokens
+                except json.JSONDecodeError:
+                    continue
 
-                # 解析 SSE 流，查找 usage 信息
-                # message_start 包含初始 usage（0），message_delta 包含真实 usage
-                input_tokens = 0
-                async for line in resp.aiter_lines():
-                    if not line or line.startswith(":"):
-                        continue
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            # message_delta 事件直接包含 usage
-                            if "usage" in chunk:
-                                usage = chunk.get("usage") or {}
-                                tokens = usage.get("prompt_tokens", 0) or usage.get(
-                                    "input_tokens", 0
-                                )
-                                if tokens > 0:
-                                    input_tokens = tokens
-                            # message_start 事件在 message 对象中包含 usage
-                            elif "message" in chunk and "usage" in chunk["message"]:
-                                usage = chunk["message"].get("usage") or {}
-                                tokens = usage.get("prompt_tokens", 0) or usage.get(
-                                    "input_tokens", 0
-                                )
-                                if tokens > 0:
-                                    input_tokens = tokens
-                        except json.JSONDecodeError:
-                            continue
+        return {"input_tokens": input_tokens}
 
-                return {"input_tokens": input_tokens}
-
-    except httpx.HTTPError as e:
-        _log(f"✗ count_tokens network error: {e}")
+    except BackendHTTPError as e:
+        _log(
+            f"✗ count_tokens HTTP {e.status}: {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
+        )
         raise HTTPException(
-            status_code=502,
+            status_code=e.status,
             detail={
-                "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
+                "error": {
+                    "message": e.body.decode("utf-8", "replace")[:500],
+                    "type": "api_error",
+                    "code": e.status,
+                }
             },
         ) from None
 
@@ -1495,7 +1568,7 @@ def preflight() -> bool:
         ok = False
     else:
         try:
-            cm = CredentialManager(af)
+            cm = make_credential(af)
             info = cm.summary()
             sys.stderr.write(
                 f"账号      : {info.get('nickname')} / {info.get('enterpriseName')}\n"
@@ -1552,7 +1625,7 @@ def main():
         args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     )
     af = find_auth_file()
-    CONFIG["cred"] = CredentialManager(af) if af else None
+    CONFIG["cred"] = make_credential(af) if af else None
 
     if not args.skip_check:
         preflight()

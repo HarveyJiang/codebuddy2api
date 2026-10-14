@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
+from core.backends.registry import make_credential, trae_model_ids
 from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
@@ -80,7 +81,7 @@ class Store:
                     continue
                 aid = secrets.token_hex(8)
                 name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
-                self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
+                self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time()), "backend": doc.get("backend", "workbuddy")}
                 if self.data["active"] is None and not doc.get("disabled"):
                     self.data["active"] = aid
             if initial_key:
@@ -92,6 +93,9 @@ class Store:
     def validate_credential(doc):
         if not isinstance(doc, dict) or not isinstance(doc.get("auth"), dict) or not isinstance(doc.get("account"), dict):
             raise HTTPException(400, "需要桌面端 .info／JSON 登录文件，包含 auth 和 account 对象")
+        backend = doc.get("backend", "workbuddy")
+        if backend not in ("workbuddy", "trae"):
+            raise HTTPException(400, "backend 字段无效（仅支持 workbuddy / trae）")
         for key in ("accessToken", "refreshToken"):
             if not isinstance(doc["auth"].get(key), str) or not doc["auth"][key].strip():
                 raise HTTPException(400, "凭据缺少 accessToken 或 refreshToken，请重新导出桌面端登录文件")
@@ -115,14 +119,15 @@ class Store:
 
     def save_browser_account(self, doc, name):
         self.validate_credential(doc)
+        backend = doc.get("backend", "workbuddy")
         with self.lock:
-            identity = (doc["account"]["uid"], doc["account"].get("enterpriseId", ""))
+            identity = (backend, doc["account"]["uid"], doc["account"].get("enterpriseId", ""))
             for aid, item in self.data["accounts"].items():
                 try:
                     old = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 except (ValueError, OSError):
                     continue
-                if (old.get("account", {}).get("uid"), old.get("account", {}).get("enterpriseId", "")) == identity:
+                if (old.get("backend", "workbuddy"), old.get("account", {}).get("uid"), old.get("account", {}).get("enterpriseId", "")) == identity:
                     current = self.manager_for(aid, item)
                     if current:
                         with current._lock:
@@ -140,7 +145,7 @@ class Store:
                 raise HTTPException(400, "最多保存 100 个账号")
             aid = secrets.token_hex(8)
             write_json(self.auth_dir / (aid + ".info"), doc)
-            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
+            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True, "backend": backend}
             if self.data["active"] is None:
                 self.data["active"] = aid
             self.save()
@@ -161,29 +166,72 @@ class Store:
     def manager_for(self, aid, item):
         with self.lock:
             if aid not in self.managers:
-                self.managers[aid] = converter.CredentialManager(self.file_for(item))
+                # 按 .info 的 backend 字段分派：trae → TraeCredentialManager，其余 → WorkBuddy。
+                self.managers[aid] = make_credential(self.file_for(item))
             return self.managers[aid]
 
     def any_enabled_manager(self):
-        """A credential manager from any enabled account, for background pulls (model catalog)."""
+        """A credential manager from any enabled WorkBuddy account, for background pulls
+        (model catalog). Trae accounts are excluded: their headers hit workbuddy.cn and 400."""
         with self.lock:
             for aid, item in self.data["accounts"].items():
-                if item["enabled"]:
+                if item["enabled"] and item.get("backend", "workbuddy") == "workbuddy":
                     return self.manager_for(aid, item)
             return None
 
     def account_rows(self):
         result = []
         for aid, item in self.data["accounts"].items():
-            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"]}
+            backend = item.get("backend", "workbuddy")
+            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"], "backend": backend}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
+                # Trae 的 expiresAt 是 Unix 秒；统一归一为毫秒（前端/池按毫秒语义处理）。
+                if doc.get("backend", backend) == "trae":
+                    expiry = expiry * 1000
                 row.update({"nickname": str(doc["account"].get("nickname") or ""), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
             except (ValueError, OSError, KeyError):
                 row.update({"status": "invalid", "expired": True, "expires_at": 0, "refresh_available": False})
             result.append(row)
         return result
+
+    def adopt_auth_files(self):
+        """收养 auth_dir 里新落盘的 .info（CLI 登录产出，如 trae-{uid}.info）。
+
+        单写者＝服务进程；pool tick（60s）调用。按文件名去重（确定性文件名不重复收养），
+        账号数 ≥100 停止。返回本次新增数量。
+        """
+        added = 0
+        with self.lock:
+            known = {item["file"] for item in self.data["accounts"].values()}
+            for path in sorted(self.auth_dir.glob("*.info")):
+                if path.name in known:
+                    continue
+                if len(self.data["accounts"]) >= 100:
+                    break
+                try:
+                    doc = json.loads(path.read_text(encoding="utf-8"))
+                    self.validate_credential(doc)
+                except (ValueError, OSError, HTTPException):
+                    continue
+                aid = secrets.token_hex(8)
+                backend = doc.get("backend", "workbuddy")
+                self.data["accounts"][aid] = {
+                    "file": path.name,
+                    "name": str(doc.get("account", {}).get("nickname") or "已收养账号")[:60],
+                    "created": int(time.time()),
+                    "enabled": not bool(doc.get("disabled")),
+                    "backend": backend,
+                }
+                known.add(path.name)
+                added += 1
+            if added:
+                self.events.appendleft({"time": int(time.time()), "event": "adopt_auth", "count": added})
+                self.save()
+        if added:
+            self.sync_active()
+        return added
 
     def add_key(self, name, value=None, daily_limit=None):
         value = value or "sk-wb-" + secrets.token_urlsafe(32)
@@ -325,6 +373,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         async def pool_worker():
             while True:
                 try:
+                    # 收养 CLI 新落盘的 .info（如 trae-{uid}.info），再跑 tick。
+                    await asyncio.to_thread(store.adopt_auth_files)
                     await pool.tick()
                 except Exception:
                     pass  # Per-account errors are persisted without credential data.
@@ -370,9 +420,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     app.state.model_registry = model_registry
     # Route converter's model list through the registry (dynamic + managed),
     # keeping the legacy file-based loader as last-resort fallback.
+    _original_available_models = converter.get_available_models  # 捕获原函数，防自递归
+
     def _managed_models():
         models = model_registry.enabled_models()
-        return models or converter.get_available_models()
+        base = list(models or _original_available_models())
+        if os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") != "0":
+            base += [f"trae/{mid}" for mid in trae_model_ids()]
+        return base
     converter.get_available_models = _managed_models
     app.add_middleware(AdminMiddleware)
     app.add_middleware(PoolMiddleware, pool=pool, model_registry=model_registry)
@@ -577,6 +632,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         doc = body.get("credential")
         store.validate_credential(doc)
+        backend = doc.get("backend", "workbuddy")
         name = clean_name(body.get("name"), str(doc["account"].get("nickname") or "新账号")[:60])
         with store.lock:
             if len(store.data["accounts"]) >= 100:
@@ -584,12 +640,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             aid = secrets.token_hex(8)
             filename = aid + ".info"
             write_json(store.auth_dir / filename, doc)
-            store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True}
+            store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True, "backend": backend}
             if store.data["active"] is None:
                 store.data["active"] = aid
             store.save()
             store.sync_active()
         return {"id": aid}
+
+    @app.post("/admin/api/accounts/adopt")
+    async def adopt_accounts(req: Request):
+        store.require_admin(req)
+        added = await asyncio.to_thread(store.adopt_auth_files)
+        return {"ok": True, "added": added}
 
     @app.patch("/admin/api/accounts/{aid}")
     async def edit_account(aid: str, req: Request):
@@ -600,6 +662,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             if not item:
                 raise HTTPException(404, "账号不存在")
             new = dict(item)
+            if "backend" in body and body["backend"] != item.get("backend", "workbuddy"):
+                raise HTTPException(400, "账号后端不可修改")
             if "name" in body:
                 new["name"] = clean_name(body["name"], item["name"])
             if "weight" in body:
@@ -710,7 +774,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             raise HTTPException(400, "测试消息需为 1–2000 个字符")
         if store.test_lock.locked():
             raise HTTPException(409, "已有测试正在进行")
-        if converter.CONFIG.get("cred") is None:
+        if model.startswith("trae/"):
+            with store.lock:
+                has_trae = any(it.get("backend", "workbuddy") == "trae" and it["enabled"] for it in store.data["accounts"].values())
+            if not has_trae:
+                raise HTTPException(400, "请先启用一个 Trae 账号")
+        elif converter.CONFIG.get("cred") is None:
             raise HTTPException(400, "请先导入并启用一个账号")
         async with store.test_lock:
             started = time.monotonic()
