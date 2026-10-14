@@ -15,9 +15,22 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
+# 池中间件观察到的路由信息，交由外层 MetricsMiddleware 合并成一行 request_logs。
+# 用 scope 传递而不是 ContextVar：middleware 是嵌套调用，内层 finally 的 reset
+# 会先于外层读取执行，ContextVar 到外层就变回默认值了（实测确认）。
+# scope 是同一条链上共享的可变对象，不受 finally 时序影响。
+REQUEST_LOG_CONTEXT = "codebuddy.request_log"
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
+# 上游用量明细接口在另一个域、且没有 /v2 前缀，不能复用 BILLING 常量。
+# 注意参数名是驼峰 pageNum/pageSize（与同域 get-user-resource 的 PageNumber/PageSize 不同）。
+USAGE_BILLING = "https://www.workbuddy.cn/billing/meter/"
+USAGE_PAGE_SIZE = 100
+USAGE_SYNC_DAYS = 30   # 拉取窗口必须 ≥ 同步周期，否则连续断档会留永久空洞
 EXPIRY_SOON_DAYS = 3
+# 三档轮转策略。round_robin 按权重+最早过期排序后用游标轮转；
+# random 随机；expiry_first 只看最早过期、不看权重。
+ROUTING_POLICIES = frozenset(("round_robin", "random", "expiry_first"))
 
 
 def number(value):
@@ -30,6 +43,18 @@ def number(value):
     if not n.is_finite():
         raise ValueError("invalid number")
     return max(Decimal(0), n)
+
+
+def _same_day(timestamp, now):
+    """timestamp 是否是 now 所在的北京时间那一天（按天判断，避免同一天重复拉取）。"""
+    if not timestamp:
+        return False
+    try:
+        day = datetime.fromtimestamp(timestamp, CN).date()
+        today = datetime.fromtimestamp(now, CN).date()
+    except (TypeError, ValueError, OSError):
+        return False
+    return day == today
 
 
 def package_expiry(p):
@@ -70,7 +95,7 @@ def summarize_packages(packages, now=None):
                     earliest, earliest_remaining = expiry, float(spendable)
                 if now < expiry <= cutoff:
                     expiring_soon += spendable
-    return {"remaining": float(remain), "capacity": float(size), "used": float(max(Decimal(0), size - remain)), "packages": len(packages),
+    return {"remaining": float(remain), "packages": len(packages),
             "earliest_expiry": earliest, "earliest_expiry_remaining": earliest_remaining,
             "expiring_soon": float(expiring_soon), "expiring_soon_updated": int(now)}
 
@@ -84,9 +109,11 @@ class BillingError(Exception):
 class AccountPool:
     # 池设置默认值。Store._load 用它们补齐旧数据缺失的字段，
     # 这里保留 setdefault 兼容直接构造 Store 的老用法。
-    POOL_DEFAULTS = {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00",
+    # routing 不在这里：全局默认改由 settings.default_routing 提供，每 key 的策略在 keys.routing。
+    POOL_DEFAULTS = {"auto_checkin": True, "checkin_time": "09:00",
                      "affinity_expiry_days": 3, "credit_min_interval": 60,
-                     "sync_window": ["10:00", "20:00"], "batch_spread": 90}
+                     "sync_start": "10:00", "sync_end": "20:00", "batch_spread": 90,
+                     "default_routing": "round_robin"}
 
     def __init__(self, store, clock=time.time, client_factory=None):
         self.store, self.clock = store, clock
@@ -103,10 +130,18 @@ class AccountPool:
             store.data["pool"] = {**self.POOL_DEFAULTS, **store.data["pool"]}
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
+            # 只在真的补了缺失字段时才落库：否则每次启动都全量重写
+            # accounts/keys 两张表，纯属白写。
+            filled = False
             for item in store.data.get("keys", {}).values():
-                item.setdefault("daily_limit", None)
-                item.setdefault("usage", {})
-            store.save()
+                for field, default in (("daily_limit", None), ("usage", {}), ("enabled", 1),
+                                       ("revoked_at", None), ("expires_at", None), ("routing", None)):
+                    if field not in item:
+                        item[field] = default
+                        filled = True
+            if filled:
+                store.keys_dirty = True
+                store.save()
 
     def operation_lock(self, aid):
         with self.store.lock:
@@ -123,27 +158,18 @@ class AccountPool:
         with self.store.lock:
             if aid in self.store.data["accounts"]:
                 status = self.store.data["account_status"].setdefault(aid, {})
-                old = status.get("remaining")
-                new = values.get("remaining")
-                # 记录积分余额变化：按天滚动存 (时间戳, 变化量)，用于消耗速率与预测。
-                if isinstance(new, (int, float)) and isinstance(old, (int, float)) and old != new:
-                    today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
-                    history = status.setdefault("usage_history", [])
-                    if not history or history[-1].get("date") != today:
-                        history.append({"date": today, "samples": []})
-                    history[-1]["samples"].append([int(self.clock()), round(old - new, 2)])
-                    # 只保留最近 30 天，每天最多 288 个采样点（足够覆盖 5 分钟~30 分钟同步频率）。
-                    del history[:-30]
-                    if len(history[-1]["samples"]) > 288:
-                        del history[-1]["samples"][:len(history[-1]["samples"]) - 288]
-                    self.dirty = True
                 status.update(values)
                 self.dirty = True
 
     def flush(self, force=False):
-        """Debounced persistence: per-request updates only mark dirty; tick flushes every 5s."""
+        """Debounced persistence: per-request updates only mark dirty; tick flushes every 5s.
+
+        触发条件除 pool.dirty 外，还要覆盖 keys 用量（keys_dirty）与 request_logs 缓冲——
+        record_key_usage 现在只改内存，不落库，漏了它们计数就永远不会写进库。
+        """
         with self.store.lock:
-            if self.dirty and (force or self.clock() - self.last_flush >= 5):
+            pending = (self.dirty or self.store.keys_dirty or self.store.log_buffer)
+            if pending and (force or self.clock() - self.last_flush >= 5):
                 self.store.save()
                 self.dirty = False
                 self.last_flush = self.clock()
@@ -154,82 +180,80 @@ class AccountPool:
             return "paused"
         if row["status"] == "invalid" or status.get("auth_invalid"):
             return "invalid"
-        if status.get("cooldown_until", 0) > self.clock():
+        if (status.get("cooldown_until") or 0) > self.clock():
             return "cooling"
         if status.get("credits_updated", 0) > self.clock() - 600 and status.get("remaining") == 0 and status.get("packages", 0) > 0:
             return "exhausted"
         return "available"
 
-    def consumption(self, status):
-        """从 usage_history 估算日消耗速率（近 7 天，剔除余额上涨样本如签到/充值）。"""
-        history = status.get("usage_history", [])
-        if not history:
-            return None
-        now = self.clock()
-        cutoff = now - 7 * 86400
-        total_spent, span_start, span_end = 0.0, None, None
-        for day in history:
-            for ts, delta in day.get("samples", []):
-                if ts < cutoff or delta <= 0:
-                    continue
-                total_spent += delta
-                span_start = ts if span_start is None else min(span_start, ts)
-                span_end = ts if span_end is None else max(span_end, ts)
-        if not total_spent or span_start is None or not span_end or span_end <= span_start:
-            return None
-        days = max((span_end - span_start) / 86400, 0.5)
-        return {"daily_rate": round(total_spent / days, 2), "spent_7d": round(total_spent, 2)}
-
     def rows(self, rows):
         today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
         for row in rows:
             status = self.store.data["account_status"].get(row["id"], {})
-            consumption = self.consumption(status)
-            expiry = status.get("earliest_expiry")
-            remaining = status.get("remaining")
-            # 过期前用不完的积分：整号剩余 - 到期前按当前速率能消耗的量（粗估）。
-            expire_unused = None
-            if expiry and consumption and isinstance(remaining, (int, float)) and remaining > 0:
-                burnable = max(0.0, consumption["daily_rate"] * max((expiry - self.clock()) / 86400, 0))
-                expire_unused = round(max(0.0, remaining - burnable), 2)
-            row.update({"pool_state": self.state(row), "remaining": remaining, "credits_updated": status.get("credits_updated"),
+            row.update({"pool_state": self.state(row), "remaining": status.get("remaining"),
+                        "credits_updated": status.get("credits_updated"),
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
-                        "earliest_expiry": expiry, "earliest_expiry_remaining": status.get("earliest_expiry_remaining"),
+                        "earliest_expiry": status.get("earliest_expiry"),
+                        "earliest_expiry_remaining": status.get("earliest_expiry_remaining"),
                         "expiring_soon": status.get("expiring_soon"),
                         "expiring_soon_updated": status.get("expiring_soon_updated"),
                         "weight": int(status.get("weight", 0)),
-                        "daily_rate": consumption["daily_rate"] if consumption else None,
-                        "days_to_empty": round(remaining / consumption["daily_rate"], 1) if consumption and isinstance(remaining, (int, float)) and consumption["daily_rate"] > 0 else None,
-                        "expire_unused": expire_unused,
                         "checkin_slot": status.get("checkin_slot"), "checkin_when": status.get("checkin_when"),
-                        "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
+                        "today_checked_in": status.get("checkin_date") == today,
+                        "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
-                        "request_count": status.get("request_count", 0)})
+                        "request_count": status.get("request_count", 0),
+                        # 上游用量同步留痕：不吐给 overview 的话「留痕」没人看得到，
+                        # 出了同步故障只能翻库，等于没有这个功能。
+                        "usage_synced_at": status.get("usage_synced_at"),
+                        "usage_sync_error": status.get("usage_sync_error")})
         return rows
 
-    def order_candidates(self, candidates):
-        """Sort by weight desc, then earliest credit expiry asc so the soonest-to-expire
-        account is consumed first; unknown expiry sorts last within the same weight."""
-        def key(row):
-            status = self.store.data["account_status"].get(row["id"], {})
-            expiry = status.get("earliest_expiry")
-            return (-int(status.get("weight", 0)), expiry is None, expiry or 0)
-        return sorted(candidates, key=key)
+    def order_candidates(self, candidates, routing="round_robin"):
+        """round_robin：权重降序 + 最早过期升序；expiry_first：只看最早过期。
 
-    def select(self, affinity_key=None):
+        未知到期时间在同权重内排最后。unknown expiry sorts last。
+        """
+        def weight_key(row):
+            return -int(self.store.data["account_status"].get(row["id"], {}).get("weight", 0))
+
+        def expiry_key(row):
+            expiry = self.store.data["account_status"].get(row["id"], {}).get("earliest_expiry")
+            return (expiry is None, expiry or 0)
+
+        if routing == "expiry_first":
+            return sorted(candidates, key=expiry_key)
+        return sorted(candidates, key=lambda row: (weight_key(row), *expiry_key(row)))
+
+    def _routing_for(self, kid):
+        """该 key 的轮转策略；NULL 动态跟随 settings.default_routing。"""
+        item = self.store.data["keys"].get(kid) or {}
+        policy = item.get("routing") or self.store.data["pool"].get("default_routing", "round_robin")
+        return policy if policy in ROUTING_POLICIES else "round_robin"
+
+    def select(self, affinity_key=None, kid=None):
+        """按 key 选账号：候选集 = key 的 accounts 白名单 ∩ 可用账号。
+
+        kid=None 表示无 key 路径（管理页测试请求），此时不施加白名单。凭据失败后
+        重试也必须传同一个 kid，否则会选到白名单外的账号。
+        """
         with self.store.lock:
             candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
-            if self.store.data["pool"]["routing"] == "manual":
-                candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
+            if kid is not None:
+                # 空白名单 = 不限制；只有显式列了账号才收窄候选集。
+                whitelist = self.store.key_bindings(kid)[1]
+                if whitelist:
+                    candidates = [row for row in candidates if row["id"] in whitelist]
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+            routing = self._routing_for(kid)
             now = self.clock()
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
                 if bindings[key].get("expires", 0) <= now:
                     del bindings[key]
             bound = bindings.get(affinity_key, {}).get("account_id")
-            if bound in {row["id"] for row in candidates} and self.store.data["pool"]["routing"] != "manual":
+            if bound in {row["id"] for row in candidates}:
                 # 亲和默认保持以命中上游缓存；但若绑定账号的最早过期积分离过期还远，
                 # 而其他账号的积分将在阈值内过期，则改绑过去，避免积分白白清零。
                 self.affinity_hits += 1
@@ -245,8 +269,10 @@ class AccountPool:
                     bindings[affinity_key] = {"account_id": bound, "expires": now + 86400}
             if bound in {row["id"] for row in candidates}:
                 aid = bound
+            elif routing == "random":
+                aid = random.choice(candidates)["id"]
             else:
-                ordered = self.order_candidates(candidates)
+                ordered = self.order_candidates(candidates, routing)
                 aid = ordered[self.cursor % len(ordered)]["id"]
                 self.cursor += 1
             if affinity_key:
@@ -446,8 +472,8 @@ class AccountPool:
         # 低峰凭据预刷新：expiresAt 2 小时内到期的账号提前刷新，避免请求撞上 401 再冷却。
         # 凭据预刷新：分散到白天时段，每个账号每天随机一个时刻，模拟正常使用时刷新，
         # 避免半夜集中刷新。仅在 access token 两小时内到期时才动作。
-        window = cfg.get("sync_window") or ["10:00", "20:00"]
-        in_window = len(window) == 2 and window[0] <= now.strftime("%H:%M") <= window[1]
+        window = [cfg.get("sync_start") or "10:00", cfg.get("sync_end") or "20:00"]
+        in_window = window[0] <= now.strftime("%H:%M") <= window[1]
         if in_window:
             today = now.strftime("%Y-%m-%d")
             for aid, item in list(self.store.data["accounts"].items()):
@@ -474,6 +500,8 @@ class AccountPool:
                     except HTTPException:
                         pass
         self.flush()
+        # 上游用量明细：每账号每天一次，失败只留痕不影响其它账号。
+        await self.sync_upstream_usage_batch()
 
     # 页面刷新触发的积分拉取：每账号限流，避免频繁请求被上游风控。
     REFRESH_MIN_INTERVAL = 60
@@ -501,6 +529,116 @@ class AccountPool:
                         return {"id": aid, "ok": False, "message": "账号已移除"}
             await asyncio.gather(*(run(aid) for aid in ids))
         return {"refreshed": len(ids)}
+
+    # -- 上游用量明细（对账）-----------------------------------------------
+    @staticmethod
+    def _usage_time(value):
+        """上游 requestTime 是北京时间且无时区标记，必须按 CN 解析，否则跨天统计差 8 小时。"""
+        try:
+            return int(datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN).timestamp())
+        except (TypeError, ValueError):
+            return None
+
+    def fetch_upstream_usage(self, client, headers, start, end):
+        """按 data.total 翻页拉取近端用量明细，返回原始行列表。"""
+        rows, page, total = [], 1, None
+        while page <= 200:
+            response = client.post(USAGE_BILLING + "get-user-request-usage", headers=headers,
+                                   json={"startTime": start, "endTime": end,
+                                         "pageNum": page, "pageSize": USAGE_PAGE_SIZE})
+            if response.status_code != 200:
+                raise BillingError("上游用量接口请求失败", response.status_code)
+            try:
+                payload = response.json()
+            except ValueError:
+                raise BillingError("上游用量接口返回格式异常")
+            if not isinstance(payload, dict) or payload.get("code") != 0:
+                raise BillingError("上游未返回用量明细")
+            data = payload.get("data") or {}
+            batch = data.get("data") or []
+            if not isinstance(batch, list):
+                raise BillingError("上游用量明细格式异常")
+            total = int(data.get("total") or 0)
+            rows.extend(item for item in batch if isinstance(item, dict))
+            if not batch or len(rows) >= total:
+                break
+            page += 1
+        return rows
+
+    def sync_upstream_usage(self, aid):
+        """单个账号同步上游用量：成功写 usage_synced_at，失败写 usage_sync_error。"""
+        item = self.store.data["accounts"].get(aid)
+        if not item:
+            raise HTTPException(404, "账号不存在")
+        end = datetime.fromtimestamp(self.clock(), CN)
+        start = end - timedelta(days=USAGE_SYNC_DAYS)
+        fmt = "%Y-%m-%d %H:%M:%S"
+        with self.operation_lock(aid):
+            manager = self.store.manager_for(aid, item)
+            headers = manager.get_headers()
+            with self.client_factory() as client:
+                rows = self.fetch_upstream_usage(
+                    client, headers, start.strftime(fmt), end.strftime(fmt))
+        name = item.get("name")
+        records = []
+        for row in rows:
+            request_id = row.get("requestId")
+            when = self._usage_time(row.get("requestTime"))
+            if not request_id or when is None:
+                continue
+            records.append({
+                "request_id": request_id, "account_id": aid, "account_name": name,
+                # credit 可能不是终值，db 层用 UPSERT 允许后续修正，不能 OR IGNORE。
+                "credit": number(row.get("credit")), "model": row.get("model"),
+                "client": row.get("client"), "request_time": when,
+                "agent_purpose": row.get("agentPurpose"),
+            })
+        self.store.db.save_upstream_usage(records)
+        self.update(aid, usage_synced_at=int(self.clock()), usage_sync_error=None)
+        return len(records)
+
+    async def sync_upstream_usage_batch(self):
+        """每天每账号一次；失败写 usage_sync_error 并当天不再重试（避免每 60 秒打上游）。"""
+        now = self.clock()
+        today = datetime.fromtimestamp(now, CN).strftime("%Y-%m-%d")
+        with self.store.lock:
+            due = []
+            for aid, item in self.store.data["accounts"].items():
+                if not item["enabled"]:
+                    continue
+                status = self.store.data["account_status"].get(aid, {})
+                # usage_synced_at 语义是「最后同步成功时间」，失败时不改它；
+                # 靠 usage_sync_error 里的日期前缀兼作「当天已尝试」标记，不新增列。
+                if _same_day(status.get("usage_synced_at"), now):
+                    continue
+                if (status.get("usage_sync_error") or "").startswith(today):
+                    continue
+                due.append(aid)
+        if not due:
+            return {"synced": 0, "skipped": True}
+        if self.jobs.locked():
+            return {"synced": 0, "skipped": True, "message": "已有任务进行中"}
+        results = {"synced": 0, "failed": 0}
+        async with self.jobs:
+            semaphore = asyncio.Semaphore(3)
+
+            async def run(aid):
+                async with semaphore:
+                    try:
+                        return await asyncio.to_thread(self.sync_upstream_usage, aid)
+                    except HTTPException:
+                        return None
+                    except Exception as e:
+                        # 留痕：同步挂了、过时几天都没人知道。前缀日期兼作「当天已尝试」，
+                        # 避免失败账号被每 60 秒的 tick 反复重试打上游。
+                        self.update(aid, usage_sync_error=f"{today} {type(e).__name__}: {e}"[:200])
+                        return None
+            for outcome in await asyncio.gather(*(run(aid) for aid in due)):
+                if outcome is None:
+                    results["failed"] += 1
+                else:
+                    results["synced"] += 1
+        return results
 
 
 def request_affinity(headers, body):
@@ -574,19 +712,29 @@ class PoolMiddleware:
                     return {"type": "http.request", "body": raw, "more_body": False}
                 return await original_receive()
             receive = replay_receive
-            aid, manager = self.pool.select(affinity_key)
+            model_name = None
+            if isinstance(body, dict) and isinstance(body.get("model"), str):
+                model_name = body["model"]
             # Refresh before entering a stream; retry another eligible account only
             # if credential preparation fails, never replay a partially emitted response.
+            # 重试分支也要传同一个 kid，否则凭据失败后可能选到该 key 白名单之外的账号。
+            aid, manager = self.pool.select(affinity_key, kid)
             try:
                 await asyncio.to_thread(manager.get_headers)
             except Exception:
                 self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
-                aid, manager = self.pool.select(affinity_key)
+                aid, manager = self.pool.select(affinity_key, kid)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
         except Exception:
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
+        log_context = {"key_id": kid, "account_id": aid,
+                       "account_name": self.pool.store.data["accounts"].get(aid, {}).get("name"),
+                       "model_id": model_name, "model_name": model_name,
+                       "error_code": None}
+        # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
+        scope[REQUEST_LOG_CONTEXT] = log_context
         token = REQUEST_CREDENTIAL.set(manager)
         status = 200
         buffer = b""
@@ -615,6 +763,8 @@ class PoolMiddleware:
                                 code = int(code)
                             if code in (401, 402, 403, 429):
                                 status = code
+                                # 交由外层 MetricsMiddleware 统一决定生效状态码，这里只留痕。
+                                log_context["error_code"] = code
                         except (ValueError, AttributeError):
                             pass
                 if len(buffer) > 65536:

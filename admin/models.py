@@ -68,6 +68,49 @@ class ModelRegistry:
         _registry_ref[0] = self
 
     # -- persistence -------------------------------------------------------
+    def load(self, db):
+        """从 models 表恢复内存目录。只加载 available=1 的行。
+
+        上游已消失的模型（available=0）只留在表里供 request_logs join，不进 registry：
+        否则 snapshot_ids() 会把它们算成「已知」，PoolMiddleware 就会把「上游已下线」
+        误报成「管理页已禁用」而拒掉请求。
+        """
+        with self._lock:
+            rows = db.load_models(only_available=True)
+            self._catalog, self._available = {}, []
+            for order, (mid, row) in enumerate(sorted(rows.items(), key=lambda kv: kv[1].get("sort_order", 0))):
+                self._catalog[mid] = {"name": row.get("name") or mid,
+                                      "description": row.get("description"),
+                                      "credits": row.get("credits"),
+                                      "max_input_tokens": row.get("max_input_tokens"),
+                                      "source": row.get("source") or "builtin",
+                                      "_promo": row.get("promo")}
+                self._available.append(mid)
+                if not row.get("enabled", 1):
+                    self._disabled.add(mid)
+            self._updated = db.get_settings() or {}
+            self._updated = self._updated.get("models_updated", 0)
+
+    def persist(self, db):
+        """把当前目录写回 models 表（UPSERT 不删行）。
+
+        fetch() 拉到的 available 列表之外、上次存在但这次没出现的模型标 available=0 保留，
+        保证 request_logs.model_id 长期可 join。用户禁用状态 enabled 只由用户操作改写。
+        """
+        with self._lock:
+            rows = {}
+            for mid, info in self._catalog.items():
+                rows[mid] = {"name": info.get("name") or mid, "description": info.get("description"),
+                             "credits": info.get("credits"), "max_input_tokens": info.get("max_input_tokens"),
+                             "source": info.get("source") or "builtin",
+                             "available": 1 if mid in self._available else 0,
+                             "enabled": 0 if mid in self._disabled else 1,
+                             "sort_order": self._available.index(mid) if mid in self._available else 0,
+                             "promo": info.get("_promo")}
+            # 上次标记 available 的、这次 catalog 里已不在的：写 available=0 保留行。
+            db.save_models(rows)
+            db.update_settings({"models_updated": self._updated})
+
     def export_state(self):
         with self._lock:
             return {"catalog": dict(self._catalog), "available": list(self._available),
@@ -75,6 +118,7 @@ class ModelRegistry:
                     "updated": self._updated}
 
     def import_state(self, state):
+        """兼容旧的 state.json 导入路径（迁移后一般不再走，但保留以支持 state.json）。"""
         if not isinstance(state, dict):
             return
         with self._lock:
@@ -234,10 +278,15 @@ class ModelRegistry:
                 if mid not in self._catalog:
                     continue
                 entry = dict(self._catalog[mid], id=mid, enabled=mid not in self._disabled)
+                stored = entry.pop("_promo", None)
+                # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
+                # 在读取时算，两者不一致时以内置表为准。
                 promo = active_promo(mid, now)
                 if promo and isinstance(entry.get("credits"), (int, float)):
-                    entry["promo"] = {"label": promo[0], "factor": promo[1],
+                    entry["promo"] = {"label": promo[0] or stored or "折扣", "factor": promo[1],
                                       "credits": round(entry["credits"] * promo[1], 4)}
+                elif stored and isinstance(entry.get("credits"), (int, float)):
+                    entry["promo"] = {"label": stored, "factor": 1.0, "credits": entry["credits"]}
                 models.append(entry)
             models.sort(key=lambda m: (
                 not m["enabled"],
@@ -261,7 +310,6 @@ class ModelRegistry:
             if mid not in self._catalog and mid not in self._available:
                 raise KeyError(mid)
             self._disabled.discard(mid) if enabled else self._disabled.add(mid)
-        return self.export_state()
 
     def info(self, mid):
         with self._lock:

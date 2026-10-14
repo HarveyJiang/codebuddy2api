@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from core import converter
 from .browser_login import BrowserLogin
 from .db import Database
-from .pool import AccountPool, PoolMiddleware
+from .pool import AccountPool, PoolMiddleware, ROUTING_POLICIES
 from .metrics import RequestMetrics, MetricsMiddleware
 from .models import CN, ModelRegistry
 
@@ -68,6 +68,9 @@ def _id_list(value):
 # save() 里 kv 脏标记的初始值：与任何真实值都不同，保证首次一定写入。
 _MISSING = object()
 
+# accounts 表拆成「实体字段 + account_status 字段」，这里是实体的那几列。
+ENTITY_FIELDS = ("name", "file", "enabled", "created")
+
 
 class Store:
     def __init__(self, root, auth_dir, initial_key, admin_key):
@@ -87,8 +90,11 @@ class Store:
         self.path = self.root / "state.json"
         # SQLite 是唯一持久层；内存 self.data 是工作副本，写操作后统一落库。
         self.db = Database(self.root / "state.db", legacy_json=self.path)
-        self.data = {"accounts": {}, "active": None, "keys": {}}
-        self._dirty = {}  # kv 脏标记：值未变则跳过落库，避免每请求重写大 blob
+        self.data = {"accounts": {}, "account_status": {}, "keys": {}, "pool": {},
+                     "session_bindings": {}}
+        self._dirty = {}  # 脏标记：值未变则跳过落库，避免每请求重写大 blob
+        self.keys_dirty = False  # key 用量/管理改动等 save() 时才会落盘的字段
+        self.log_buffer = []  # request_logs 批量缓冲，随 5 秒防抖落库
         self._load()
         if not self.data["accounts"] and not self.data["keys"]:
             # 全新部署（数据库与 state.json 都为空）：从凭据目录导入。
@@ -101,47 +107,38 @@ class Store:
                 aid = secrets.token_hex(8)
                 name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
                 self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
-                if self.data["active"] is None and not doc.get("disabled"):
-                    self.data["active"] = aid
             if initial_key and not any(item["hash"] == digest(initial_key) for item in self.data["keys"].values()):
                 self.add_key("原有 API Key", value=initial_key)
             self.save()
-        self.sync_active()
+        self.sync_any_enabled()
 
     def _load(self):
-        """从 SQLite 恢复内存状态。"""
-        for row in self.db.query("SELECT id, name, file, enabled, created FROM accounts"):
-            self.data["accounts"][row["id"]] = {"name": row["name"], "file": row["file"],
-                                                "enabled": bool(row["enabled"]), "created": row["created"]}
-        for row in self.db.query("SELECT id, name, hash, hint, created, daily_limit, usage, models, accounts FROM keys"):
-            self.data["keys"][row["id"]] = {"name": row["name"], "hash": row["hash"], "hint": row["hint"],
-                                            "created": row["created"], "daily_limit": row["daily_limit"],
-                                            "usage": self._decode_dict(row["usage"]),
-                                            "models": self._decode_list(row["models"]),
-                                            "accounts": self._decode_list(row["accounts"])}
-        self.data["active"] = self.db.get_kv("active")
-        for key in ("pool", "model_registry", "account_status", "session_bindings"):
-            # 空 dict/None 都补成空壳：AccountPool 等下游仍可用 setdefault
-            # 往里填默认字段；这里保证键一定存在，避免直接访问 KeyError。
-            self.data[key] = self.db.get_kv(key) or {}
+        """从 SQLite 恢复内存状态。
+
+        accounts 一行装的是「实体字段 + account_status 字段」，这里按内存结构拆回
+        data['accounts'] / data['account_status']；金额已在 Database.load_accounts 里
+        ÷1e6 还原成 float。keys 同理：usage 三列重新组装成内存里的 usage dict。
+        """
+        for aid, merged in self.db.load_accounts().items():
+            self.data["accounts"][aid] = {k: merged.get(k) for k in ENTITY_FIELDS}
+            # 只保留非 NULL 的状态字段：以前 account_status 里只有实际写过的键，
+            # 下游大量用 status.get(x, 默认值)，让 NULL 值也占位会把默认值吃掉。
+            self.data["account_status"][aid] = {
+                k: v for k, v in merged.items() if k not in ENTITY_FIELDS and v is not None}
+        for kid, row in self.db.load_keys().items():
+            self.data["keys"][kid] = {
+                "name": row.get("name", ""), "hash": row.get("hash", ""),
+                "hint": row.get("hint", ""), "created": row.get("created", 0),
+                "enabled": row.get("enabled", 1), "revoked_at": row.get("revoked_at"),
+                "expires_at": row.get("expires_at"), "daily_limit": row.get("daily_limit"),
+                "usage": {"date": row.get("usage_date"), "count": row.get("usage_count", 0),
+                          "tokens": row.get("usage_tokens", 0)},
+                "models": row.get("models") or [], "accounts": row.get("accounts") or [],
+                "routing": row.get("routing")}
+        settings = self.db.get_settings()
         # 池设置可能来自旧数据（缺新字段），用默认值补齐缺失项。
-        self.data["pool"] = {**AccountPool.POOL_DEFAULTS, **self.data["pool"]}
-
-    @staticmethod
-    def _decode_list(raw):
-        try:
-            value = json.loads(raw or "[]")
-        except ValueError:
-            return []
-        return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
-
-    @staticmethod
-    def _decode_dict(raw):
-        try:
-            value = json.loads(raw or "{}")
-        except ValueError:
-            return {}
-        return value if isinstance(value, dict) else {}
+        self.data["pool"] = {**AccountPool.POOL_DEFAULTS, **(settings or {})}
+        self.data["session_bindings"] = self.db.load_bindings()
 
     @staticmethod
     def validate_credential(doc):
@@ -166,24 +163,40 @@ class Store:
                 raise HTTPException(400, "账号字段格式不正确")
 
     def save(self):
-        """全量落库：账号/密钥走独立表，其余状态走 kv 表。
+        """全量落库：每张状态表各写一次，与 request_logs 批量缓冲同处一个事务。
 
         整份状态收进单个事务，恢复旧 write_json「要么全新要么全旧」的原子性——
-        否则账号已提交而 active 尚未提交时崩溃，重启后 active 指向不存在的
-        账号，网关会全量失败。
+        否则账号已提交而密钥尚未提交时崩溃，重启后两边对不上。
 
-        kv 带脏标记：只有内容真的变化时才写（model_registry 序列化后约 20KB，
-        每请求重写会明显拖慢请求路径）。脏标记存深拷贝快照——若直接存引用，
+        pool / session_bindings 带脏标记：只有内容真的变化时才写（模型目录序列化后
+        约 20KB，每请求重写会明显拖慢请求路径）。脏标记存深拷贝快照——若直接存引用，
         原地修改会同时改到快照，导致永远判定为「未变化」而漏写。
         """
-        with self.lock, self.db.transaction():
-            self.db.replace_accounts(self.data["accounts"])
-            self.db.replace_keys(self.data["keys"])
-            for key in ("active", "pool", "model_registry", "account_status", "session_bindings"):
-                value = self.data.get(key)
-                if value != self._dirty.get(key, _MISSING):
-                    self.db.set_kv(key, value)
-                    self._dirty[key] = copy.deepcopy(value)
+        rows = self.log_buffer
+        self.log_buffer = []
+        try:
+            with self.lock, self.db.transaction():
+                self.db.save_accounts(self.data["accounts"], self.data["account_status"])
+                self.db.save_keys(self.data["keys"])
+                self.keys_dirty = False
+                for key, dump, load in (("pool", self.db.save_settings, None),
+                                        ("session_bindings", self.db.save_bindings, None)):
+                    value = self.data.get(key)
+                    if value != self._dirty.get(key, _MISSING):
+                        dump(value)
+                        self._dirty[key] = copy.deepcopy(value)
+                if rows:
+                    self.db.append_request_logs(rows)
+        except BaseException:
+            # 提交失败（磁盘满/IO 错误）时事务已回滚，把这批日志放回缓冲，
+            # 下次 flush 重试。否则它们会永久消失且没有任何提示。
+            self.log_buffer[:0] = rows
+            raise
+
+    def queue_request_log(self, row):
+        """请求日志只入内存缓冲，由 5 秒防抖的 flush() 统一落库。"""
+        with self.lock:
+            self.log_buffer.append(row)
 
     def save_browser_account(self, doc, name):
         self.validate_credential(doc)
@@ -206,17 +219,15 @@ class Store:
                         item["name"] = name
                     self.data.get("account_status", {}).pop(aid, None)
                     self.save()
-                    self.sync_active()
+                    self.sync_any_enabled()
                     return {"account_id": aid, "updated": True}
             if len(self.data["accounts"]) >= 100:
                 raise HTTPException(400, "最多保存 100 个账号")
             aid = secrets.token_hex(8)
             write_json(self.auth_dir / (aid + ".info"), doc)
             self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
-            if self.data["active"] is None:
-                self.data["active"] = aid
             self.save()
-            self.sync_active()
+            self.sync_any_enabled()
             return {"account_id": aid, "updated": False}
 
     def file_for(self, item):
@@ -225,10 +236,15 @@ class Store:
             raise HTTPException(400, "凭据路径不合法")
         return path
 
-    def sync_active(self):
-        aid = self.data.get("active")
-        item = self.data["accounts"].get(aid)
-        converter.CONFIG["cred"] = self.manager_for(aid, item) if item and item["enabled"] and self.file_for(item).exists() else None
+    def sync_any_enabled(self):
+        """把 CONFIG['cred'] 指向任一启用账号。
+
+        去掉全局 active 后，请求路径靠 REQUEST_CREDENTIAL 拿到具体账号；
+        CONFIG['cred'] 只用于 /health 与管理页测试的「有没有可用账号」判断，
+        因此指向任一启用账号即可，不代表某个路由目标。
+        """
+        manager = self.any_enabled_manager()
+        converter.CONFIG["cred"] = manager if manager is not None else None
 
     def manager_for(self, aid, item):
         with self.lock:
@@ -237,17 +253,18 @@ class Store:
             return self.managers[aid]
 
     def any_enabled_manager(self):
-        """A credential manager from any enabled account, for background pulls (model catalog)."""
+        """A credential manager from any enabled account, for background pulls (model
+        catalog) and the /health 'is any account usable' check."""
         with self.lock:
             for aid, item in self.data["accounts"].items():
-                if item["enabled"]:
+                if item["enabled"] and self.auth_dir.joinpath(item["file"]).exists():
                     return self.manager_for(aid, item)
             return None
 
     def account_rows(self):
         result = []
         for aid, item in self.data["accounts"].items():
-            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"]}
+            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "created": item["created"]}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
@@ -273,8 +290,12 @@ class Store:
             if limit < 0:
                 raise HTTPException(400, "每日上限不能为负")
         self.data["keys"][kid] = {"name": name, "hash": digest(value), "hint": value[:5] + "…" + value[-4:], "created": int(time.time()), "daily_limit": limit, "usage": {},
+                                  "enabled": 1, "revoked_at": None, "expires_at": None,
+                                  # routing=None 表示动态跟随 settings.default_routing。
+                                  "routing": None,
                                   # 空列表 = 不限制：该密钥可使用所有已启用模型 / 所有可用账号。
                                   "models": _id_list(models), "accounts": _id_list(accounts)}
+        self.keys_dirty = True
         return kid, value
 
     def key_bindings(self, kid):
@@ -287,6 +308,18 @@ class Store:
     def _today(self):
         return datetime.fromtimestamp(time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
 
+    @staticmethod
+    def key_unusable(item):
+        """返回不可用原因；None=可用。停用可恢复，撤销不可逆。"""
+        if item.get("revoked_at"):
+            return "该密钥已被撤销"
+        if not item.get("enabled", 1):
+            return "该密钥已停用"
+        expires = item.get("expires_at")
+        if expires and expires <= time.time():
+            return "该密钥已过期"
+        return None
+
     def check_api(self, authorization, x_api_key):
         """Return the matching key id, or None for the legacy single admin key."""
         token = authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else x_api_key or ""
@@ -294,6 +327,9 @@ class Store:
             hashed = digest(token)
             for kid, item in self.data["keys"].items():
                 if hmac.compare_digest(hashed, item["hash"]):
+                    reason = self.key_unusable(item)
+                    if reason:
+                        raise HTTPException(401, reason)
                     usage = item.setdefault("usage", {})
                     today = self._today()
                     if usage.get("date") != today:
@@ -308,6 +344,11 @@ class Store:
         raise HTTPException(401, "invalid api key")
 
     def record_key_usage(self, kid, tokens=None):
+        """只改内存，落库交给 5 秒防抖的 flush()。
+
+        原实现在这里直接 save()，等于每个 API 请求全量重写 keys/accounts；
+        攒批之后批量写才真正省得下来。
+        """
         with self.lock:
             item = self.data["keys"].get(kid)
             if not item:
@@ -320,7 +361,7 @@ class Store:
             usage["count"] = usage.get("count", 0) + 1
             if tokens:
                 usage["tokens"] = usage.get("tokens", 0) + int(tokens)
-            self.save()
+            self.keys_dirty = True
 
     def require_admin(self, req):
         sid = req.cookies.get(COOKIE, "")
@@ -390,16 +431,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     pool = AccountPool(store)
     metrics = RequestMetrics()
     model_registry = ModelRegistry(get_credential=store.any_enabled_manager)
-    model_registry.import_state(store.data.get("model_registry"))
+    model_registry.load(store.db)
     model_registry.ensure_builtin()
     # 缓存里的描述是旧逻辑（中文+英文拼接、上游原始顺序）时重新拉取一次，
     # 让展示立即变成「只有中文 + 按单价升序」。
     if _stale_catalog(model_registry):
         model_registry.fetch()
         model_registry.ensure_builtin()
-        with store.lock:
-            store.data["model_registry"] = model_registry.export_state()
-            store.save()
+        model_registry.persist(store.db)
     @asynccontextmanager
     async def lifespan(app):
         async def reap():
@@ -427,9 +466,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                         next_run = today
                 await asyncio.sleep(max(60, (next_run - now).total_seconds()))
                 model_registry.fetch()
-                with store.lock:
-                    store.data["model_registry"] = model_registry.export_state()
-                    store.save()
+                model_registry.persist(store.db)
         models_task = asyncio.create_task(models_worker())
         try:
             yield
@@ -463,7 +500,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     converter.get_available_models = _managed_models
     app.add_middleware(AdminMiddleware)
     app.add_middleware(PoolMiddleware, pool=pool, model_registry=model_registry)
-    app.add_middleware(MetricsMiddleware, metrics=metrics)
+    app.add_middleware(MetricsMiddleware, metrics=metrics, store=store)
 
     async def payload(req):
         try:
@@ -561,9 +598,35 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.get("/admin/api/overview")
     async def overview(req: Request):
         store.require_admin(req)
+        # recent 直接读 request_logs（跨重启保留、含账号/密钥/模型维度）。
+        recent = []
+        for row in store.db.recent_request_logs(100):
+            item = dict(row)
+            item["ok"] = item.get("outcome") == "success"
+            recent.append(item)
         with store.lock:
             keys = [{"id": kid, "usage": item.get("usage") or {}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+
+    @app.get("/admin/api/logs/stats")
+    async def log_stats(req: Request):
+        store.require_admin(req)
+        params = req.query_params
+
+        def as_int(name):
+            raw = params.get(name)
+            if raw in (None, ""):
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                raise HTTPException(400, f"{name} 需为整数时间戳")
+        group_by = params.get("group_by") or None
+        try:
+            return store.db.request_log_stats(since=as_int("since"), until=as_int("until"),
+                                              group_by=group_by, limit=500)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
 
     @app.post("/admin/api/pool/refresh-credits")
     async def pool_refresh_credits(req: Request):
@@ -574,9 +637,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def models_refresh(req: Request):
         store.require_admin(req)
         ok = await asyncio.to_thread(model_registry.fetch)
-        with store.lock:
-            store.data["model_registry"] = model_registry.export_state()
-            store.save()
+        model_registry.persist(store.db)
         snapshot = model_registry.snapshot()
         if not ok:
             raise HTTPException(502, snapshot.get("error") or "拉取失败")
@@ -589,12 +650,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         if type(body.get("enabled")) is not bool:
             raise HTTPException(400, "enabled 需为布尔值")
         try:
-            state = model_registry.set_enabled(mid, body["enabled"])
+            model_registry.set_enabled(mid, body["enabled"])
         except KeyError:
             raise HTTPException(404, "模型不存在")
-        with store.lock:
-            store.data["model_registry"] = state
-            store.save()
+        model_registry.persist(store.db)
         return {"ok": True}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
@@ -618,10 +677,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         import re
         with store.lock:
             settings = dict(store.data["pool"])
-            if "routing" in body:
-                if body["routing"] not in ("manual", "round_robin"):
+            if "default_routing" in body:
+                if body["default_routing"] not in ROUTING_POLICIES:
                     raise HTTPException(400, "调度方式无效")
-                settings["routing"] = body["routing"]
+                settings["default_routing"] = body["default_routing"]
             if "auto_checkin" in body:
                 if type(body["auto_checkin"]) is not bool:
                     raise HTTPException(400, "签到开关无效")
@@ -638,14 +697,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 0 <= interval <= 3600:
                     raise HTTPException(400, "积分拉取间隔需在 0-3600 秒之间")
                 settings["credit_min_interval"] = interval
-            if "sync_window" in body:
-                window = body["sync_window"]
+            if "sync_start" in body or "sync_end" in body:
                 pattern = r"(?:[01]\d|2[0-3]):[0-5]\d"
-                if (not isinstance(window, list) or len(window) != 2
-                        or not all(isinstance(t, str) and re.fullmatch(pattern, t) for t in window)):
-                    raise HTTPException(400, "统计时段需为两个 HH:MM 时间")
-                start, end = window
-                settings["sync_window"] = [start, end] if start <= end else [end, start]
+                start = body.get("sync_start", settings.get("sync_start"))
+                end = body.get("sync_end", settings.get("sync_end"))
+                if not (isinstance(start, str) and re.fullmatch(pattern, start)
+                        and isinstance(end, str) and re.fullmatch(pattern, end)):
+                    raise HTTPException(400, "预刷新时段需为两个 HH:MM 时间")
+                settings["sync_start"], settings["sync_end"] = (
+                    (start, end) if start <= end else (end, start))
             if "batch_spread" in body:
                 try:
                     spread = int(body["batch_spread"])
@@ -672,10 +732,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             filename = aid + ".info"
             write_json(store.auth_dir / filename, doc)
             store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True}
-            if store.data["active"] is None:
-                store.data["active"] = aid
             store.save()
-            store.sync_active()
+            store.sync_any_enabled()
         return {"id": aid}
 
     @app.patch("/admin/api/accounts/{aid}")
@@ -696,25 +754,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     raise HTTPException(400, "权重需为整数")
                 if not 0 <= weight <= 100:
                     raise HTTPException(400, "权重需在 0-100 之间")
-                with store.lock:
-                    store.data["account_status"].setdefault(aid, {})["weight"] = weight
+                store.data["account_status"].setdefault(aid, {})["weight"] = weight
             if "enabled" in body:
                 if type(body["enabled"]) is not bool:
                     raise HTTPException(400, "启用状态不正确")
                 new["enabled"] = body["enabled"]
-            if body.get("active") is True:
-                if not new["enabled"]:
-                    raise HTTPException(400, "请先启用账号")
-                try:
-                    store.validate_credential(json.loads(store.file_for(new).read_text(encoding="utf-8")))
-                except (ValueError, OSError):
-                    raise HTTPException(400, "凭据文件无法读取，请重新导入")
-                store.data["active"] = aid
             store.data["accounts"][aid] = new
-            if not new["enabled"] and store.data["active"] == aid:
-                store.data["active"] = None
             store.save()
-            store.sync_active()
+            store.sync_any_enabled()
         return {"ok": True}
 
     @app.delete("/admin/api/accounts/{aid}")
@@ -731,10 +778,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 write_json(trash / "credential.json", json.loads(source.read_text(encoding="utf-8")))
             write_json(trash / "metadata.json", item)
             del store.data["accounts"][aid]
-            if store.data["active"] == aid:
-                store.data["active"] = None
+            store.data["account_status"].pop(aid, None)
+            # 显式清理关联行：软删/白名单里残留的已删账号 id 也要剔除，
+            # 否则 key 会一直指向一个不存在的账号。
+            store.data["session_bindings"] = {
+                key: value for key, value in store.data["session_bindings"].items()
+                if value.get("account_id") != aid}
+            for key_item in store.data["keys"].values():
+                if key_item.get("accounts"):
+                    key_item["accounts"] = [x for x in key_item["accounts"] if x != aid]
+                    store.keys_dirty = True
             store.save()
-            store.sync_active()
+            store.sync_any_enabled()
             # Keep the file so an in-flight token refresh may still complete safely.
             # Account storage is authoritative; deleted records cannot be selected.
         return {"ok": True}
@@ -745,7 +800,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         name = clean_name(body.get("name"), "新客户端")
         with store.lock:
-            if len(store.data["keys"]) >= 100:
+            # 软删保留行之后，已撤销的 key 会一直留在字典里；上限必须只数
+            # 未撤销的，否则累计撤销到 100 枚后再也无法新建（与 revoke_key 口径一致）。
+            if len([k for k, v in store.data["keys"].items() if not v.get("revoked_at")]) >= 100:
                 raise HTTPException(400, "最多保存 100 枚 API Key")
             kid, key = store.add_key(name, daily_limit=body.get("daily_limit"))
             store.save()
@@ -770,6 +827,29 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     if limit < 0:
                         raise HTTPException(400, "每日上限不能为负")
                     item["daily_limit"] = limit
+            if "enabled" in body:
+                if type(body["enabled"]) is not bool:
+                    raise HTTPException(400, "enabled 需为布尔值")
+                item["enabled"] = int(body["enabled"])
+            if "routing" in body:
+                routing = body["routing"]
+                if routing is not None and routing not in ROUTING_POLICIES:
+                    raise HTTPException(400, "routing 需为 " + "／".join(sorted(ROUTING_POLICIES)) + " 或留空")
+                item["routing"] = routing
+            if "accounts" in body:
+                item["accounts"] = _id_list(body["accounts"])
+            if "models" in body:
+                item["models"] = _id_list(body["models"])
+            if "expires_at" in body:
+                raw = body["expires_at"]
+                if raw in (None, "", 0):
+                    item["expires_at"] = None
+                else:
+                    try:
+                        item["expires_at"] = int(raw)
+                    except (TypeError, ValueError):
+                        raise HTTPException(400, "expires_at 需为 unix 秒或留空")
+            store.keys_dirty = True
             store.save()
         return {"ok": True}
 
@@ -777,11 +857,17 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def revoke_key(kid: str, req: Request):
         store.require_admin(req)
         with store.lock:
-            if kid not in store.data["keys"]:
+            item = store.data["keys"].get(kid)
+            if not item:
                 raise HTTPException(404, "密钥不存在")
-            if len(store.data["keys"]) <= 1:
+            # 软删保留行（审计链不断），但「最后一枚不可撤销」只数未撤销的：
+            # 沿用 len(data["keys"]) <= 1 会把已撤销的计入，导致最后一个有效 key 也能被撤销。
+            active = [k for k, v in store.data["keys"].items() if not v.get("revoked_at")]
+            if len(active) <= 1:
                 raise HTTPException(400, "请先创建一枚新密钥，再撤销最后一枚密钥")
-            del store.data["keys"][kid]
+            item["enabled"] = 0
+            item["revoked_at"] = int(time.time())
+            store.keys_dirty = True
             store.save()
         return {"ok": True}
 
@@ -806,7 +892,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
             try:
-                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test", store=store)), base_url="http://internal") as client:
                     result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
                 data = result.json()
                 answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") if result.status_code == 200 else ""

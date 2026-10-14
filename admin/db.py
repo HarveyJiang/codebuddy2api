@@ -1,48 +1,210 @@
 """SQLite 持久层。
 
-替代早期的 state.json 单文件存储：管理数据（账号、密钥、账号池设置、模型注册表、
-账号状态、会话绑定）全部落在 SQLite。
+管理数据（账号、密钥、池设置、模型目录、请求日志、上游用量）全部落在 SQLite，
+没有通用 kv 表。
 
 设计要点：
 - `store.data`（内存 dict）保持原有结构不变，写操作后由 Store.save() 全量落库；
   数据量很小（账号 ≤100、密钥 ≤100），全量重写足够快。
+- 金额只在这层换算：落库 ×1e6 取整成 `*_micro`，读库 ÷1e6 还原成内存里的 float。
+  内存里始终是 float，`state()` 的比较和速率计算都依赖它。
+- 迁移走版本化 MIGRATIONS 列表（元素第一个值是目标版本），所有待执行迁移合并在
+  同一个事务里：任一步失败整体回滚且不写版本号，下次启动从头重跑。分步提交会出现
+  「step1 已提交、step2 失败」，届时版本号还是旧值，下次会重跑 step1 而非续跑。
 - 首次启动时若存在 state.json 而数据库为空，自动导入旧数据并保留 .bak 备份。
 - 所有写操作走同一个连接（单进程多线程），用显式事务保证整份状态原子生效。
 """
 import json
+import math
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-# 需要持久化的顶层键 -> 说明。accounts/keys 有独立表，其余走 kv 表。
-KV_KEYS = ("active", "pool", "model_registry", "account_status", "session_bindings")
+MICRO = 1_000_000
+
+# 内存字段名 -> DB 列名（改名与换算只发生在这层，上层只见内存字段名）
+ACCOUNT_MONEY_COLUMNS = {
+    "remaining": "remaining_micro",
+    "earliest_expiry_remaining": "earliest_remaining_micro",
+    "expiring_soon": "expiring_soon_micro",
+}
+
+# accounts 表里由 account_status 提供的列（其余属于账号实体）。
+# 金额列不在此列中——它们由 ACCOUNT_MONEY_COLUMNS 单独处理，避免重复建列。
+ACCOUNT_STATUS_COLUMNS = (
+    "weight", "packages", "earliest_expiry", "expiring_soon_updated",
+    "credits_updated", "checkin_date", "checkin_fails", "auto_attempt", "checkin_slot",
+    "checkin_when", "checkin_offset_date", "token_refreshed", "auth_invalid", "refresh_slot",
+    "refresh_slot_date", "refresh_window_date", "consecutive_fails", "cooldown_until",
+    "request_count", "last_request", "last_error", "usage_synced_at", "usage_sync_error",
+)
+
+ACCOUNT_STATUS_DEFAULTS = {
+    "weight": 0, "checkin_fails": 0, "auth_invalid": 0, "consecutive_fails": 0, "request_count": 0,
+}
+
+# 这些列必须是整数，避免把 float/str 写进 INTEGER 列
+ACCOUNT_INT_COLUMNS = frozenset(ACCOUNT_STATUS_COLUMNS) - {
+    "checkin_date", "checkin_slot", "checkin_when", "checkin_offset_date",
+    "refresh_slot", "refresh_slot_date", "last_error", "usage_sync_error",
+}
+
+KEY_COLUMNS = (
+    "name", "hash", "hint", "created", "enabled", "revoked_at", "expires_at", "daily_limit",
+    "usage_date", "usage_count", "usage_tokens", "models", "accounts", "routing",
+)
+
+MODEL_COLUMNS = (
+    "name", "description", "credits_micro", "max_input_tokens", "source", "available",
+    "enabled", "sort_order", "promo",
+)
+
+LOG_COLUMNS = (
+    "time", "source", "path", "status", "outcome", "duration_ms", "key_id", "account_id",
+    "account_name", "model_id", "model_name", "upstream_request_id",
+)
+
+REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
+REQUEST_LOG_MAX_ROWS = 2_000_000
 
 
 def _json_default(value):
     raise TypeError(f"不可序列化的状态值：{type(value).__name__}")
 
 
+def _dumps(value, default=_json_default):
+    return json.dumps(value, ensure_ascii=False, default=default)
+
+
+def _to_micro(value):
+    """积分 → 最小单位整数；None/非法值返回 None，避免把 0 和「未知」混为一谈。"""
+    number = _to_float(value)
+    return None if number is None else int(round(number * MICRO))
+
+
+def _from_micro(value):
+    return None if value is None else value / MICRO
+
+
+def _to_float(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _to_int(value, default=0):
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _decode_list(raw):
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, str)]
+    try:
+        value = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _decode_json(raw, default):
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        value = json.loads(raw) if raw else default
+    except (ValueError, TypeError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
 class Database:
     """SQLite 封装：单写连接 + 每线程读连接，自动建表与旧数据迁移。"""
+
+    # accounts / keys 单独列出来：v1 库已有同名旧表，迁移时 DROP 后按新结构重建。
+    ACCOUNTS_DDL = """CREATE TABLE IF NOT EXISTS accounts (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL DEFAULT 0,
+        weight INTEGER NOT NULL DEFAULT 0,
+        remaining_micro INTEGER, packages INTEGER, earliest_expiry INTEGER,
+        earliest_remaining_micro INTEGER, expiring_soon_micro INTEGER,
+        expiring_soon_updated INTEGER, credits_updated INTEGER,
+        checkin_date TEXT, checkin_fails INTEGER NOT NULL DEFAULT 0, auto_attempt INTEGER,
+        checkin_slot TEXT, checkin_when TEXT, checkin_offset_date TEXT,
+        token_refreshed INTEGER, auth_invalid INTEGER NOT NULL DEFAULT 0,
+        refresh_slot TEXT, refresh_slot_date TEXT, refresh_window_date TEXT,
+        consecutive_fails INTEGER NOT NULL DEFAULT 0, cooldown_until INTEGER,
+        request_count INTEGER NOT NULL DEFAULT 0, last_request INTEGER, last_error TEXT,
+        usage_synced_at INTEGER, usage_sync_error TEXT)"""
+
+    KEYS_DDL = """CREATE TABLE IF NOT EXISTS keys (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL, hint TEXT NOT NULL,
+        created INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        revoked_at INTEGER, expires_at INTEGER, daily_limit INTEGER,
+        usage_date TEXT, usage_count INTEGER NOT NULL DEFAULT 0,
+        usage_tokens INTEGER NOT NULL DEFAULT 0,
+        models TEXT NOT NULL DEFAULT '[]', accounts TEXT NOT NULL DEFAULT '[]', routing TEXT)"""
 
     # 逐条执行而不用 executescript()：后者会先隐式 COMMIT，
     # 把外层显式事务直接结束掉，导致随后 COMMIT 报 no transaction is active。
     SCHEMA = (
         """CREATE TABLE IF NOT EXISTS schema_meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
-        """CREATE TABLE IF NOT EXISTS accounts (
-            id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL DEFAULT 0)""",
-        """CREATE TABLE IF NOT EXISTS keys (
-            id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL,
-            hint TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0,
-            daily_limit INTEGER, usage TEXT NOT NULL DEFAULT '{}',
-            models TEXT NOT NULL DEFAULT '[]', accounts TEXT NOT NULL DEFAULT '[]')""",
-        """CREATE TABLE IF NOT EXISTS kv (
-            key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
+        ACCOUNTS_DDL,
+        KEYS_DDL,
+        """CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            auto_checkin INTEGER NOT NULL DEFAULT 1,
+            checkin_time TEXT NOT NULL DEFAULT '09:00',
+            affinity_expiry_days INTEGER NOT NULL DEFAULT 3,
+            credit_min_interval INTEGER NOT NULL DEFAULT 60,
+            sync_start TEXT NOT NULL DEFAULT '10:00',
+            sync_end TEXT NOT NULL DEFAULT '20:00',
+            batch_spread INTEGER NOT NULL DEFAULT 90,
+            default_routing TEXT NOT NULL DEFAULT 'round_robin',
+            models_updated INTEGER NOT NULL DEFAULT 0)""",
+        """CREATE TABLE IF NOT EXISTS session_bindings (
+            affinity_key TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+            expires INTEGER NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS models (
+            model_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+            credits_micro INTEGER, max_input_tokens INTEGER,
+            source TEXT NOT NULL DEFAULT 'builtin',
+            available INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0, promo TEXT)""",
+        """CREATE TABLE IF NOT EXISTS request_logs (
+            id INTEGER PRIMARY KEY,
+            time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api', path TEXT NOT NULL,
+            status INTEGER, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL,
+            key_id TEXT, account_id TEXT, account_name TEXT,
+            model_id TEXT, model_name TEXT, upstream_request_id TEXT)""",
+        """CREATE TABLE IF NOT EXISTS upstream_request_usage (
+            request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
+            credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
+            request_time INTEGER NOT NULL, agent_purpose TEXT)""",
+        """CREATE INDEX IF NOT EXISTS idx_bindings_expires
+            ON session_bindings(expires)""",
+        """CREATE INDEX IF NOT EXISTS idx_logs_key_time
+            ON request_logs(key_id, time)""",
+        """CREATE INDEX IF NOT EXISTS idx_logs_account_time
+            ON request_logs(account_id, time)""",
+        """CREATE INDEX IF NOT EXISTS idx_logs_model_time
+            ON request_logs(model_id, time)""",
+        """CREATE INDEX IF NOT EXISTS idx_upstream_model_time
+            ON upstream_request_usage(model, request_time)""",
+        """CREATE INDEX IF NOT EXISTS idx_upstream_account_time
+            ON upstream_request_usage(account_id, request_time)""",
     )
 
     def __init__(self, path, legacy_json=None):
@@ -60,8 +222,9 @@ class Database:
         with self.transaction():
             for statement in self.SCHEMA:
                 self._write.execute(statement)
-            self._write.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
-                                (str(SCHEMA_VERSION),))
+        self._migrate()
+        self.prune_request_logs()
+        self.prune_upstream_usage()
         # 空库 + 存在旧 state.json：导入后把旧文件备份，避免误当新数据处理。
         if legacy_json and Path(legacy_json).exists() and not self.query("SELECT 1 FROM accounts LIMIT 1"):
             self._import_legacy(legacy_json)
@@ -85,7 +248,7 @@ class Database:
 
         可重入：嵌套调用时直接让出，由最外层负责提交/回滚。
         这样 Store.save() 能把整份状态包进一个事务，而内部的
-        replace_accounts / replace_keys / set_kv 无需关心自己被嵌套调用。
+        save_accounts / save_keys 无需关心自己被嵌套调用。
 
         但「嵌套」必须由 _depth 记账，不能只看 in_transaction：后者为 True 时
         也可能是上一轮回滚失败留下的未决事务。那种情况下直接让出会让之后每次
@@ -171,6 +334,400 @@ class Database:
             except sqlite3.Error:
                 pass
 
+    # -- migrations ---------------------------------------------------------
+    # 第一个值是目标版本：(2, _v1_to_v2) 表示把库升到版本 2。
+    MIGRATIONS = ()
+
+    def _migrate(self):
+        rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
+        if not rows:
+            # 全新库：结构已由 SCHEMA 建好，直接标版本，不跑数据迁移。
+            self._write_version(SCHEMA_VERSION)
+            return
+        try:
+            current = int(rows[0][0])
+        except (TypeError, ValueError, IndexError):
+            raise RuntimeError(f"state.db 的 schema 版本号不可读：{rows[0][0]!r}")
+        pending = [step for target, step in self.MIGRATIONS if target > current]
+        if not pending:
+            return
+        with self.transaction():
+            for step in pending:
+                step(self)
+            self._write.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
+                (str(SCHEMA_VERSION),))
+
+    def _write_version(self, version):
+        with self.transaction():
+            self._write.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
+                (str(version),))
+
+    # -- 旧数据吸收（v1→v2 与 state.json 导入共用同一路径）-----------------
+    def _absorb(self, legacy, entities, keys):
+        """把旧 kv 五键 + 旧 accounts/keys 落到新表。
+
+        legacy: {active, pool, model_registry, account_status, session_bindings}
+        entities: {id: {name, file, enabled, created}}
+        keys: {id: 旧 key 结构}
+        """
+        legacy = legacy if isinstance(legacy, dict) else {}
+        self.save_accounts(entities or {}, legacy.get("account_status") or {})
+        self.save_keys(_upgrade_keys(keys or {}))
+        self._absorb_pool(legacy.get("pool"))
+        self._absorb_model_registry(legacy.get("model_registry"))
+        self.save_bindings(legacy.get("session_bindings") or {})
+
+    def _absorb_pool(self, pool):
+        """旧 kv.pool → settings 单行。routing 不迁移（语义下沉到 keys）。"""
+        if not isinstance(pool, dict):
+            return
+        window = pool.get("sync_window")
+        start, end = "10:00", "20:00"
+        if isinstance(window, list) and len(window) >= 2:
+            start, end = str(window[0]), str(window[1])
+        self.save_settings({
+            "auto_checkin": _to_int(pool.get("auto_checkin"), 1),
+            "checkin_time": str(pool.get("checkin_time") or "09:00"),
+            "affinity_expiry_days": _to_int(pool.get("affinity_expiry_days"), 3),
+            "credit_min_interval": _to_int(pool.get("credit_min_interval"), 60),
+            "sync_start": start,
+            "sync_end": end,
+            "batch_spread": _to_int(pool.get("batch_spread"), 90),
+            "default_routing": "round_robin",
+            "models_updated": _to_int(pool.get("models_updated"), 0),
+        })
+
+    def _absorb_model_registry(self, registry):
+        """旧 kv.model_registry → models 表 + settings.models_updated。
+
+        catalog{} 与 available[] 合并成行：available 里的决定 available=1 与
+        sort_order；只在 catalog 里（上游已消失）的保留成 available=0 行供日志 join。
+        """
+        if not isinstance(registry, dict):
+            return
+        catalog = registry.get("catalog")
+        catalog = catalog if isinstance(catalog, dict) else {}
+        disabled = {str(m) for m in registry.get("disabled") or []}
+        promotions = registry.get("promotions")
+        labels = [str(p.get("label")) for p in promotions
+                  if isinstance(p, dict) and p.get("label")] if isinstance(promotions, list) else []
+        promo = "／".join(dict.fromkeys(labels)) or None
+
+        rows = {}
+        for order, mid in enumerate(registry.get("available") or []):
+            rows[str(mid)] = {"sort_order": order, "available": 1}
+        for mid, info in catalog.items():
+            mid = str(mid)
+            row = rows.setdefault(mid, {"sort_order": 0, "available": 0})
+            info = info if isinstance(info, dict) else {}
+            row.update({
+                "name": str(info.get("name") or mid),
+                "description": info.get("description"),
+                # 传 float 单价：save_models 负责换算成 micro。这里若传已换算的
+                # credits_micro，会被再乘一次 1e6（曾把 3.5 存成 3.5e12）。
+                "credits": _to_float(info.get("credits")),
+                "max_input_tokens": _to_int(info.get("max_input_tokens")) or None,
+                "source": info.get("source") or "builtin",
+            })
+        for mid, row in rows.items():
+            row["enabled"] = 0 if mid in disabled else 1
+            # promo 只给 available 的模型：消失的模型只在表里供日志 join，不参与展示。
+            row["promo"] = promo if row["available"] else None
+        self.save_models(rows)
+        self.update_settings({"models_updated": _to_int(registry.get("updated"), 0)})
+
+    # -- settings -----------------------------------------------------------
+    SETTINGS_COLUMNS = (
+        "auto_checkin", "checkin_time", "affinity_expiry_days", "credit_min_interval",
+        "sync_start", "sync_end", "batch_spread", "default_routing", "models_updated",
+    )
+
+    def get_settings(self, defaults=None):
+        rows = self.query("SELECT * FROM settings WHERE id=1")
+        if not rows:
+            return None
+        return {column: rows[0][column] for column in self.SETTINGS_COLUMNS}
+
+    def save_settings(self, values):
+        with self.transaction():
+            self._write.execute(
+                f"INSERT OR REPLACE INTO settings (id, {', '.join(self.SETTINGS_COLUMNS)})"
+                f" VALUES (?, {', '.join('?' * len(self.SETTINGS_COLUMNS))})",
+                (1, *(values.get(column) for column in self.SETTINGS_COLUMNS)))
+
+    def update_settings(self, values):
+        if not values:
+            return
+        with self.transaction():
+            self._write.execute(
+                f"UPDATE settings SET {', '.join(f'{k}=?' for k in values)} WHERE id=1",
+                tuple(values.values()))
+
+    # -- accounts -----------------------------------------------------------
+    def load_accounts(self):
+        """{id: {实体字段…, account_status 字段…}}；金额已 ÷1e6 还原成 float。"""
+        result = {}
+        for row in self.query("SELECT * FROM accounts"):
+            item = {key: row[key] for key in row.keys()}
+            for memory, column in ACCOUNT_MONEY_COLUMNS.items():
+                item[memory] = _from_micro(item.pop(column, None))
+            result[row["id"]] = item
+        return result
+
+    def save_accounts(self, entities, statuses):
+        """全量同步：实体字段来自 entities，account_status 的字段并进同一行。"""
+        columns = ("id", "name", "file", "enabled", "created",
+                   *ACCOUNT_STATUS_COLUMNS, *ACCOUNT_MONEY_COLUMNS.values())
+        rows = []
+        for aid, entity in entities.items():
+            merged = {**entity, **(statuses.get(aid) or {})}
+            values = [aid,
+                      str(entity.get("name", ""))[:60],
+                      str(entity.get("file", "")),
+                      int(bool(entity.get("enabled", True))),
+                      _to_int(entity.get("created"))]
+            for column in ACCOUNT_STATUS_COLUMNS:
+                values.append(_status_value(column, merged))
+            values.extend(_to_micro(merged.get(memory)) for memory in ACCOUNT_MONEY_COLUMNS)
+            rows.append(tuple(values))
+        marks = ", ".join(["?"] * len(columns))
+        with self.transaction():
+            self._write.execute("DELETE FROM accounts")
+            self._write.executemany(
+                f"INSERT INTO accounts ({', '.join(columns)}) VALUES ({marks})", rows)
+
+    # -- keys ---------------------------------------------------------------
+    def load_keys(self):
+        result = {}
+        for row in self.query("SELECT * FROM keys"):
+            item = {key: row[key] for key in row.keys()}
+            item["models"] = _decode_list(item.get("models"))
+            item["accounts"] = _decode_list(item.get("accounts"))
+            result[row["id"]] = item
+        return result
+
+    def save_keys(self, keys):
+        columns = ("id", *KEY_COLUMNS)
+        marks = ", ".join(["?"] * len(columns))
+        rows = []
+        for kid, item in keys.items():
+            usage = item.get("usage") or {}
+            rows.append((kid,
+                         str(item.get("name", ""))[:60], item.get("hash", ""), item.get("hint", ""),
+                         _to_int(item.get("created")), _to_int(item.get("enabled"), 1),
+                         item.get("revoked_at"), item.get("expires_at"), item.get("daily_limit"),
+                         usage.get("date") or None, _to_int(usage.get("count")),
+                         _to_int(usage.get("tokens")),
+                         _dumps(_decode_list(item.get("models"))),
+                         _dumps(_decode_list(item.get("accounts"))),
+                         item.get("routing")))
+        with self.transaction():
+            self._write.execute("DELETE FROM keys")
+            self._write.executemany(
+                f"INSERT INTO keys ({', '.join(columns)}) VALUES ({marks})", rows)
+
+    # -- session bindings ---------------------------------------------------
+    def load_bindings(self):
+        return {row["affinity_key"]: {"account_id": row["account_id"], "expires": row["expires"]}
+                for row in self.query("SELECT * FROM session_bindings")}
+
+    def save_bindings(self, bindings):
+        rows = [(str(key), str(value.get("account_id")), _to_int(value.get("expires")))
+                for key, value in bindings.items()
+                if isinstance(value, dict) and value.get("account_id")]
+        with self.transaction():
+            self._write.execute("DELETE FROM session_bindings")
+            self._write.executemany(
+                "INSERT OR REPLACE INTO session_bindings (affinity_key, account_id, expires)"
+                " VALUES (?,?,?)", rows)
+
+    def delete_bindings_for_account(self, account_id):
+        with self.transaction():
+            self._write.execute("DELETE FROM session_bindings WHERE account_id=?", (account_id,))
+
+    # -- models -------------------------------------------------------------
+    def load_models(self, only_available=False):
+        sql = "SELECT * FROM models"
+        if only_available:
+            sql += " WHERE available=1"
+        result = {}
+        for row in self.query(sql):
+            item = {key: row[key] for key in row.keys()}
+            item["credits"] = _from_micro(item.pop("credits_micro", None))
+            result[row["model_id"]] = item
+        return result
+
+    def save_models(self, models):
+        """UPSERT 不删行：上游消失的模型由调用方标 available=0 保留。
+
+        入参 item 的单价是 float（`credits`），由这里统一换算成 `credits_micro`。
+        不接受已换算的 micro 值——那会被再乘一次 1e6。
+        """
+        if not models:
+            return
+        columns = ("model_id", *MODEL_COLUMNS)
+        marks = ", ".join(["?"] * len(columns))
+        rows = []
+        for mid, item in models.items():
+            rows.append((mid,
+                         str(item.get("name") or mid), item.get("description"),
+                         _to_micro(item.get("credits")),
+                         _to_int(item.get("max_input_tokens")) or None,
+                         item.get("source") or "builtin",
+                         _to_int(item.get("available"), 1), _to_int(item.get("enabled"), 1),
+                         _to_int(item.get("sort_order")), item.get("promo")))
+        with self.transaction():
+            self._write.executemany(
+                f"INSERT INTO models ({', '.join(columns)}) VALUES ({marks})"
+                " ON CONFLICT(model_id) DO UPDATE SET"
+                f" {', '.join(f'{c}=excluded.{c}' for c in columns[1:])}", rows)
+
+    def enabled_models(self):
+        """可用列表：available 与 enabled 两个条件缺一不可。"""
+        return [row["model_id"] for row in self.query(
+            "SELECT model_id FROM models WHERE available=1 AND enabled=1 ORDER BY sort_order")]
+
+    def known_model_ids(self):
+        """上游当前提供的全部 id（available=1），用于区分「已禁用」与「未知」。"""
+        return {row["model_id"] for row in self.query(
+            "SELECT model_id FROM models WHERE available=1")}
+
+    # -- request logs -------------------------------------------------------
+    def append_request_logs(self, rows):
+        """批量写入请求日志；空批次直接返回，不开事务。"""
+        if not rows:
+            return
+        marks = ", ".join(["?"] * len(LOG_COLUMNS))
+        with self.transaction():
+            self._write.executemany(
+                f"INSERT INTO request_logs ({', '.join(LOG_COLUMNS)}) VALUES ({marks})",
+                [tuple(row.get(column) for column in LOG_COLUMNS) for row in rows])
+
+    def recent_request_logs(self, limit=100):
+        rows = self.query(
+            f"SELECT {', '.join(LOG_COLUMNS)} FROM request_logs ORDER BY id DESC LIMIT ?",
+            (limit,))
+        return [{column: row[column] for column in LOG_COLUMNS} for row in rows]
+
+    # 分组维度 -> SQL 表达式。name 只是列名，不带用户输入，可安全拼接。
+    LOG_GROUPS = {
+        "day": "date(time, 'unixepoch', '+8 hours')",
+        "source": "source",
+        "path": "path",
+        "status": "status",
+        "outcome": "outcome",
+        "account": "account_id",
+        "key": "key_id",
+        "model": "model_id",
+    }
+
+    def request_log_stats(self, since=None, until=None, group_by=None, limit=500):
+        """请求日志统计：不分组时给总量，分组时给每组计数、成功率与平均耗时。
+
+        成功率只认 outcome='success'（HTTP 200 但 SSE 中途失败不算成功），
+        与 MetricsMiddleware 的判定保持一致。日期分桶按北京时间，避免跨天错位。
+        """
+        clauses, params = [], []
+        if since is not None:
+            clauses.append("time >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("time < ?")
+            params.append(int(until))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if group_by is None:
+            rows = self.query(
+                "SELECT COUNT(*) AS n, SUM(outcome='success') AS ok, AVG(duration_ms) AS avg"
+                f" FROM request_logs{where}", tuple(params))
+            row = rows[0]
+            return {"count": row["n"] or 0, "success": row["ok"] or 0,
+                    "avg_duration_ms": row["avg"], "groups": []}
+        expression = self.LOG_GROUPS.get(group_by)
+        if expression is None:
+            raise ValueError(f"不支持的分组维度：{group_by}")
+        rows = self.query(
+            f"SELECT {expression} AS bucket, COUNT(*) AS n, SUM(outcome='success') AS ok,"
+            f" AVG(duration_ms) AS avg FROM request_logs{where}"
+            f" GROUP BY bucket ORDER BY n DESC LIMIT ?", (*params, int(limit)))
+        # 分组模式下不返回总量：桶受 limit 截断，求和会小于真实总量，
+        # 字段名叫 count 容易被当成全量。真实总量用不分组调用（count 无歧义）。
+        return {"groups": [
+            {"key": row["bucket"], "count": row["n"] or 0, "success": row["ok"] or 0,
+             "success_rate": round(100 * (row["ok"] or 0) / row["n"], 1) if row["n"] else None,
+             "avg_duration_ms": round(row["avg"]) if row["avg"] is not None else None}
+            for row in rows]}
+
+    def prune_upstream_usage(self, keep_days=REQUEST_LOG_KEEP_DAYS):
+        """启动时裁剪上游用量（spec 要求保留 3 个月）。
+
+        这张表每次同步会 UPSERT 进 30 天窗口内的所有行，只增不减，
+        不裁剪会随账号数×时间无限膨胀。按 request_time（不是本地写入时间）裁，
+        与同步窗口同基准。
+        """
+        cutoff = int(time.time()) - keep_days * 86400
+        with self.transaction():
+            self._write.execute(
+                "DELETE FROM upstream_request_usage WHERE request_time < ?", (cutoff,))
+
+    def prune_request_logs(self, keep_days=REQUEST_LOG_KEEP_DAYS, max_rows=REQUEST_LOG_MAX_ROWS):
+        """启动时裁剪：先按时间，再按行数上限兜底，避免一次全表 DELETE 长时间持锁。"""
+        cutoff = int(time.time()) - keep_days * 86400
+        with self.transaction():
+            self._write.execute("DELETE FROM request_logs WHERE time < ?", (cutoff,))
+        total = self.query("SELECT COUNT(*) AS n FROM request_logs")[0]["n"]
+        if total <= max_rows:
+            return 0
+        with self.transaction():
+            self._write.execute(
+                "DELETE FROM request_logs WHERE id IN"
+                " (SELECT id FROM request_logs ORDER BY id LIMIT ?)", (total - max_rows,))
+        return total - max_rows
+
+    # -- upstream request usage ---------------------------------------------
+    def load_upstream_usage(self, account_id=None, since=None, limit=None):
+        sql, params = "SELECT * FROM upstream_request_usage", []
+        clauses = []
+        if account_id:
+            clauses.append("account_id=?")
+            params.append(account_id)
+        if since is not None:
+            clauses.append("request_time>=?")
+            params.append(int(since))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY request_time DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        result = []
+        for row in self.query(sql, tuple(params)):
+            item = {key: row[key] for key in row.keys()}
+            item["credit"] = _from_micro(item.pop("credit_micro", None))
+            result.append(item)
+        return result
+
+    def save_upstream_usage(self, records):
+        """UPSERT：credit 可能不是终值，用 INSERT OR IGNORE 会把首条 pending/0 永久钉死。"""
+        rows = [(str(r.get("request_id")), r.get("account_id"), r.get("account_name"),
+                 _to_micro(r.get("credit")) or 0, r.get("model"), r.get("client"),
+                 _to_int(r.get("request_time")), r.get("agent_purpose"))
+                for r in records if r.get("request_id")]
+        if not rows:
+            return 0
+        with self.transaction():
+            self._write.executemany(
+                """INSERT INTO upstream_request_usage
+                   (request_id, account_id, account_name, credit_micro, model, client,
+                    request_time, agent_purpose)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(request_id) DO UPDATE SET
+                     credit_micro=excluded.credit_micro,
+                     account_name=excluded.account_name""",
+                rows)
+        return len(rows)
+
     # -- legacy import ------------------------------------------------------
     def _import_legacy(self, legacy_json):
         try:
@@ -180,52 +737,74 @@ class Database:
         if not isinstance(legacy, dict):
             return
         with self.transaction():
-            self.replace_accounts(legacy.get("accounts") or {})
-            self.replace_keys(legacy.get("keys") or {})
-            for key in KV_KEYS:
-                if key in legacy:
-                    self._write.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)",
-                                        (key, json.dumps(legacy[key], ensure_ascii=False,
-                                                         default=_json_default)))
+            self._absorb(legacy, legacy.get("accounts") or {}, legacy.get("keys") or {})
         try:
             backup = Path(legacy_json).with_suffix(".json.bak")
             Path(legacy_json).replace(backup)
         except OSError:
             pass
 
-    # -- accounts / keys ----------------------------------------------------
-    def replace_accounts(self, accounts):
-        """全量同步内存中的账号表（增删改都以内存为准）。数据量 ≤100，全量重写最简单可靠。"""
-        with self.transaction():
-            self._write.execute("DELETE FROM accounts")
-            self._write.executemany("INSERT INTO accounts (id, name, file, enabled, created) VALUES (?,?,?,?,?)",
-                                    [(aid, str(item.get("name", ""))[:60], str(item.get("file", "")),
-                                      int(bool(item.get("enabled", True))), int(item.get("created", 0) or 0))
-                                     for aid, item in accounts.items()])
 
-    def replace_keys(self, keys):
-        with self.transaction():
-            self._write.execute("DELETE FROM keys")
-            self._write.executemany("""INSERT INTO keys (id, name, hash, hint, created, daily_limit, usage, models, accounts)
-                                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                                    [(kid, str(item.get("name", ""))[:60], item.get("hash", ""), item.get("hint", ""),
-                                      int(item.get("created", 0) or 0), item.get("daily_limit"),
-                                      json.dumps(item.get("usage") or {}, ensure_ascii=False),
-                                      json.dumps(item.get("models") or [], ensure_ascii=False),
-                                      json.dumps(item.get("accounts") or [], ensure_ascii=False))
-                                     for kid, item in keys.items()])
+def _status_value(column, merged):
+    default = ACCOUNT_STATUS_DEFAULTS.get(column)
+    value = merged.get(column)
+    if value is None:
+        return default
+    if column in ACCOUNT_INT_COLUMNS:
+        return _to_int(value, default if default is not None else 0)
+    return int(value) if isinstance(value, bool) else value
 
-    # -- kv -----------------------------------------------------------------
-    def set_kv(self, key, value):
-        with self.transaction():
-            self._write.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)",
-                                (key, json.dumps(value, ensure_ascii=False, default=_json_default)))
 
-    def get_kv(self, key, default=None):
-        rows = self.query("SELECT value FROM kv WHERE key=?", (key,))
-        if not rows:
-            return default
-        try:
-            return json.loads(rows[0][0])
-        except (ValueError, IndexError):
-            return default
+def _upgrade_keys(keys):
+    """旧 key 结构 → 新结构：usage 摊平成三列，其余新列取默认值。"""
+    result = {}
+    for kid, item in keys.items():
+        if not isinstance(item, dict):
+            continue
+        usage = _decode_json(item.get("usage"), {})
+        result[kid] = {
+            "name": item.get("name", ""),
+            "hash": item.get("hash", ""),
+            "hint": item.get("hint", ""),
+            "created": _to_int(item.get("created")),
+            "enabled": 1,
+            "revoked_at": None,
+            "expires_at": None,
+            "daily_limit": item.get("daily_limit"),
+            "usage": {"date": usage.get("date"), "count": _to_int(usage.get("count")),
+                      "tokens": _to_int(usage.get("tokens"))},
+            "models": _decode_list(item.get("models")),
+            "accounts": _decode_list(item.get("accounts")),
+            "routing": None,
+        }
+    return result
+
+
+def _v1_to_v2(db):
+    """v1 → v2：旧 accounts/keys 按新结构重建，kv 五键导入具名表后删除 kv。"""
+    legacy = {}
+    if db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"):
+        for row in db.query("SELECT key, value FROM kv"):
+            try:
+                legacy[row["key"]] = json.loads(row["value"])
+            except (ValueError, TypeError):
+                legacy[row["key"]] = None
+
+    entities, keys = {}, {}
+    for row in db.query("SELECT * FROM accounts"):
+        entities[row["id"]] = {"name": row["name"], "file": row["file"],
+                               "enabled": bool(row["enabled"]), "created": row["created"]}
+    for row in db.query("SELECT * FROM keys"):
+        keys[row["id"]] = {key: row[key] for key in row.keys()}
+
+    # v1 里这两张表已存在但列结构是旧的：SCHEMA 的 IF NOT EXISTS 不会改列，
+    # 必须 DROP 后按新 DDL 重建（数据量 ≤100 行，内存里搬运即可）。
+    db._write.execute("DROP TABLE IF EXISTS accounts")
+    db._write.execute("DROP TABLE IF EXISTS keys")
+    db._write.execute(Database.ACCOUNTS_DDL)
+    db._write.execute(Database.KEYS_DDL)
+    db._absorb(legacy, entities, keys)
+    db._write.execute("DROP TABLE IF EXISTS kv")
+
+
+Database.MIGRATIONS = ((2, _v1_to_v2),)
