@@ -23,3 +23,11 @@
 .usage-groups-wrap h3{font-size:15px;margin-bottom:8px}
 .usage-cell{cursor:pointer}
 .usage-cell:hover{background:#f8fbfa}
+
+/* 模型管理：工具栏双按钮、行内删除、添加弹窗的勾选项 */
+.toolbar-actions{display:flex;gap:10px;align-items:center}
+.models-body-actions{display:flex;gap:4px;justify-content:flex-end}
+#models-body .danger{color:#a46762;background:none;padding:6px 8px;border-radius:5px;font-size:11px}
+#models-body .danger:hover:not(:disabled){background:#fbefed}
+.check-row{display:flex;align-items:center;gap:9px;font-size:12px;margin:19px 0 7px;font-weight:600}
+.check-row input{width:16px;height:16px;flex-shrink:0}

@@ -96,8 +96,12 @@ function renderModels() {
     const credits = m.credits === null || m.credits === undefined ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
     const promoNote = m.promo ? `<small class="cell-note">${esc(m.promo.label)} ×${m.promo.credits}</small>` : "";
     const ctx = m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : m.max_input_tokens) : "—";
-    return `<tr><td><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small></td><td>${esc(m.description || "—")}</td><td><span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${credits}</span>${promoNote}</td><td class="mono">${ctx}</td><td><span class="pill ${m.enabled ? "green" : ""}">${m.enabled ? "启用" : "禁用"}</span></td><td class="align-right"><button data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}">${m.enabled ? "禁用" : "启用"}</button></td></tr>`;
-  }).join("") || '<tr><td colspan="6" class="muted">模型列表为空，请点击「立即拉取」。</td></tr>';
+    // 来源：上游返回 / 内置兜底 / 用户手动添加。自定义项才能删。
+    const sourceLabel = {upstream:"上游", builtin:"内置", custom:"自定义"}[m.source] || m.source || "—";
+    const sourceTag = `<span class="pill ${m.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
+    const del = m.custom ? `<button class="danger" data-model-delete="${esc(m.id)}">删除</button>` : "";
+    return `<tr><td><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small></td><td>${sourceTag}</td><td>${esc(m.description || "—")}</td><td><span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${credits}</span>${promoNote}</td><td class="mono">${ctx}</td><td><span class="pill ${m.enabled ? "green" : ""}">${m.enabled ? "启用" : "禁用"}</span></td><td class="align-right">${del}<button data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}">${m.enabled ? "禁用" : "启用"}</button></td></tr>`;
+  }).join("") || '<tr><td colspan="7" class="muted">模型列表为空，请点击「立即拉取」或手动添加。</td></tr>';
 }
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
@@ -402,12 +406,61 @@ $("models-refresh").addEventListener("click", async () => {
   finally { $("models-refresh").disabled = false; $("models-refresh").innerHTML = '<span>↻</span> 立即拉取'; }
 });
 $("models-body").addEventListener("click", async e => {
-  const button = e.target.closest("[data-model-toggle]");
-  if (!button) return;
-  button.disabled = true;
-  try { await api("models/" + encodeURIComponent(button.dataset.modelToggle), {method:"PATCH", body:{enabled:button.dataset.enabled === "1"}}); await refresh(); }
-  catch (err) { toast(err.message); button.disabled = false; }
+  const toggle = e.target.closest("[data-model-toggle]");
+  if (toggle) {
+    toggle.disabled = true;
+    try { await api("models/" + encodeURIComponent(toggle.dataset.modelToggle), {method:"PATCH", body:{enabled:toggle.dataset.enabled === "1"}}); await refresh(); }
+    catch (err) { toast(err.message); toggle.disabled = false; }
+    return;
+  }
+  const del = e.target.closest("[data-model-delete]");
+  if (del) {
+    const mid = del.dataset.modelDelete;
+    if (!confirm(`删除自定义模型 ${mid}？`)) return;
+    del.disabled = true;
+    try { await api("models/" + encodeURIComponent(mid), {method:"DELETE"}); await refresh(); toast(`已删除 ${mid}`); }
+    catch (err) { toast(err.message); del.disabled = false; }
+  }
 });
+// -- 添加模型 -------------------------------------------------------------
+$("models-add").addEventListener("click", () => {
+  $("model-form").reset();
+  $("model-enabled").checked = true;
+  $("model-error").textContent = "";
+  $("model-dialog").showModal();
+});
+$("model-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const error = $("model-error");
+  error.textContent = "";
+  const id = $("model-id").value.trim();
+  // 前端先挡一道，但后端才是权威（ID 要进 URL 路径与 JSON）。
+  if (!/^[A-Za-z0-9._:/-]+$/.test(id)) {
+    error.textContent = "模型 ID 只能包含字母、数字与 . _ : / -";
+    return;
+  }
+  const num = el => { const v = el.value.trim(); return v === "" ? null : Number(v); };
+  const button = $("model-submit");
+  button.disabled = true;
+  try {
+    await api("models", {method: "POST", body: {
+      id,
+      name: $("model-name").value.trim() || null,
+      description: $("model-desc").value.trim() || null,
+      credits: num($("model-credits")),
+      max_input_tokens: num($("model-ctx")),
+      enabled: $("model-enabled").checked,
+    }});
+    $("model-dialog").close();
+    await refresh();
+    toast(`已保存 ${id}`);
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $("test-form").addEventListener("submit", async e => {
   e.preventDefault(); busy = true; $("test-submit").disabled = true; $("test-submit").textContent = "正在调用…"; $("test-status").className = "pill amber"; $("test-status").textContent = "请求中"; $("test-output").textContent = "正在等待上游响应，最长约 90 秒…"; $("test-meta").textContent = "";
   try { const r = await api("test", {method:"POST",body:{model:$("model").value,prompt:$("test-prompt").value}}); $("test-status").className = "pill " + (r.ok ? "green" : "red"); $("test-status").textContent = r.ok ? "连接成功" : "调用失败"; $("test-output").textContent = r.ok ? r.answer : r.error; $("test-meta").textContent = `${r.seconds}s${r.status ? " · HTTP " + r.status : ""}${r.usage?.total_tokens !== undefined ? " · " + r.usage.total_tokens + " tokens" : ""}`; }

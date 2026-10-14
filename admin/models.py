@@ -32,6 +32,24 @@ FETCH_TIMEOUT = 15
 REFRESH_INTERVAL = 6 * 3600
 
 
+# 模型来源（models.source 列），管理页按它显示徽标：
+#   upstream —— 上游 /v3/config 本次返回了它，元数据以上游为准
+#   builtin  —— 上游没返回，用内置官方元数据兜底（如三档智能路由）
+#   custom   —— 用户手动添加的，上游没返回但实际可调用
+SOURCE_UPSTREAM = "upstream"
+SOURCE_BUILTIN = "builtin"
+SOURCE_CUSTOM = "custom"
+MODEL_SOURCES = (SOURCE_UPSTREAM, SOURCE_BUILTIN, SOURCE_CUSTOM)
+
+# 管理页的中文标签。
+SOURCE_LABELS = {SOURCE_UPSTREAM: "上游", SOURCE_BUILTIN: "内置", SOURCE_CUSTOM: "自定义"}
+
+
+def normalize_source(value):
+    """收敛到三种来源之一；不认识的历史值当作上游。"""
+    return value if value in MODEL_SOURCES else SOURCE_UPSTREAM
+
+
 def _credits_multiplier(text):
     """'x0.06 credits' -> 0.06; '' or missing -> None (billed as standard)."""
     if not isinstance(text, str) or not text.strip():
@@ -62,6 +80,9 @@ class ModelRegistry:
         self._catalog = {}      # id -> {name, description, credits, max_input_tokens, source}
         self._available = []    # ordered ids from the upstream cli agent
         self._disabled = set()  # user-disabled ids
+        # 用户手工添加的模型 id。上游菜单不一定列全（灰度、区域差异、菜单滞后），
+        # 这些模型上游没返回但仍可调用，必须跨 fetch() 存活。
+        self._custom = set()
         self._promotions = []   # dynamic discounts parsed from the product config
         self._updated = 0
         self._error = None
@@ -76,16 +97,23 @@ class ModelRegistry:
         误报成「管理页已禁用」而拒掉请求。
         """
         with self._lock:
-            rows = db.load_models(only_available=True)
-            self._catalog, self._available = {}, []
-            for order, (mid, row) in enumerate(sorted(rows.items(), key=lambda kv: kv[1].get("sort_order", 0))):
+            # include_custom：手工添加的行可能 available=0（上游没返回它），
+            # 只按 available=1 加载会让它们在重启后消失。
+            rows = db.load_models(only_available=True, include_custom=True)
+            self._catalog, self._available, self._custom = {}, [], set()
+            order_rows = sorted(rows.items(),
+                                key=lambda kv: kv[1].get("sort_order", 0))
+            for _, (mid, row) in enumerate(order_rows):
+                source = normalize_source(row.get("source"))
                 self._catalog[mid] = {"name": row.get("name") or mid,
                                       "description": row.get("description"),
                                       "credits": row.get("credits"),
                                       "max_input_tokens": row.get("max_input_tokens"),
-                                      "source": row.get("source") or "builtin",
+                                      "source": source,
                                       "_promo": row.get("promo")}
                 self._available.append(mid)
+                if source == SOURCE_CUSTOM:
+                    self._custom.add(mid)
                 if not row.get("enabled", 1):
                     self._disabled.add(mid)
             self._updated = db.get_settings() or {}
@@ -99,13 +127,25 @@ class ModelRegistry:
         """
         with self._lock:
             rows = {}
+            tail = len(self._available)   # 不在 _available 的行从末尾开始编号，保持稳定
             for mid, info in self._catalog.items():
+                # source 必须忠实写回：自定义项若被写成 upstream，重启后 _custom
+                # 就空了，下一次 fetch() 会把它当「上游已消失」而冲掉。
+                source = normalize_source(info.get("source"))
+                if mid in self._custom:
+                    source = SOURCE_CUSTOM
+                if mid in self._available:
+                    sort_order = self._available.index(mid)
+                else:
+                    # 同一序位会让 reload 时的相对顺序随机（sorted 稳定但输入无序）。
+                    tail += 1
+                    sort_order = tail
                 rows[mid] = {"name": info.get("name") or mid, "description": info.get("description"),
                              "credits": info.get("credits"), "max_input_tokens": info.get("max_input_tokens"),
-                             "source": info.get("source") or "builtin",
+                             "source": source,
                              "available": 1 if mid in self._available else 0,
                              "enabled": 0 if mid in self._disabled else 1,
-                             "sort_order": self._available.index(mid) if mid in self._available else 0,
+                             "sort_order": sort_order,
                              "promo": info.get("_promo")}
             # 上次标记 available 的、这次 catalog 里已不在的：写 available=0 保留行。
             db.save_models(rows)
@@ -211,7 +251,7 @@ class ModelRegistry:
                         continue
                     catalog[mid] = {"name": builtin["name"], "description": builtin["description"],
                                    "credits": builtin["credits"],
-                                   "max_input_tokens": builtin["max_input_tokens"], "source": "builtin"}
+                                   "max_input_tokens": builtin["max_input_tokens"], "source": SOURCE_BUILTIN}
                     available.append(mid)
                     continue
                 max_in = raw.get("maxInputTokens")
@@ -226,7 +266,7 @@ class ModelRegistry:
                     "description": description,
                     "credits": _credits_multiplier(raw.get("credits")),
                     "max_input_tokens": max_in if isinstance(max_in, int) else None,
-                    "source": "upstream",
+                    "source": SOURCE_UPSTREAM,
                 }
                 available.append(mid)
             if not available:
@@ -234,9 +274,24 @@ class ModelRegistry:
                 return False
             promotions = _parse_promotions(payload.get("modelPromotions"))
             with self._lock:
+                # 合并而不是替换：用户手工添加的模型上游不会返回，整体替换会让它们
+                # 每次自动拉取（启动 + 每 6 小时）后全部消失。
+                merged_catalog, merged_available = dict(catalog), list(available)
+                for mid in self._custom:
+                    if mid in merged_catalog:
+                        # 上游这次也有了它：元数据以上游为准，但 source 保持 custom，
+                        # 否则下一次拉取时 _custom 就断了，用户保存的项会「变成上游的」。
+                        entry = merged_catalog[mid]
+                        if isinstance(entry, dict):
+                            entry["source"] = SOURCE_CUSTOM
+                        continue
+                    entry = self._catalog.get(mid) or {}
+                    merged_catalog[mid] = dict(entry, source=SOURCE_CUSTOM)
+                    # 追加在末尾，不打乱上游按单价排好的顺序。
+                    merged_available.append(mid)
                 # Keep management choices for models that still exist; add new ones enabled.
-                self._disabled &= set(available)
-                self._catalog, self._available = catalog, available
+                self._disabled &= set(merged_available)
+                self._catalog, self._available = merged_catalog, merged_available
                 self._promotions = promotions
                 self._updated = int(self.clock())
                 self._error = None
@@ -260,7 +315,7 @@ class ModelRegistry:
         with self._lock:
             if self._available:
                 return
-            self._catalog = {mid: dict(info, source="builtin") for mid, info in BUILTIN_MODELS.items()}
+            self._catalog = {mid: dict(info, source=SOURCE_BUILTIN) for mid, info in BUILTIN_MODELS.items()}
             self._available = [mid for mid in BUILTIN_ORDER if mid in self._catalog]
             self._updated = 0
 
@@ -277,7 +332,9 @@ class ModelRegistry:
             for mid in self._available:
                 if mid not in self._catalog:
                     continue
-                entry = dict(self._catalog[mid], id=mid, enabled=mid not in self._disabled)
+                entry = dict(self._catalog[mid], id=mid, enabled=mid not in self._disabled,
+                             custom=mid in self._custom)
+                entry["source"] = normalize_source(entry.get("source"))
                 stored = entry.pop("_promo", None)
                 # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
                 # 在读取时算，两者不一致时以内置表为准。
@@ -310,6 +367,60 @@ class ModelRegistry:
             if mid not in self._catalog and mid not in self._available:
                 raise KeyError(mid)
             self._disabled.discard(mid) if enabled else self._disabled.add(mid)
+
+    def add(self, mid, enabled=True, **fields):
+        """添加或更新一个模型。
+
+        两种语义：
+
+        - **上游已有的 id**：只覆盖用户可改的字段，`source` 保持原值，这样它继续
+          跟着上游刷新（用户只是改了名字/单价或顺手关掉它）。
+        - **上游没有的 id**：新建为 `source="custom"` 并记进 `_custom`，从此
+          `fetch()` 会把它合并回来，不会冲掉。`available=1` 表示「用户认为它能用」。
+
+        返回最终的 source。
+        """
+        with self._lock:
+            known = mid in self._catalog
+            source = normalize_source((self._catalog.get(mid) or {}).get("source"))
+            if not known:
+                source = SOURCE_CUSTOM
+                self._custom.add(mid)
+                self._available.append(mid)
+                self._catalog[mid] = {"source": SOURCE_CUSTOM}
+            entry = self._catalog[mid]
+            for key, value in fields.items():
+                if value is not None:
+                    entry[key] = value
+            if not entry.get("name"):
+                entry["name"] = mid
+            entry["source"] = source
+            if enabled:
+                self._disabled.discard(mid)
+            else:
+                self._disabled.add(mid)
+            return source
+
+    def remove(self, mid):
+        """删除模型。只允许删自定义项。
+
+        上游模型删了没用：下一次 fetch() 会把它原地带回来，而且会让
+        request_logs.model_id 的 join 断掉（表里保留 available=0 的行正是为此）。
+        自定义项必须同时从 _custom 移除，否则下次合并又把它加回来。
+        """
+        with self._lock:
+            if mid not in self._catalog:
+                raise KeyError(mid)
+            if mid not in self._custom:
+                raise ValueError("upstream")
+            self._custom.discard(mid)
+            self._catalog.pop(mid, None)
+            self._available = [x for x in self._available if x != mid]
+            self._disabled.discard(mid)
+
+    def is_custom(self, mid):
+        with self._lock:
+            return mid in self._custom
 
     def info(self, mid):
         with self._lock:

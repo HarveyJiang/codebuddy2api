@@ -226,8 +226,10 @@ class DatabaseTests(unittest.TestCase):
     def test_models_upsert_and_available_filter(self):
         db = Database(self.root / "t.db")
         self._write_models(db)
-        self.assertEqual(db.enabled_models(), ["hy3"])
-        self.assertEqual(db.known_model_ids(), {"hy3"})
+        # enabled_models 只看 enabled：gone 的 available=0 也照样可调用。
+        self.assertEqual(db.enabled_models(), ["hy3", "gone"])
+        # known_model_ids 不再按 available 过滤，否则自定义模型会被当成「未知」。
+        self.assertEqual(db.known_model_ids(), {"hy3", "gone"})
         models = db.load_models()
         self.assertIn("gone", models)
         self.assertEqual(models["gone"]["available"], 0)
@@ -459,9 +461,10 @@ class DatabaseTests(unittest.TestCase):
             # catalog 里有、available 里没有的行保留成 available=0（供日志 join），不删。
             self.assertIn("ghost", models)
             self.assertEqual(models["ghost"]["available"], 0)
-            # 不加载进 registry 的判据由 enabled_models 表达。
-            self.assertNotIn("ghost", db.enabled_models())
+            # available 不再决定可调用性：上游没返回（ghost）但用户没禁用，
+            # 一样放行——上游菜单不一定列全，放行与否交给 enabled。
             self.assertIn("glm-5.2", db.enabled_models())
+            self.assertIn("ghost", db.enabled_models())
         finally:
             db.close()
 

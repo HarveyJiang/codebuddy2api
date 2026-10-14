@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import random
+import re
 import secrets
 import threading
 import time
@@ -776,6 +777,63 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             model_registry.set_enabled(mid, body["enabled"])
         except KeyError:
             raise HTTPException(404, "模型不存在")
+        model_registry.persist(store.db)
+        return {"ok": True}
+
+    @app.post("/admin/api/models")
+    async def model_add(req: Request):
+        """手动添加模型。
+
+        上游 /v3/config 返回的菜单不一定列全，有些 id 仍可调用。这里允许用户
+        把它们补齐；新建的项 source=custom，fetch() 会合并回来而不会冲掉。
+        已存在的上游模型走「只改用户可改字段」，不会变成自定义。
+        """
+        store.require_admin(req)
+        body = await payload(req)
+        mid = body.get("id")
+        if not isinstance(mid, str) or not mid.strip():
+            raise HTTPException(400, "模型 ID 不能为空")
+        mid = mid.strip()
+        if len(mid) > 128:
+            raise HTTPException(400, "模型 ID 不能超过 128 个字符")
+        # 这个 id 会进 URL 路径和 JSON，拒掉空格/换行/引号等易出错的字符。
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]+", mid):
+            raise HTTPException(400, "模型 ID 只能包含字母、数字与 . _ : / -")
+        name = body.get("name")
+        if name is not None and (not isinstance(name, str) or len(name) > 200):
+            raise HTTPException(400, "显示名不能超过 200 个字符")
+        description = body.get("description")
+        if description is not None and (not isinstance(description, str)
+                                        or len(description) > 1000):
+            raise HTTPException(400, "描述不能超过 1000 个字符")
+        credits = body.get("credits")
+        if credits is not None:
+            if isinstance(credits, bool) or not isinstance(credits, (int, float)) or credits < 0:
+                raise HTTPException(400, "倍率需为空或非负数")
+        max_in = body.get("max_input_tokens")
+        if max_in is not None:
+            if isinstance(max_in, bool) or not isinstance(max_in, int) or not 1 <= max_in <= 10_000_000:
+                raise HTTPException(400, "上下文长度需为空或 1–10000000 的整数")
+        enabled = body.get("enabled", True)
+        if type(enabled) is not bool:
+            raise HTTPException(400, "enabled 需为布尔值")
+        source = model_registry.add(mid, enabled=enabled, name=(name or None),
+                                    description=description, credits=credits,
+                                    max_input_tokens=max_in)
+        model_registry.persist(store.db)
+        return {"ok": True, "id": mid, "source": source}
+
+    @app.delete("/admin/api/models/{mid}")
+    async def model_delete(mid: str, req: Request):
+        """删除模型。只允许删自定义项。"""
+        store.require_admin(req)
+        try:
+            model_registry.remove(mid)
+        except KeyError:
+            raise HTTPException(404, "模型不存在")
+        except ValueError:
+            # 上游模型删了没用：下一次 fetch() 会把它带回来，还会断掉日志 join。
+            raise HTTPException(400, "上游模型只能禁用，不能删除")
         model_registry.persist(store.db)
         return {"ok": True}
 

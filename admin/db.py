@@ -453,7 +453,7 @@ class Database:
                 # credits_micro，会被再乘一次 1e6（曾把 3.5 存成 3.5e12）。
                 "credits": _to_float(info.get("credits")),
                 "max_input_tokens": _to_int(info.get("max_input_tokens")) or None,
-                "source": info.get("source") or "builtin",
+                "source": info.get("source") or "upstream",
             })
         for mid, row in rows.items():
             row["enabled"] = 0 if mid in disabled else 1
@@ -572,10 +572,20 @@ class Database:
             self._write.execute("DELETE FROM session_bindings WHERE account_id=?", (account_id,))
 
     # -- models -------------------------------------------------------------
-    def load_models(self, only_available=False):
+    def load_models(self, only_available=False, include_custom=False):
+        """读模型目录。include_custom 时额外带上手工添加的行。
+
+        两类条件的连接词是 OR：自定义模型可能 available=0（上游根本没返回它），
+        用 AND 会把它们全过滤掉，用户保存的模型重启后消失。
+        """
         sql = "SELECT * FROM models"
+        where = []
         if only_available:
-            sql += " WHERE available=1"
+            where.append("available=1")
+        if include_custom:
+            where.append("source='custom'")
+        if where:
+            sql += " WHERE " + " OR ".join(where)
         result = {}
         for row in self.query(sql):
             item = {key: row[key] for key in row.keys()}
@@ -599,7 +609,7 @@ class Database:
                          str(item.get("name") or mid), item.get("description"),
                          _to_micro(item.get("credits")),
                          _to_int(item.get("max_input_tokens")) or None,
-                         item.get("source") or "builtin",
+                         item.get("source") or "upstream",
                          _to_int(item.get("available"), 1), _to_int(item.get("enabled"), 1),
                          _to_int(item.get("sort_order")), item.get("promo")))
         with self.transaction():
@@ -609,14 +619,24 @@ class Database:
                 f" {', '.join(f'{c}=excluded.{c}' for c in columns[1:])}", rows)
 
     def enabled_models(self):
-        """可用列表：available 与 enabled 两个条件缺一不可。"""
+        """可调用列表（DB 视角）：只看 enabled。
+
+        available 不参与：上游没返回有两种情况——真下线了，或只是菜单没列全。
+        网关分不清，只有用户知道，所以放行与否交给 enabled。
+
+        注意：运行时决定放行的是 `ModelRegistry.enabled_models()`（它还要算上
+        自定义模型与内存里的启停覆盖）。这个方法只在直接读表的场景用。
+        """
         return [row["model_id"] for row in self.query(
-            "SELECT model_id FROM models WHERE available=1 AND enabled=1 ORDER BY sort_order")]
+            "SELECT model_id FROM models WHERE enabled=1 ORDER BY sort_order")]
 
     def known_model_ids(self):
-        """上游当前提供的全部 id（available=1），用于区分「已禁用」与「未知」。"""
-        return {row["model_id"] for row in self.query(
-            "SELECT model_id FROM models WHERE available=1")}
+        """全部已知 id，用于区分「已禁用」与「未知」。
+
+        不按 available 过滤：自定义模型不在上游目录里，过滤掉会让它们被当成
+        「未知」而绕过禁用检查。
+        """
+        return {row["model_id"] for row in self.query("SELECT model_id FROM models")}
 
     # -- request logs -------------------------------------------------------
     def append_request_logs(self, rows):

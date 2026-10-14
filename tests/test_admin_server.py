@@ -281,6 +281,63 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         # 旧的积分同步间隔字段已移除。
         self.assertNotIn("sync_interval", (await self.client.get("/admin/api/overview")).json()["pool"])
 
+    async def test_custom_model_add_hide_and_callable(self):
+        """手动添加模型：能保存、不被拉取冲掉、来源区分上游与自定义。"""
+        await self.login()
+        # 不存在的 id -> 新建为自定义。
+        result = await self.client.post("/admin/api/models", json={
+            "id": "my-hidden-model", "name": "我的隐藏模型", "credits": 0.5,
+            "max_input_tokens": 64000, "enabled": True})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["source"], "custom")
+
+        async def catalog():
+            return {m["id"]: m for m in
+                    (await self.client.get("/admin/api/overview")).json()["models"]["models"]}
+
+        models = await catalog()
+        self.assertTrue(models["my-hidden-model"]["custom"])
+        self.assertEqual(models["my-hidden-model"]["source"], "custom")
+        # 幂等：重复提交同一 id 不报错，视为更新。
+        self.assertEqual((await self.client.post("/admin/api/models",
+                         json={"id": "my-hidden-model", "name": "改名"})).status_code, 200)
+        self.assertEqual((await catalog())["my-hidden-model"]["name"], "改名")
+        # 上游已有的模型只改字段，来源保持上游（否则它就不跟着上游刷新了）。
+        upstream_id = next(mid for mid, m in models.items() if not m["custom"])
+        kept = await self.client.post("/admin/api/models", json={"id": upstream_id, "name": "改过的名字"})
+        self.assertEqual(kept.status_code, 200)
+        self.assertNotEqual(kept.json()["source"], "custom")
+        self.assertFalse((await catalog())[upstream_id]["custom"])
+        # 删除：自定义项可删，上游模型不可删。
+        self.assertEqual((await self.client.delete("/admin/api/models/my-hidden-model")).status_code, 200)
+        self.assertNotIn("my-hidden-model", await catalog())
+        self.assertEqual((await self.client.delete("/admin/api/models/" + upstream_id)).status_code, 400)
+
+    async def test_custom_model_is_callable(self):
+        """上游菜单没列出的模型：加进来之后能调，禁用才被拦。"""
+        await self.login()
+        await self.client.post("/admin/api/models", json={"id": "ghost-callable", "enabled": True})
+        registry = self.app.state.model_registry
+        # 可调用列表含它 —— 上游没返回不影响放行。
+        self.assertIn("ghost-callable", registry.enabled_models())
+        # 已知 id 必须含它，否则 PoolMiddleware 会当「未知模型」放行，禁用标记失效。
+        self.assertIn("ghost-callable", registry.snapshot_ids())
+        await self.client.patch("/admin/api/models/ghost-callable", json={"enabled": False})
+        self.assertNotIn("ghost-callable", registry.enabled_models())
+        self.assertIn("ghost-callable", registry.snapshot_ids())
+
+    async def test_model_add_rejects_bad_input(self):
+        await self.login()
+        for body in [{"id": ""}, {"id": "   "}, {"id": "has space"}, {"id": "x" * 129},
+                     {"id": "ok-id", "credits": -1}, {"id": "ok-id", "credits": True},
+                     {"id": "ok-id", "max_input_tokens": 0},
+                     {"id": "ok-id", "max_input_tokens": 10 ** 9},
+                     {"id": "ok-id", "enabled": "yes"}]:
+            resp = await self.client.post("/admin/api/models", json=body)
+            self.assertEqual(resp.status_code, 400, f"{body} -> {resp.status_code}")
+        self.assertEqual((await self.client.delete("/admin/api/models/nope")).status_code, 404)
+
+
     def test_stale_catalog_detection(self):
         """旧格式缓存（描述含英文、或未按单价升序）需重新拉取；新格式不需要。"""
         from admin.models import ModelRegistry, BUILTIN_ORDER
