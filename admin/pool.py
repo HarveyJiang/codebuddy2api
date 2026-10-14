@@ -704,24 +704,18 @@ class PoolMiddleware:
                     payload = message.get("body", b"")
                     more = message.get("more_body", False)
                     if _s["held"] and not _s["emitted"]:
+                        # 首包到达即判定：排队错误通常是完整小响应（第一分片就带 error）；
+                        # 正常 SSE 流首包是内容，立即放行（不管 more_body），不再扣留后续。
                         _s["buffer"] += payload
-                        if not more:
-                            code, text, has_content = sniff_error(_s["buffer"])
-                            _s["code"], _s["text"] = code, text
-                            if self.pool.is_queue_error(_s["status"], text, code) and not has_content:
-                                _s["queue"] = True  # 交给外层换号重试，本响应不回给客户端
-                                return
-                            _s["held"] = False
-                            _s["emitted"] = True
-                            await send({"type": "http.response.start", "status": _s["status"], "headers": _s["headers"]})
-                            await send({"type": "http.response.body", "body": _s["buffer"], "more_body": False})
+                        code, text, has_content = sniff_error(_s["buffer"])
+                        _s["code"], _s["text"] = code, text
+                        if self.pool.is_queue_error(_s["status"], text, code) and not has_content:
+                            _s["queue"] = True  # 交给外层换号重试，本响应不回给客户端
                             return
-                        if len(_s["buffer"]) > 256 * 1024:
-                            # 攒太多还没结束，判定为正常流，放行
-                            _s["held"] = False
-                            _s["emitted"] = True
-                            await send({"type": "http.response.start", "status": _s["status"], "headers": _s["headers"]})
-                            await send({"type": "http.response.body", "body": _s["buffer"], "more_body": True})
+                        _s["held"] = False
+                        _s["emitted"] = True
+                        await send({"type": "http.response.start", "status": _s["status"], "headers": _s["headers"]})
+                        await send({"type": "http.response.body", "body": _s["buffer"], "more_body": more})
                         return
                     if not _s["emitted"]:
                         _s["emitted"] = True
