@@ -404,6 +404,60 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 
 ---
 
+## 能力实测
+
+以下为对本项目上游（腾讯 CodeBuddy 后端）的实测结论，非官方文档，仅供参考。
+
+### 图像识别（多模态）
+
+支持。走 `image_url`（支持 `data:image/...;base64,` 内联图）传入图片，视觉模型可正确识别。
+
+实测用例：
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CODEBUDDY2OPENAI_KEY" \
+  -d '{
+    "model": "glm-5v-turbo",
+    "messages": [{"role": "user", "content": [
+      {"type": "text", "text": "这张图是什么颜色？只回答颜色词"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64>"}}
+    ]}]
+  }'
+```
+
+结果：传入纯红色 PNG，模型正确回答「红色」。
+
+**已知支持视觉的模型**：`glm-5v-turbo`（`kimi` / `deepseek` 系未逐一验证）。
+
+### 上下文长度
+
+实测上游可接受**超长上下文**，远超预期。用 `kimi-k3` 逐档压测（上游在响应 `usage.prompt_tokens` 中返回真实 token 数）：
+
+| 输入规模 | 上游返回 `prompt_tokens` | 结果 |
+|---|---|---|
+| 256K 字符 | — | ✅ 通过 |
+| 512K 字符 | — | ✅ 通过 |
+| 1024K 字符 | — | ✅ 通过 |
+| 2048K 字符 | 409,701 | ✅ 接受，未报超长 |
+| 4096K 字符 | 819,307 | ✅ 接受，未报超长 |
+
+结论：**上游至少接受到约 82 万 tokens 未拒绝**，实际窗口上限高于此值（未继续上探，边际成本高）。
+
+> 说明：压测中所有响应均为 `finish_reason: "length"`（模型把 `max_tokens` 额度用在了推理输出上），**不是上下文被截断拒绝**，属于正常表现。
+
+### 模型选型建议
+
+| 用途 | 推荐模型 | 说明 |
+|---|---|---|
+| 超长文档 / 代码库 | `kimi-k3` | 已验证 800K+ tokens 上下文 |
+| 图像识别 | `glm-5v-turbo` | 视觉 + 长上下文 |
+| 日常对话 / 追求速度 | `glm-5.3-flash`、`deepseek-v4-flash` | 约 1.1s 级响应 |
+| 重任务 / 复杂推理 | `glm-5.3` | — |
+
+---
+
 ## 项目结构
 
 ```text
@@ -535,6 +589,33 @@ Use `/v1/messages`:
 - `--desensitize --no-compact` preserves more of the original system prompt
 - if that still gets review-blocked, `/v1/responses` will retry once in compact mode
 - an optional Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `bash deploy/one-click/deploy.sh`
+
+### Capability Notes (Measured)
+
+Not official specs — measured against this project's upstream (Tencent CodeBuddy backend).
+
+**Vision (multimodal): supported.** Images can be passed via `image_url`, including inline `data:image/...;base64,`. Verified with a solid-color PNG on `glm-5v-turbo` — the model reported the correct color. Known vision model: `glm-5v-turbo` (kimi/deepseek families not individually verified).
+
+**Context length: very large.** Measured with `kimi-k3`, using the real `usage.prompt_tokens` returned by upstream:
+
+| Input size | `prompt_tokens` | Result |
+|---|---|---|
+| 256K chars | — | ✅ accepted |
+| 512K chars | — | ✅ accepted |
+| 1024K chars | — | ✅ accepted |
+| 2048K chars | 409,701 | ✅ accepted |
+| 4096K chars | 819,307 | ✅ accepted |
+
+Upstream accepted roughly **820K tokens** without rejecting the request; the real limit is higher. Responses showed `finish_reason: "length"` because the token budget was spent on reasoning output, not because context was truncated.
+
+**Model selection:**
+
+| Use case | Model | Notes |
+|---|---|---|
+| Very long docs / codebases | `kimi-k3` | 800K+ token context verified |
+| Image understanding | `glm-5v-turbo` | vision + long context |
+| Chat / low latency | `glm-5.3-flash`, `deepseek-v4-flash` | ~1.1s response |
+| Heavy tasks / reasoning | `glm-5.3` | — |
 
 ### CLI Options
 
