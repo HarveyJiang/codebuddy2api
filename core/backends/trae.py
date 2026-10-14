@@ -469,8 +469,23 @@ def checkin_claim(client: httpx.Client, headers: dict, ug_host: str | None = Non
         raise TraeAPIError(f"签到接口返回 HTTP {r.status_code}", status=r.status_code)
 
 
-def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None) -> int:
-    """聚合剩余积分（user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit 求和）。"""
+def _num(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None,
+                   now: float | None = None) -> float:
+    """聚合**剩余**积分。
+
+    口径：每个权益包可用额度 = `quota.credits_limit − usage.credits_amount`。
+    注意上游 `usage_summary.total_amount` 是 Σ`credits_limit`（**总额度**而非余额），
+    直接对其求和会把已消耗部分算进去、导致余额虚高（实测 9100 vs 真实 5428.39）。
+    逐包口径与其它字段（过期时间、包名）同源，便于跳过已过期包；
+    仅当没有任何权益包时回落到 `usage_summary.total_amount − consumed_amount`。
+    """
     host = ug_host or UG_HOST
     r = client.post(host + EP_ENT_USAGE, headers=headers, json={})
     if r.status_code != 200:
@@ -479,17 +494,26 @@ def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = No
         data = r.json()
     except ValueError:
         raise TraeAPIError("积分接口返回非 JSON")
-    remain = 0
+    if not isinstance(data, dict):
+        raise TraeAPIError("积分接口返回结构异常")
+    ts = time.time() if now is None else now
+    remain = 0.0
+    counted = False
     for pack in _pick(data, "user_entitlement_pack_list") or []:
         if not isinstance(pack, dict):
             continue
         base = pack.get("entitlement_base_info") if isinstance(pack.get("entitlement_base_info"), dict) else {}
         quota = base.get("quota") if isinstance(base.get("quota"), dict) else {}
-        try:
-            remain += int(quota.get("credits_limit") or 0)
-        except (TypeError, ValueError):
+        usage = pack.get("usage") if isinstance(pack.get("usage"), dict) else {}
+        expire = _num(pack.get("expire_time") or base.get("end_time") or 0)
+        if expire and expire < ts:  # 已过期额度不可用
             continue
-    return remain
+        remain += max(_num(quota.get("credits_limit")) - _num(usage.get("credits_amount")), 0.0)
+        counted = True
+    if not counted:
+        summary = data.get("usage_summary") if isinstance(data.get("usage_summary"), dict) else {}
+        remain = max(_num(summary.get("total_amount")) - _num(summary.get("consumed_amount")), 0.0)
+    return round(remain, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +682,7 @@ class TraeCredentialManager:
     def checkin_claim(self, client) -> None:
         return checkin_claim(client, self.ug_headers())
 
-    def user_ent_usage(self, client) -> int:
+    def user_ent_usage(self, client) -> float:
         return user_ent_usage(client, self.ug_headers())
 
     def summary(self) -> dict:

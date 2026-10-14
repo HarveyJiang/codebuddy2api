@@ -1120,6 +1120,36 @@ def test_ug_api_error_paths():
             T.user_ent_usage(client, {})
 
 
+def test_ent_usage_returns_remaining_not_limit():
+    """余额 = Σ(credits_limit − usage.credits_amount)，不能直接把 credits_limit 当余额。"""
+    payload = {"user_entitlement_pack_list": [
+        {"entitlement_base_info": {"quota": {"credits_limit": 4000}}, "usage": {"credits_amount": 3471.61}},
+        {"entitlement_base_info": {"quota": {"credits_limit": 500}}, "usage": {}},
+        {"entitlement_base_info": {"quota": {"credits_limit": 200}}, "usage": {"credits_amount": 200}},
+    ]}
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        assert T.user_ent_usage(client, {}) == 1028.39  # 4000-3471.61 + 500 + 0
+
+
+def test_ent_usage_skips_expired_packs():
+    now = 1_800_000_000
+    payload = {"user_entitlement_pack_list": [
+        {"entitlement_base_info": {"quota": {"credits_limit": 300}}, "usage": {},
+         "expire_time": now - 10},  # 已过期
+        {"entitlement_base_info": {"quota": {"credits_limit": 300}}, "usage": {},
+         "expire_time": now + 10},  # 未过期
+    ]}
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        assert T.user_ent_usage(client, {}, now=now) == 300.0
+
+
+def test_ent_usage_falls_back_to_summary_without_packs():
+    payload = {"user_entitlement_pack_list": [],
+               "usage_summary": {"total_amount": 9100, "consumed_amount": 3671.61}}
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        assert T.user_ent_usage(client, {}) == 5428.39
+
+
 def test_catalog_provider_drives_map_model_and_ids():
     from core.backends import registry as R
     assert R.trae_model_ids() == [m["id"] for m in T.TRAE_STATIC_MODELS]  # 无提供者→静态
