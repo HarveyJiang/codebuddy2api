@@ -67,6 +67,7 @@ class Store:
         self.managers = {}
         self.started = time.time()
         self.events = deque(maxlen=40)
+        self.trae_flows = {}
         self.path = self.root / "state.json"
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -652,6 +653,54 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         added = await asyncio.to_thread(store.adopt_auth_files)
         return {"ok": True, "added": added}
+
+    # ---- Trae 授权登录（管理页入口；CLI 方式仍可用） ----
+    @app.post("/admin/api/trae/authorize")
+    async def trae_authorize(req: Request):
+        store.require_admin(req)
+        from core.backends.trae_login import build_login_url
+
+        fid = secrets.token_hex(8)
+        machine_id, device_id = secrets.token_hex(16), secrets.token_hex(16)
+        now = time.time()
+        with store.lock:
+            store.trae_flows = {k: v for k, v in store.trae_flows.items() if v["expires"] > now}
+            if len(store.trae_flows) >= 20:
+                store.trae_flows.pop(min(store.trae_flows, key=lambda k: store.trae_flows[k]["expires"]))
+            store.trae_flows[fid] = {"machine_id": machine_id, "device_id": device_id, "expires": now + 600}
+        # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），故随 fid 服务端暂存
+        return {"id": fid, "url": build_login_url(machine_id, device_id), "expires_at": int((now + 600) * 1000)}
+
+    @app.post("/admin/api/trae/login")
+    async def trae_login_finish(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        fid, callback_url = body.get("id"), body.get("callback_url")
+        if not isinstance(callback_url, str) or not callback_url.strip():
+            raise HTTPException(400, "请粘贴浏览器地址栏的完整回调链接")
+        if len(callback_url) > 8192:
+            raise HTTPException(400, "回调链接过长")
+        with store.lock:
+            flow = store.trae_flows.pop(fid, None)
+        if flow is None:
+            raise HTTPException(400, "登录链接已过期，请重新生成")
+        from core.backends import trae_login as trae_login_mod
+
+        try:
+            summary = await asyncio.to_thread(
+                trae_login_mod.login, callback_url.strip(), flow["machine_id"], flow["device_id"], store.auth_dir
+            )
+        except (RuntimeError, ValueError, httpx.HTTPError) as e:
+            raise HTTPException(400, f"登录失败：{e}")
+        added = await asyncio.to_thread(store.adopt_auth_files)
+        return {"ok": True, "uid": summary["uid"], "nickname": summary["nickname"], "updated": summary["updated"], "adopted": added}
+
+    @app.delete("/admin/api/trae/{fid}")
+    async def trae_cancel(fid: str, req: Request):
+        store.require_admin(req)
+        with store.lock:
+            store.trae_flows.pop(fid, None)
+        return {"ok": True}
 
     @app.patch("/admin/api/accounts/{aid}")
     async def edit_account(aid: str, req: Request):

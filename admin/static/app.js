@@ -1,7 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
-let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0;
+let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null;
 const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
@@ -124,7 +124,7 @@ function renderAccounts() {
     const credits = a.remaining === null || a.remaining === undefined ? "—" : Math.floor(Number(a.remaining)).toLocaleString("zh-CN");
     const expiring = a.expiring_soon === null || a.expiring_soon === undefined ? "—" : Math.floor(Number(a.expiring_soon)).toLocaleString("zh-CN");
     const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
-    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.active ? '<span class="mini-active">手动 / 测试账号</span>' : ""}</strong>${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${Math.floor(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${Math.round(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${Math.round(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}${a.enabled && !a.active ? `<button class="switch" data-action="activate" data-id="${a.id}">设为手动 / 测试</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}${a.active ? '<span class="mini-active">手动 / 测试账号</span>' : ""}</strong>${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.backend === "trae" ? "Trae 账号（v1 不统计积分）" : a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated && a.backend !== "trae" ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${Math.floor(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${Math.round(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${Math.round(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? (a.backend === "trae" ? `<button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>`) : ""}${a.enabled && !a.active ? `<button class="switch" data-action="activate" data-id="${a.id}">设为手动 / 测试</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
@@ -182,16 +182,56 @@ function clearOAuth() {
   $("oauth-status").className = "banner oauth-status";
 }
 function setAccountMode(mode) {
-  clearOAuth(); accountMode = mode;
+  clearOAuth(); clearTrae(); accountMode = mode;
   $("browser-login-panel").hidden = mode !== "browser";
+  $("trae-login-panel").hidden = mode !== "trae";
   $("file-import-panel").hidden = $("account-import").hidden = mode !== "file";
   $("mode-browser").setAttribute("aria-pressed", String(mode === "browser"));
+  $("mode-trae").setAttribute("aria-pressed", String(mode === "trae"));
   $("mode-file").setAttribute("aria-pressed", String(mode === "file"));
   $("account-error").textContent = "";
 }
+function clearTrae() {
+  const previous = traeFlow; traeFlow = null;
+  if (previous && csrf) api("trae/" + previous.id, {method:"DELETE"}).catch(() => {});
+  $("trae-link-box").hidden = true; $("trae-open").removeAttribute("href");
+  $("trae-start").disabled = false; $("trae-start").textContent = "生成 Trae 登录链接 ↗";
+  $("trae-callback").value = ""; $("trae-submit").disabled = false;
+  $("trae-status").className = "banner oauth-status";
+  $("trae-status").textContent = "Trae 登录链接 10 分钟内有效。同一账号重新登录会更新凭据。";
+}
 $("mode-browser").addEventListener("click", () => setAccountMode("browser"));
+$("mode-trae").addEventListener("click", () => setAccountMode("trae"));
 $("mode-file").addEventListener("click", () => setAccountMode("file"));
-$("account-dialog").addEventListener("close", () => { clearOAuth(); $("account-form").reset(); $("file-label").textContent = "选择或拖入 .info / .json 文件"; $("account-error").textContent = ""; });
+$("trae-start").addEventListener("click", async () => {
+  clearTrae();
+  $("trae-start").disabled = true; $("trae-start").textContent = "正在生成…"; $("account-error").textContent = "";
+  try {
+    const flow = await api("trae/authorize", {method:"POST", body:{}});
+    traeFlow = flow; $("trae-open").href = flow.url; $("trae-link-box").hidden = false;
+    $("trae-start").textContent = "重新生成链接";
+    $("trae-status").textContent = "登录链接已就绪：打开 Trae 完成登录，然后粘贴回调链接。";
+  } catch (e) { $("account-error").textContent = e.message; }
+  finally { $("trae-start").disabled = false; }
+});
+$("trae-copy").addEventListener("click", () => { if (traeFlow) copy(traeFlow.url); });
+$("trae-submit").addEventListener("click", async () => {
+  if (!traeFlow) { $("account-error").textContent = "请先生成 Trae 登录链接"; return; }
+  const callback = $("trae-callback").value.trim();
+  if (!callback) { $("account-error").textContent = "请粘贴浏览器地址栏的完整回调链接"; return; }
+  $("trae-submit").disabled = true; $("account-error").textContent = "";
+  $("trae-status").className = "banner oauth-status"; $("trae-status").textContent = "正在换取 Trae 凭据…";
+  try {
+    const result = await api("trae/login", {method:"POST", body:{id:traeFlow.id, callback_url:callback}});
+    traeFlow = null;
+    $("account-dialog").close(); await refresh();
+    toast(result.updated ? "Trae 账号凭据已更新" : "Trae 账号已添加");
+  } catch (e) {
+    $("account-error").textContent = e.message;
+    $("trae-status").className = "banner warning oauth-status"; $("trae-status").textContent = e.message;
+  } finally { $("trae-submit").disabled = false; }
+});
+$("account-dialog").addEventListener("close", () => { clearOAuth(); clearTrae(); $("account-form").reset(); $("file-label").textContent = "选择或拖入 .info / .json 文件"; $("account-error").textContent = ""; });
 function openAccount() { setAccountMode("browser"); $("account-dialog").showModal(); }
 async function pollOAuth(generation) {
   if (generation !== oauthGeneration || !oauthFlow) return;

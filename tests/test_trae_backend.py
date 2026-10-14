@@ -64,6 +64,7 @@ async def _achunks(data: bytes):
 
 # 记录未被任何 monkeypatch 污染的原始 AsyncClient，供 e2e 手动 patch/restore 使用。
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
+_REAL_SYNC_CLIENT = httpx.Client
 
 
 def _events(raw: bytes):
@@ -535,6 +536,11 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
                 return aid
         raise AssertionError("no trae account")
 
+    async def login_admin(self):
+        await self.client.post("/admin/api/login", json={"key": ADMIN})
+        csrf = (await self.client.get("/admin/api/session")).json()["csrf"]
+        return {"X-CSRF-Token": csrf}
+
     async def test_models_list_has_trae_owned_by(self):
         r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
         assert r.status_code == 200
@@ -689,6 +695,88 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
                                    json={"model": "trae/bogus", "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 400
+
+    # ---- 管理页 Trae 登录入口 ----
+
+    def patch_trae_login_http(self, handler):
+        import core.backends.trae_login as tl
+        real = _REAL_SYNC_CLIENT
+        self._orig_sync = tl.httpx.Client
+        tl.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+
+    async def test_trae_authorize_requires_admin(self):
+        assert (await self.client.post("/admin/api/trae/authorize")).status_code == 401
+
+    async def test_trae_authorize_returns_url_and_flow(self):
+        headers = await self.login_admin()
+        r = await self.client.post("/admin/api/trae/authorize", headers=headers)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["url"].startswith("https://www.trae.cn/authorization?")
+        assert "auth_callback_url=http%3A%2F%2F127.0.0.1%3A18080%2Fauthorize" in data["url"]
+        assert data["id"] in self.app.state.store.trae_flows
+
+    async def test_trae_login_end_to_end_adds_account(self):
+        headers = await self.login_admin()
+        flow = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+
+        def handler(req):
+            if req.url.path.endswith("ExchangeToken"):
+                return httpx.Response(200, json={"Result": {"Token": "NEW", "RefreshToken": "R2", "TokenExpireAt": int(time.time() * 1000) + 30 * 86400 * 1000}})
+            if req.url.path.endswith("GetUserInfo"):
+                return httpx.Response(200, json={"Result": {"UserID": "trae-it", "ScreenName": "集成账号", "EnterpriseID": "E"}})
+            return httpx.Response(404)
+
+        self.patch_trae_login_http(handler)
+        try:
+            r = await self.client.post("/admin/api/trae/login", headers=headers,
+                                       json={"id": flow["id"], "callback_url": "http://127.0.0.1:18080/authorize?refreshToken=RT"})
+        finally:
+            import core.backends.trae_login as tl
+            tl.httpx.Client = self._orig_sync
+        assert r.status_code == 200, r.text
+        assert r.json()["uid"] == "trae-it"
+        # 已落盘并被收养
+        assert (self.auth / "trae-trae-it.info").exists()
+        rows = self.app.state.store.account_rows()
+        trae = [x for x in rows if x["backend"] == "trae"]
+        assert any(x["uid"] == "trae-it" for x in trae)
+        # flow 已消费
+        assert flow["id"] not in self.app.state.store.trae_flows
+
+    async def test_trae_login_requires_callback(self):
+        headers = await self.login_admin()
+        flow = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        r = await self.client.post("/admin/api/trae/login", headers=headers, json={"id": flow["id"], "callback_url": "  "})
+        assert r.status_code == 400
+
+    async def test_trae_login_unknown_flow_400(self):
+        headers = await self.login_admin()
+        r = await self.client.post("/admin/api/trae/login", headers=headers,
+                                   json={"id": "nope", "callback_url": "http://127.0.0.1:18080/authorize?refreshToken=x"})
+        assert r.status_code == 400
+
+    async def test_trae_cancel_flow(self):
+        headers = await self.login_admin()
+        flow = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        r = await self.client.delete(f"/admin/api/trae/{flow['id']}", headers=headers)
+        assert r.status_code == 200
+        assert flow["id"] not in self.app.state.store.trae_flows
+
+    async def test_trae_account_actions_gated(self):
+        headers = await self.login_admin()
+        aid = self.trae_aid()
+        r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False and "暂不支持" in body["message"]
+
+    async def test_admin_static_has_trae_entry(self):
+        html = (await self.client.get("/admin/", headers={"Authorization": "Bearer " + API}))
+        # /admin/ 需要管理会话吗？静态页直接返回
+        assert html.status_code in (200, 401)
+        index = Path(__file__).resolve().parent.parent / "admin" / "static" / "index.html"
+        assert 'id="mode-trae"' in index.read_text(encoding="utf-8")
 
 
 def test_cred_backend_mismatch_503():
