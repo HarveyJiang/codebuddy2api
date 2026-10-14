@@ -93,6 +93,21 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + API})).status_code, 401)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + newkey})).status_code, 200)
 
+    async def test_credit_refresh_endpoint_and_settings(self):
+        # 未登录不可用。
+        self.assertEqual((await self.client.post("/admin/api/pool/refresh-credits")).status_code, 401)
+        await self.login()
+        result = await self.client.post("/admin/api/pool/refresh-credits")
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertIn("refreshed", result.json())
+        # 拉取间隔可配置并持久化。
+        saved = await self.client.patch("/admin/api/pool/settings", json={"credit_min_interval": 120})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["pool"]["credit_min_interval"], 120)
+        self.assertEqual((await self.client.patch("/admin/api/pool/settings", json={"credit_min_interval": 99999})).status_code, 400)
+        # 旧的积分同步间隔字段已移除。
+        self.assertNotIn("sync_interval", (await self.client.get("/admin/api/overview")).json()["pool"])
+
     async def test_invalid_credentials_and_limits(self):
         await self.login()
         for doc in [{}, {"auth": {}, "account": {}}, {**credential(), "account": {"uid": "bad\r\nheader"}}, {**credential(), "auth": {**credential()["auth"], "expiresAt": "not-time"}}]:

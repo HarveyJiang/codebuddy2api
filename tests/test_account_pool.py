@@ -62,15 +62,35 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pool.select()[0], self.b)
 
     def test_summarize_packages_earliest_expiry(self):
+        fixed = datetime(2026, 10, 14, 8, 0, 0, tzinfo=CN).timestamp()
         result = summarize_packages([
             {'CycleCapacityRemainPrecise': '4.61', 'CycleCapacitySizePrecise': '100', 'CycleEndTime': '2026-10-14 09:06:13'},
             {'CycleCapacityRemainPrecise': '100', 'CycleCapacitySizePrecise': '100', 'CycleEndTime': '2026-10-15 09:00:47'},
             {'CycleCapacityRemainPrecise': '0', 'CycleCapacitySizePrecise': '100', 'CycleEndTime': '2026-10-13 00:00:00'},
             {'CycleCapacityRemainPrecise': '50', 'CycleCapacitySizePrecise': '50'},
-        ])
+        ], now=fixed)
         self.assertEqual(result['earliest_expiry'], datetime(2026, 10, 14, 9, 6, 13, tzinfo=CN).timestamp())
         self.assertAlmostEqual(result['earliest_expiry_remaining'], 4.61)
         self.assertEqual(result['remaining'], 154.61)
+        # 3 天内到期：10-14 09:06（4.61）+ 10-15 09:00（100）；10-13 已过期且余额为 0 不计。
+        self.assertAlmostEqual(result['expiring_soon'], 104.61)
+        # 无到期时间的包不计入。
+        self.assertEqual(result['expiring_soon_updated'], int(fixed))
+
+    def test_expiring_soon_excludes_far_future_and_expired(self):
+        fixed = datetime(2026, 10, 14, 8, 0, 0, tzinfo=CN).timestamp()
+        result = summarize_packages([
+            {'CycleCapacityRemainPrecise': '10', 'CycleCapacitySizePrecise': '10', 'CycleEndTime': '2026-10-20 00:00:00'},
+            {'CycleCapacityRemainPrecise': '20', 'CycleCapacitySizePrecise': '20', 'CycleEndTime': '2026-10-16 23:00:00'},
+            {'CycleCapacityRemainPrecise': '30', 'CycleCapacitySizePrecise': '30', 'CycleEndTime': '2026-10-13 00:00:00'},
+        ], now=fixed)
+        # 只有 10-16 在 3 天窗口内；10-20 太远，10-13 已过期。
+        self.assertAlmostEqual(result['expiring_soon'], 20)
+        self.assertEqual(result['remaining'], 60)
+
+    def test_expiring_soon_defaults_to_now(self):
+        result = summarize_packages([{'CycleCapacityRemainPrecise': '5', 'CycleCapacitySizePrecise': '5'}])
+        self.assertEqual(result['expiring_soon'], 0)
 
     async def test_checkin_spreads_across_day_slots(self):
         self.store.data['pool']['auto_checkin'] = True
@@ -101,28 +121,46 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.pool.checkin_offset(self.a, '2026-10-14', 0), (slot, when))
             self.store.data['account_status'][self.a].pop('checkin_offset_date')
 
-    async def test_sync_only_inside_configured_window(self):
-        self.store.data['pool']['sync_window'] = ['10:00', '20:00']
-        self.store.data['pool']['sync_interval'] = 1800
+    async def test_no_automatic_credit_sync_in_tick(self):
+        """积分只在页面请求时拉取，tick 不做任何后台积分查询。"""
+        calls = []
+        async def fake_batch(action):
+            calls.append(action)
+            return {'results': []}
+        self.pool.batch = fake_batch
+        for hour in (3, 11, 21):
+            self.pages.clear()
+            self.now = datetime(2026, 10, 14, hour, 0, tzinfo=CN).timestamp()
+            await self.pool.tick()
+            self.assertNotIn('status', calls)
 
-        async def status_call(_action=None):
-            self.pages.append('sync')
-        self.pool.batch = status_call
-        # 03:00 北京时间：夜间不同步。
-        self.now = datetime(2026, 10, 14, 3, 0, tzinfo=CN).timestamp()
-        self.pool.last_sync = 0
-        await self.pool.tick()
-        self.assertNotIn('sync', self.pages)
-        # 11:00：时段内同步。
-        self.now = datetime(2026, 10, 14, 11, 0, tzinfo=CN).timestamp()
-        await self.pool.tick()
-        self.assertIn('sync', self.pages)
-        # 21:00：时段外不再同步。
-        self.pages.clear()
-        self.now = datetime(2026, 10, 14, 21, 0, tzinfo=CN).timestamp()
-        self.pool.last_sync = 0
-        await self.pool.tick()
-        self.assertNotIn('sync', self.pages)
+    async def test_refresh_credits_pulls_and_throttles(self):
+        self.store.data['pool']['credit_min_interval'] = 60
+        seen = []
+        def fake_operate(aid, action):
+            seen.append((aid, action))
+            return {'id': aid, 'ok': True, 'message': '积分状态已更新'}
+        self.pool.operate = fake_operate
+        # 首次拉取：两个账号都请求。
+        result = await self.pool.refresh_credits()
+        self.assertEqual(result['refreshed'], 2)
+        self.assertEqual(sorted(aid for aid, _ in seen), sorted((self.a, self.b)))
+        self.assertTrue(all(action == 'status' for _, action in seen))
+        # 记录成功返回的时间，模拟 operate 更新 credits_updated。
+        for aid in (self.a, self.b):
+            self.store.data['account_status'].setdefault(aid, {})['credits_updated'] = int(self.now)
+        # 限流窗口内：不再重复请求。
+        seen.clear()
+        result = await self.pool.refresh_credits()
+        self.assertEqual(result['refreshed'], 0)
+        self.assertTrue(result['skipped'])
+        self.assertEqual(seen, [])
+        # 超过窗口后再拉。
+        self.now += 120
+        seen.clear()
+        result = await self.pool.refresh_credits()
+        self.assertEqual(result['refreshed'], 2)
+        self.assertEqual(len(seen), 2)
 
     async def test_batch_checkin_spreads_requests(self):
         # 记录每次实际延迟的秒数，验证错峰参数真正生效（而非依赖时序竞态）。

@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
+EXPIRY_SOON_DAYS = 3
 
 
 def number(value):
@@ -42,11 +43,16 @@ def package_expiry(p):
         return None
 
 
-def summarize_packages(packages):
+def summarize_packages(packages, now=None):
+    """Aggregate credits. `expiring_soon` sums the spendable balance of every package whose
+    CycleEndTime falls within the next `EXPIRY_SOON_DAYS` days."""
+    now = time.time() if now is None else now
+    cutoff = now + EXPIRY_SOON_DAYS * 86400
     remain = Decimal(0)
     size = Decimal(0)
     earliest = None
     earliest_remaining = None
+    expiring_soon = Decimal(0)
     for p in packages:
         # Precise values carry fractional credit balances; cycle values are spendable now.
         prefix = "Cycle" if any(k in p for k in ["CycleCapacityRemainPrecise", "CycleCapacityRemain"]) else ""
@@ -59,10 +65,14 @@ def summarize_packages(packages):
         size += capacity
         if spendable > 0:
             expiry = package_expiry(p)
-            if expiry is not None and (earliest is None or expiry < earliest):
-                earliest, earliest_remaining = expiry, float(spendable)
+            if expiry is not None:
+                if earliest is None or expiry < earliest:
+                    earliest, earliest_remaining = expiry, float(spendable)
+                if now < expiry <= cutoff:
+                    expiring_soon += spendable
     return {"remaining": float(remain), "capacity": float(size), "used": float(max(Decimal(0), size - remain)), "packages": len(packages),
-            "earliest_expiry": earliest, "earliest_expiry_remaining": earliest_remaining}
+            "earliest_expiry": earliest, "earliest_expiry_remaining": earliest_remaining,
+            "expiring_soon": float(expiring_soon), "expiring_soon_updated": int(now)}
 
 
 class BillingError(Exception):
@@ -78,13 +88,12 @@ class AccountPool:
         self.locks = {}
         self.cursor = 0
         self.jobs = asyncio.Lock()
-        self.last_sync = 0
         self.affinity_hits = 0
         self.affinity_rebinds = 0
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "sync_interval": 1800, "sync_window": ["10:00", "20:00"], "batch_spread": 90})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "credit_min_interval": 60, "sync_window": ["10:00", "20:00"], "batch_spread": 90})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -179,6 +188,8 @@ class AccountPool:
             row.update({"pool_state": self.state(row), "remaining": remaining, "credits_updated": status.get("credits_updated"),
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
                         "earliest_expiry": expiry, "earliest_expiry_remaining": status.get("earliest_expiry_remaining"),
+                        "expiring_soon": status.get("expiring_soon"),
+                        "expiring_soon_updated": status.get("expiring_soon_updated"),
                         "weight": int(status.get("weight", 0)),
                         "daily_rate": consumption["daily_rate"] if consumption else None,
                         "days_to_empty": round(remaining / consumption["daily_rate"], 1) if consumption and isinstance(remaining, (int, float)) and consumption["daily_rate"] > 0 else None,
@@ -286,7 +297,7 @@ class AccountPool:
                 raise BillingError("积分数据格式异常，上次余额已保留")
             packages.extend(current)
             if len(packages) >= total:
-                return summarize_packages(packages)
+                return summarize_packages(packages, now=self.clock())
             if not current:
                 break
         raise BillingError("积分包分页不完整，上次余额已保留")
@@ -455,11 +466,34 @@ class AccountPool:
                         await asyncio.to_thread(self.operate, aid, "refresh")
                     except HTTPException:
                         pass
-        # 统计只在配置的时段内进行（默认 10:00-20:00 北京时间），夜间不发起积分查询。
-        if in_window and self.clock() - self.last_sync > int(cfg.get("sync_interval", 1800)) and not self.jobs.locked():
-            await self.batch("status")
-            self.last_sync = self.clock()
         self.flush()
+
+    # 页面刷新触发的积分拉取：每账号限流，避免频繁请求被上游风控。
+    REFRESH_MIN_INTERVAL = 60
+
+    async def refresh_credits(self):
+        """Pull fresh balances because the admin page was loaded. No background/incremental
+        polling happens elsewhere: credits change only when the page asks for them.
+        Each account is throttled by pool.credit_min_interval seconds to avoid hammering upstream."""
+        limit = max(0, int(self.store.data["pool"].get("credit_min_interval", self.REFRESH_MIN_INTERVAL)))
+        with self.store.lock:
+            ids = [aid for aid, item in self.store.data["accounts"].items()
+                   if self.store.data["account_status"].get(aid, {}).get("credits_updated", 0)
+                   < self.clock() - limit]
+        if not ids:
+            return {"refreshed": 0, "skipped": True}
+        if self.jobs.locked():
+            return {"refreshed": 0, "skipped": True, "message": "已有任务进行中"}
+        async with self.jobs:
+            semaphore = asyncio.Semaphore(3)
+            async def run(aid):
+                async with semaphore:
+                    try:
+                        return await asyncio.to_thread(self.operate, aid, "status")
+                    except HTTPException:
+                        return {"id": aid, "ok": False, "message": "账号已移除"}
+            await asyncio.gather(*(run(aid) for aid in ids))
+        return {"refreshed": len(ids)}
 
 
 def request_affinity(headers, body):

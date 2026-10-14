@@ -415,6 +415,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             keys = [{"id": kid, "usage": {"date": store._today(), "count": 0, "tokens": 0}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
             return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
 
+    @app.post("/admin/api/pool/refresh-credits")
+    async def pool_refresh_credits(req: Request):
+        store.require_admin(req)
+        return await pool.refresh_credits()
+
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
         store.require_admin(req)
@@ -448,14 +453,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(body["checkin_time"], str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", body["checkin_time"]):
                     raise HTTPException(400, "请选择有效的签到时间")
                 settings["checkin_time"] = body["checkin_time"]
-            if "sync_interval" in body:
+            if "credit_min_interval" in body:
                 try:
-                    interval = int(body["sync_interval"])
+                    interval = int(body["credit_min_interval"])
                 except (TypeError, ValueError):
-                    raise HTTPException(400, "积分同步间隔需为整数分钟")
-                if not 5 <= interval <= 1440:
-                    raise HTTPException(400, "积分同步间隔需在 5-1440 分钟之间")
-                settings["sync_interval"] = interval * 60
+                    raise HTTPException(400, "积分拉取间隔需为整数秒")
+                if not 0 <= interval <= 3600:
+                    raise HTTPException(400, "积分拉取间隔需在 0-3600 秒之间")
+                settings["credit_min_interval"] = interval
             if "sync_window" in body:
                 window = body["sync_window"]
                 pattern = r"(?:[01]\d|2[0-3]):[0-5]\d"
