@@ -6,6 +6,7 @@ const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
+  models: ["模型管理", "MODEL CATALOG", "与官方客户端一致的模型列表，可按需启用或禁用。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
 };
@@ -58,11 +59,27 @@ function render() {
     $("pool-routing").value = overview.pool?.routing || "manual"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; const w = overview.pool?.sync_window || ["10:00","20:00"]; $("sync-start").value = w[0]; $("sync-end").value = w[1];
   }
   $("keys-body").innerHTML = keys.map(k => { const u = k.usage || {}; const limited = k.daily_limit !== null && k.daily_limit !== undefined; const ratio = limited && k.daily_limit > 0 ? (u.count || 0) / k.daily_limit : 0; const warn = ratio >= 1 ? "red" : ratio >= 0.8 ? "amber" : ""; return `<tr><td><strong>${esc(k.name)}</strong></td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td class="align-right"><div class="actions"><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`; }).join("");
+  renderModels();
+  const modelIds = Array.isArray(models?.models) ? models.models.filter(m => m.enabled).map(m => m.id) : [];
   const selected = $("model").value || "deepseek-v4-flash";
-  $("model").replaceChildren(...models.map(model => { const o = document.createElement("option"); o.value = o.textContent = model; return o; }));
-  if (models.includes(selected)) $("model").value = selected;
+  $("model").replaceChildren(...modelIds.map(model => { const o = document.createElement("option"); o.value = o.textContent = model; return o; }));
+  if (modelIds.includes(selected)) $("model").value = selected;
   $("test-submit").disabled = !active || busy;
   $("test-history").innerHTML = events.length ? events.map(e => `<div class="history-row"><span class="mono muted">${esc(stamp(e.time * 1000))}</span><strong>${esc(e.model)}</strong><span class="pill ${e.ok ? "green" : "red"}">${e.ok ? "成功" : "失败"}</span><span class="mono">${e.seconds}s</span></div>`).join("") : '<p class="history-empty">暂无测试记录，发送第一条测试消息。</p>';
+}
+function renderModels() {
+  const catalog = overview?.models;
+  const list = Array.isArray(catalog?.models) ? catalog.models : [];
+  $("models-badge").textContent = list.filter(m => m.enabled).length + " / " + list.length;
+  const note = $("models-note");
+  if (catalog?.error) { note.textContent = `上游拉取异常：${catalog.error}（当前展示${catalog.updated ? "上次缓存" : "内置官方列表"}）`; note.classList.add("field-error"); }
+  else { note.textContent = catalog?.updated ? `上次拉取：${stamp(catalog.updated * 1000)} · 每 6 小时自动刷新。禁用的模型不会出现在 /v1/models，调用会被拒绝。` : "尚未从上游拉取过，展示内置官方列表。服务启动与每 6 小时会自动尝试拉取。"; note.classList.remove("field-error"); }
+  $("models-body").innerHTML = list.map(m => {
+    const credits = m.credits === null || m.credits === undefined ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
+    const promoNote = m.promo ? `<small class="cell-note">${esc(m.promo.label)} ×${m.promo.credits}</small>` : "";
+    const ctx = m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : m.max_input_tokens) : "—";
+    return `<tr><td><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small></td><td>${esc(m.description || "—")}</td><td><span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${credits}</span>${promoNote}</td><td class="mono">${ctx}</td><td><span class="pill ${m.enabled ? "green" : ""}">${m.enabled ? "启用" : "禁用"}</span></td><td class="align-right"><button data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}">${m.enabled ? "禁用" : "启用"}</button></td></tr>`;
+  }).join("") || '<tr><td colspan="6" class="muted">模型列表为空，请点击「立即拉取」。</td></tr>';
 }
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
@@ -268,6 +285,19 @@ document.querySelectorAll("[data-copy]").forEach(b => b.addEventListener("click"
 $("base-url").textContent = location.origin + "/v1"; $("anthropic-url").textContent = location.origin;
 $("copy-base").addEventListener("click", () => copy(location.origin + "/v1")); $("copy-anthropic").addEventListener("click", () => copy(location.origin));
 $("host-label").textContent = location.host;
+$("models-refresh").addEventListener("click", async () => {
+  $("models-refresh").disabled = true; $("models-refresh").textContent = "拉取中…";
+  try { await api("models/refresh", {method:"POST"}); await refresh(); toast("模型列表已更新"); }
+  catch (e) { toast(e.message); }
+  finally { $("models-refresh").disabled = false; $("models-refresh").innerHTML = '<span>↻</span> 立即拉取'; }
+});
+$("models-body").addEventListener("click", async e => {
+  const button = e.target.closest("[data-model-toggle]");
+  if (!button) return;
+  button.disabled = true;
+  try { await api("models/" + encodeURIComponent(button.dataset.modelToggle), {method:"PATCH", body:{enabled:button.dataset.enabled === "1"}}); await refresh(); }
+  catch (err) { toast(err.message); button.disabled = false; }
+});
 $("test-form").addEventListener("submit", async e => {
   e.preventDefault(); busy = true; $("test-submit").disabled = true; $("test-submit").textContent = "正在调用…"; $("test-status").className = "pill amber"; $("test-status").textContent = "请求中"; $("test-output").textContent = "正在等待上游响应，最长约 90 秒…"; $("test-meta").textContent = "";
   try { const r = await api("test", {method:"POST",body:{model:$("model").value,prompt:$("test-prompt").value}}); $("test-status").className = "pill " + (r.ok ? "green" : "red"); $("test-status").textContent = r.ok ? "连接成功" : "调用失败"; $("test-output").textContent = r.ok ? r.answer : r.error; $("test-meta").textContent = `${r.seconds}s${r.status ? " · HTTP " + r.status : ""}${r.usage?.total_tokens !== undefined ? " · " + r.usage.total_tokens + " tokens" : ""}`; }

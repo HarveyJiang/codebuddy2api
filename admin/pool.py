@@ -527,8 +527,9 @@ def request_affinity(headers, body):
 
 
 class PoolMiddleware:
-    def __init__(self, app, pool):
+    def __init__(self, app, pool, model_registry=None):
         self.app, self.pool = app, pool
+        self.model_registry = model_registry
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}:
@@ -551,6 +552,11 @@ class PoolMiddleware:
                 body = json.loads(raw) if raw else {}
             except ValueError:
                 body = {}
+            # 管理页禁用的模型直接拒绝，不打上游。
+            if self.model_registry is not None and isinstance(body, dict):
+                model = body.get("model")
+                if isinstance(model, str) and model and model not in self.model_registry.enabled_models() and model in self.model_registry.snapshot_ids():
+                    raise HTTPException(400, f"模型 {model} 已在管理页禁用")
             affinity_key = request_affinity(headers, body)
             original_receive = receive
             delivered = False

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import secrets
 import threading
 import time
@@ -21,6 +22,7 @@ from core import converter
 from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
+from .models import ModelRegistry
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -67,6 +69,7 @@ class Store:
         self.path = self.root / "state.json"
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.data.setdefault("model_registry", {})
         else:
             self.data = {"accounts": {}, "active": None, "keys": {}}
             for p in sorted(self.auth_dir.glob("*.info")):
@@ -160,6 +163,14 @@ class Store:
             if aid not in self.managers:
                 self.managers[aid] = converter.CredentialManager(self.file_for(item))
             return self.managers[aid]
+
+    def any_enabled_manager(self):
+        """A credential manager from any enabled account, for background pulls (model catalog)."""
+        with self.lock:
+            for aid, item in self.data["accounts"].items():
+                if item["enabled"]:
+                    return self.manager_for(aid, item)
+            return None
 
     def account_rows(self):
         result = []
@@ -277,6 +288,17 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
     metrics = RequestMetrics()
+    model_registry = ModelRegistry(get_credential=store.any_enabled_manager)
+    model_registry.import_state(store.data.get("model_registry"))
+    model_registry.ensure_builtin()
+    app_state_seed = store.data.get("model_registry") or {}
+    if not app_state_seed.get("available"):
+        # First boot (or previous fetch never succeeded): try once synchronously so
+        # /v1/models is correct immediately, then fall back to builtin if offline.
+        model_registry.fetch()
+        model_registry.ensure_builtin()
+        store.data["model_registry"] = model_registry.export_state()
+        store.save()
     @asynccontextmanager
     async def lifespan(app):
         async def reap():
@@ -292,27 +314,52 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     pass  # Per-account errors are persisted without credential data.
                 await asyncio.sleep(60)
         pool_task = asyncio.create_task(pool_worker())
+        async def models_worker():
+            # 每天在 04:00-05:00 之间随机选一分钟刷新模型配置（上游免鉴权接口，
+            # 低峰期随机时刻，避免固定时间打点）。
+            while True:
+                now = datetime.now(CN)
+                next_run = (now + timedelta(days=1)).replace(hour=4, minute=random.randint(0, 59), second=random.randint(0, 59), microsecond=0)
+                if not (4 <= now.hour < 5):
+                    today = now.replace(hour=4, minute=random.randint(0, 59), second=random.randint(0, 59), microsecond=0)
+                    if today > now:
+                        next_run = today
+                await asyncio.sleep(max(60, (next_run - now).total_seconds()))
+                model_registry.fetch()
+                with store.lock:
+                    store.data["model_registry"] = model_registry.export_state()
+                    store.save()
+        models_task = asyncio.create_task(models_worker())
         try:
             yield
         finally:
             cleanup_task.cancel()
             pool_task.cancel()
+            models_task.cancel()
             try:
                 await cleanup_task
             except asyncio.CancelledError:
                 pass
             await browser_login.close()
-            try:
-                await pool_task
-            except asyncio.CancelledError:
-                pass
+            for task in (pool_task, models_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.store = store
     app.state.browser_login = browser_login
     app.state.pool = pool
     app.state.metrics = metrics
+    app.state.model_registry = model_registry
+    # Route converter's model list through the registry (dynamic + managed),
+    # keeping the legacy file-based loader as last-resort fallback.
+    def _managed_models():
+        models = model_registry.enabled_models()
+        return models or converter.get_available_models()
+    converter.get_available_models = _managed_models
     app.add_middleware(AdminMiddleware)
-    app.add_middleware(PoolMiddleware, pool=pool)
+    app.add_middleware(PoolMiddleware, pool=pool, model_registry=model_registry)
     app.add_middleware(MetricsMiddleware, metrics=metrics)
 
     async def payload(req):
@@ -413,12 +460,39 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         with store.lock:
             keys = [{"id": kid, "usage": {"date": store._today(), "count": 0, "tokens": 0}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
 
     @app.post("/admin/api/pool/refresh-credits")
     async def pool_refresh_credits(req: Request):
         store.require_admin(req)
         return await pool.refresh_credits()
+
+    @app.post("/admin/api/models/refresh")
+    async def models_refresh(req: Request):
+        store.require_admin(req)
+        ok = await asyncio.to_thread(model_registry.fetch)
+        with store.lock:
+            store.data["model_registry"] = model_registry.export_state()
+            store.save()
+        snapshot = model_registry.snapshot()
+        if not ok:
+            raise HTTPException(502, snapshot.get("error") or "拉取失败")
+        return {"ok": True, "count": len(snapshot["models"])}
+
+    @app.patch("/admin/api/models/{mid}")
+    async def model_toggle(mid: str, req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        if type(body.get("enabled")) is not bool:
+            raise HTTPException(400, "enabled 需为布尔值")
+        try:
+            state = model_registry.set_enabled(mid, body["enabled"])
+        except KeyError:
+            raise HTTPException(404, "模型不存在")
+        with store.lock:
+            store.data["model_registry"] = state
+            store.save()
+        return {"ok": True}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
