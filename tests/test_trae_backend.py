@@ -1171,10 +1171,10 @@ def test_manager_fetch_models_menu_failure_raises(tmp_path):
 
 def test_function_chain_prefers_cached_and_retries():
     """function 自适应：默认 work_lite，记住 agent 后优先 agent。"""
-    assert T.function_chain("brand-new-model") == ["solo_work_lite", "solo_agent_remote"]
+    assert T.function_chain("brand-new-model") == ["solo_work_lite", "solo_agent_remote", T.AGENT_STEP]
     T.remember_function("brand-new-model", "solo_agent_remote")
     try:
-        assert T.function_chain("brand-new-model") == ["solo_agent_remote", "solo_work_lite"]
+        assert T.function_chain("brand-new-model") == ["solo_agent_remote", "solo_work_lite", T.AGENT_STEP]
     finally:
         T._FUNCTION_CACHE.pop("brand-new-model", None)
 
@@ -1580,8 +1580,8 @@ TraeEndToEnd.test_e2e_batch_checkin_covers_trae = _e2e_batch_checkin_covers_trae
 TraeEndToEnd.test_e2e_dynamic_catalog_replaces_static = _e2e_dynamic_catalog_replaces_static
 
 
-def test_astream_param_invalid_after_both_functions(monkeypatch):
-    """两个 function 都 4001 → 抛 400 且给出可读原因（不冷却账号：400 不在冷却集合）。"""
+def test_astream_param_invalid_after_all_steps(monkeypatch):
+    """三种调用方式都 4001 → 抛 400 且给出可读原因（400 不在冷却集合，不冷却账号）。"""
     from core.backends.base import BackendHTTPError
     backend = T.TraeBackend()
     calls = []
@@ -1591,18 +1591,24 @@ def test_astream_param_invalid_after_both_functions(monkeypatch):
         raise BackendHTTPError(400, b'{"code":4001,"message":"param is invalid"}')
         yield b""  # pragma: no cover
 
+    async def fake_agent(body, headers, *, timeout=None, raise_on_error=False):
+        calls.append("agent")
+        raise BackendHTTPError(400, b'{"code":4001,"message":"param is invalid"}')
+        yield b""  # pragma: no cover
+
     async def run():
         try:
-            async for _ in backend.astream({}, {"model": "never-model"}):
+            async for _ in backend.astream({}, {"model": "never-model", "messages": [{"role": "user", "content": "hi"}]}):
                 pass
         except BackendHTTPError as e:
             return e
         return None
 
     monkeypatch.setattr(backend, "_stream", fake_stream)
+    monkeypatch.setattr(backend, "_stream_agent", fake_agent)
     try:
         err = asyncio.run(run())
-        assert calls == ["solo_work_lite", "solo_agent_remote"]
+        assert calls == ["solo_work_lite", "solo_agent_remote", "agent"]
         assert err.status == 400 and b"4001" in err.body and "不可用".encode() in err.body
     finally:
         T._FUNCTION_CACHE.pop("never-model", None)
@@ -1634,3 +1640,122 @@ def test_astream_retries_on_in_stream_4001(monkeypatch):
         assert T.function_chain("peek-model")[0] == "solo_agent_remote"
     finally:
         T._FUNCTION_CACHE.pop("peek-model", None)
+
+
+# ---------------------------------------------------------------------------
+# Trae 远程 agent（chat_sessions）链路
+# ---------------------------------------------------------------------------
+
+AGENT_EVENTS = (
+    b'id: 1\nevent: metadata\ndata: {"session_id":"s1"}\n\n'
+    b'id: 2\nevent: heartbeat\ndata: {}\n\n'
+    b'id: 3\nevent: plan_item\ndata: {"id":"pi_1","task_id":"t1","thought":"","reasoning_content":"The user wants"}\n\n'
+    b'id: 4\nevent: plan_item\ndata: {"id":"pi_1","task_id":"t1","thought":"o","reasoning_content":"The user wants me to reply only \\"ok\\"."}\n\n'
+    b'id: 5\nevent: plan_item\ndata: {"id":"pi_1","task_id":"t1","thought":"ok","reasoning_content":"The user wants me to reply only \\"ok\\".","tool_call_info":{"name":"finish"}}\n\n'
+    b'id: 6\nevent: token_usage\ndata: {"prompt_tokens":57857,"completion_tokens":14,"total_tokens":57871}\n\n'
+    b'id: 7\nevent: done\ndata: {"status":"completed","reply_to_message_id":"m1"}\n\n'
+)
+
+
+def test_build_agent_query_flattens_messages():
+    from core.backends import trae_agent as A
+    q = A.build_agent_query([
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": [{"type": "text", "text": "在的"}]},
+        {"role": "user", "content": ""},          # 空内容跳过
+    ])
+    assert q == "系统：你是助手\n\n用户：你好\n\n助手：在的"
+    assert A.build_agent_query([]) == ""
+
+
+def test_agent_create_session_and_send_message():
+    from core.backends import trae_agent as A
+    seen = []
+
+    def handler(req):
+        seen.append((req.method, str(req.url), json.loads(req.content or b"{}")))
+        if req.url.path.endswith("/chat_sessions"):
+            return httpx.Response(200, json={"code": 0, "data": {"chat_session_id": "sess-1"}})
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "msg-1", "accepted": True}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        sid = A.create_session(client, {"Authorization": "x"})
+        mid = A.send_message(client, {"Authorization": "x"}, sid, "deepseek-v4.1-flash", "用户：hi", "u123", "DeepSeek-V4.1-Flash")
+    assert (sid, mid) == ("sess-1", "msg-1")
+    assert seen[0][2] == {"mode": "code"}
+    body = seen[1][2]
+    assert seen[1][1].endswith("/api/remote/v1/chat_sessions/sess-1/messages")
+    assert body["model_name"] == "deepseek-v4.1-flash" and body["agent_type"] == "solo_agent_remote"
+    assert body["custom_model"]["config_name"] == "deepseek-v4.1-flash"
+    assert body["custom_model"]["display_model_name"] == "DeepSeek-V4.1-Flash"
+    assert json.loads(body["query"]) == [{"type": "text", "data": {"content": "用户：hi"}}]
+    cp = json.loads(body["common_params"])          # common_params 必须是「字符串化的 JSON」
+    assert cp["biz_session_id"] == "sess-1" and cp["biz_user_id"] == "u123"
+
+
+def test_normalize_agent_stream_deltas_and_usage():
+    """plan_item 是累计快照 → 只发新增后缀；done 收尾；usage 挂到最后一个 chunk。"""
+    from core.backends import trae_agent as A
+
+    async def lines():
+        for line in AGENT_EVENTS.decode("utf-8").split("\n"):
+            yield line
+
+    async def run():
+        return [c async for c in A.normalize_agent_stream(lines(), model="deepseek-v4.1-flash")]
+
+    chunks = asyncio.run(run())
+    payloads = [json.loads(c[6:].decode("utf-8")) for c in chunks if c.startswith(b"data: ") and b"[DONE]" not in c]
+    deltas = [p["choices"][0]["delta"] for p in payloads]
+    content = "".join(d.get("content", "") for d in deltas)
+    reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+    assert content == "ok"                              # 差分后无重复
+    assert reasoning == 'The user wants me to reply only "ok".'
+    assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+    assert payloads[-1]["usage"] == {"prompt_tokens": 57857, "completion_tokens": 14, "total_tokens": 57871}
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert not any(b"heartbeat" in c or b"metadata" in c for c in chunks)   # 非转发事件被忽略
+
+
+def test_astream_falls_back_to_remote_agent(monkeypatch):
+    """两个 solo function 都 4001 → 自动走会话式 agent：建会话 → 投递 → 事件流 → 删会话。"""
+    from core.backends.base import BackendHTTPError
+    backend = T.TraeBackend()
+    http_calls = []
+
+    def sync_handler(req):
+        http_calls.append((req.method, req.url.path))
+        if req.method == "POST" and req.url.path.endswith("/chat_sessions"):
+            return httpx.Response(200, json={"code": 0, "data": {"chat_session_id": "sess-9"}})
+        if req.method == "POST":
+            return httpx.Response(200, json={"code": 0, "data": {"message_id": "msg-9"}})
+        return httpx.Response(200, json={"code": 0})            # DELETE 会话
+
+    def async_handler(req):
+        http_calls.append(("SSE", req.url.path))
+        return httpx.Response(200, content=AGENT_EVENTS, headers={"content-type": "text/event-stream"})
+
+    async def solo_4001(prepared, headers, *, timeout=None, raise_on_error=False):
+        raise BackendHTTPError(400, b'{"code":4001,"message":"param is invalid"}')
+        yield b""  # pragma: no cover
+
+    real_sync, real_async = httpx.Client, httpx.AsyncClient
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_sync(transport=httpx.MockTransport(sync_handler), **kw))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_async(transport=httpx.MockTransport(async_handler), **kw))
+    monkeypatch.setattr(backend, "_stream", solo_4001)
+
+    async def run():
+        return [c async for c in backend.astream({"X-Uid": "u1"}, {
+            "model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": "只回复ok"}]})]
+
+    try:
+        chunks = asyncio.run(run())
+        text = "".join(json.loads(c[6:].decode())["choices"][0]["delta"].get("content", "")
+                       for c in chunks if c.startswith(b"data: ") and b"[DONE]" not in c)
+        assert text == "ok"
+        assert chunks[-1] == b"data: [DONE]\n\n"
+        assert [c[0] for c in http_calls] == ["POST", "POST", "SSE", "DELETE"]
+        assert T.function_chain("deepseek-v4.1-flash")[0] == T.AGENT_STEP
+    finally:
+        T._FUNCTION_CACHE.pop("deepseek-v4.1-flash", None)

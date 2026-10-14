@@ -542,6 +542,8 @@ _FUNCTION_LOCK = threading.Lock()
 
 #: 上游「参数校验失败」业务码：function 与模型不匹配（换 function 可解）
 PARAM_INVALID_CODE = 4001
+#: 传输链末位：会话式远程 agent（非 llm_utils_chat）
+AGENT_STEP = "agent"
 #: 宽松匹配 `"code": 4001`（上游换行/空格不定），用于字节级窥探
 _CODE_RE = re.compile(rb'"code"\s*:\s*%d\b' % PARAM_INVALID_CODE)
 
@@ -568,11 +570,14 @@ async def _replay(head: bytes, rest):
 
 
 def function_chain(model: str) -> list[str]:
-    """该模型要依次尝试的 function 链（缓存的可用值优先，其余按序兜底）。"""
+    """该模型要依次尝试的调用方式。
+
+    `solo_work_lite` / `solo_agent_remote` 是 llm_utils_chat 的两套 function；
+    都不可用时退到 `agent`：work.trae.cn 的会话式远程 agent（如 deepseek-v4.1-flash）。
+    """
     with _FUNCTION_LOCK:
         first = _FUNCTION_CACHE.get(str(model or ""), FUNCTION)
-    order = [first] + [f for f in (FUNCTION, FUNCTION_FALLBACK) if f != first]
-    return order
+    return [first] + [s for s in (FUNCTION, FUNCTION_FALLBACK, AGENT_STEP) if s != first]
 
 
 def remember_function(model: str, fn: str) -> None:
@@ -1088,26 +1093,71 @@ class TraeBackend(BackendSpec):
     async def astream(self, headers, body, *, timeout=None, raise_on_error=False):
         model = str((body or {}).get("model") or "")
         chain = function_chain(model)
-        for idx, fn in enumerate(chain):
-            prepared = prepare_solo_body(body, function=fn)
+        for idx, step in enumerate(chain):
             emitted = False
             try:
-                async for chunk in self._stream(prepared, headers, timeout=timeout, raise_on_error=raise_on_error):
+                if step == AGENT_STEP:
+                    stream = self._stream_agent(body, headers, timeout=timeout, raise_on_error=raise_on_error)
+                else:
+                    stream = self._stream(prepare_solo_body(body, function=step), headers,
+                                          timeout=timeout, raise_on_error=raise_on_error)
+                async for chunk in stream:
                     emitted = True
                     yield chunk
                 return
             except BackendHTTPError as e:
-                # 4001 ＝ function 与模型不匹配（param invalid）→ 换下一个 function 重试，
-                # 并把可用 function 记住。仅在「尚未向客户端吐出 chunk」时重试，
-                # 避免流中途换号导致内容重复。
+                # 4001 ＝ 该 function 与模型不匹配（param invalid）→ 换下一种调用方式重试，
+                # 并把可用方式记住。仅在「尚未向客户端吐出 chunk」时重试，
+                # 避免流中途切换导致内容重复。
                 if (idx + 1 < len(chain) and not e.emitted and not emitted and _is_param_invalid(e)):
                     with _FUNCTION_LOCK:
                         _FUNCTION_CACHE[model] = chain[idx + 1]
                     continue
                 if _is_param_invalid(e) and not e.emitted and not emitted:
-                    # 两个 function 都试过仍失败 → 给出可读原因（避免直接抛上游原文）
+                    # 所有方式都试过仍失败 → 给出可读原因（避免直接抛上游原文）
                     raise BackendHTTPError(400, _param_invalid_body(model)) from e
                 raise
+
+    async def _stream_agent(self, body, headers, *, timeout=None, raise_on_error=False):
+        """会话式远程 agent：建会话 → 投递消息 → 读事件流 → 收尾删会话。"""
+        import asyncio
+
+        from . import trae_agent as agent
+
+        model = str((body or {}).get("model") or "")
+        query = agent.build_agent_query((body or {}).get("messages"))
+        if not query:
+            raise BackendHTTPError(400, json.dumps(
+                {"error": {"message": "agent 请求缺少消息内容", "type": "invalid_request_error"}},
+                ensure_ascii=False).encode("utf-8"))
+        uid = str(headers.get("X-Uid") or "")
+        display = next((m.get("name") for m in trae_model_catalog() if m.get("id") == model), None)
+
+        def _prepare():
+            with httpx.Client(timeout=60) as c:
+                sid = agent.create_session(c, headers)
+                mid = agent.send_message(c, headers, sid, model, query, uid, display)
+            return sid, mid
+
+        def _cleanup(sid):
+            try:
+                with httpx.Client(timeout=30) as c:
+                    c.delete(f"{agent.AGENT_HOST}{agent.EP_CHAT_SESSIONS}/{sid}", headers=headers)
+            except Exception:
+                pass
+
+        session_id, _message_id = await asyncio.to_thread(_prepare)
+        try:
+            async with httpx.AsyncClient(timeout=timeout or 900) as c:
+                url = f"{agent.AGENT_HOST}{agent.EP_CHAT_SESSIONS}/{session_id}/events"
+                async with c.stream("GET", url, headers={**headers, "Accept": "text/event-stream"}) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        raise BackendHTTPError(classify_http_status(r.status_code, raw.decode("utf-8", "replace")), raw)
+                    async for chunk in agent.normalize_agent_stream(r.aiter_lines(), model=model):
+                        yield chunk
+        finally:
+            await asyncio.to_thread(_cleanup, session_id)
 
     async def _stream(self, prepared, headers, *, timeout=None, raise_on_error=False):
         url = self.chat_url()
