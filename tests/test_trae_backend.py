@@ -1606,3 +1606,31 @@ def test_astream_param_invalid_after_both_functions(monkeypatch):
         assert err.status == 400 and b"4001" in err.body and "不可用".encode() in err.body
     finally:
         T._FUNCTION_CACHE.pop("never-model", None)
+
+
+def test_astream_retries_on_in_stream_4001(monkeypatch):
+    """上游以 HTTP 200 + 流内 event:error 4001 拒绝时，也应在输出前换 function 重试。"""
+    calls = []
+    solo_error = b'id:1\nevent:error\ndata:{"code":4001,"message":"param is invalid"}\n\n'
+
+    def handler(req):
+        fn = json.loads(req.content)["function"]
+        calls.append(fn)
+        return httpx.Response(200, content=solo_error if fn == "solo_work_lite" else SOLO_SSE)
+
+    real_async = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: real_async(transport=httpx.MockTransport(handler), **kw))
+    backend = T.TraeBackend()
+
+    async def run():
+        return [c async for c in backend.astream({}, {"model": "peek-model"})]
+
+    try:
+        chunks = asyncio.run(run())
+        assert calls == ["solo_work_lite", "solo_agent_remote"]
+        assert any(b"[DONE]" in c for c in chunks)          # 重试后的正常流完整输出
+        assert not any(b"4001" in c for c in chunks)        # 客户端看不到被重试掉的错误
+        assert T.function_chain("peek-model")[0] == "solo_agent_remote"
+    finally:
+        T._FUNCTION_CACHE.pop("peek-model", None)

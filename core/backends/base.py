@@ -27,7 +27,8 @@ class BackendHTTPError(Exception):
     transport: True 表示传输层错误（httpx.HTTPError），status 恒为 502。
     """
 
-    def __init__(self, status: int, body, *, emitted: bool = False, transport: bool = False):
+    def __init__(self, status: int, body, *, emitted: bool = False, transport: bool = False,
+                 upstream_code: int | None = None):
         super().__init__(f"backend error status={status} emitted={emitted} transport={transport}")
         self.status = int(status)
         if isinstance(body, (bytes, bytearray)):
@@ -36,6 +37,8 @@ class BackendHTTPError(Exception):
             self.body = str(body).encode("utf-8", "replace")
         self.emitted = emitted
         self.transport = transport
+        #: 上游业务错误码（如 Trae 流内 event:error 的 1005/4001），供重试判定
+        self.upstream_code = upstream_code
 
 
 class BackendSpec:

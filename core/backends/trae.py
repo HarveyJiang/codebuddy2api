@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -539,6 +540,32 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
 _FUNCTION_CACHE: dict[str, str] = {}
 _FUNCTION_LOCK = threading.Lock()
 
+#: 上游「参数校验失败」业务码：function 与模型不匹配（换 function 可解）
+PARAM_INVALID_CODE = 4001
+#: 宽松匹配 `"code": 4001`（上游换行/空格不定），用于字节级窥探
+_CODE_RE = re.compile(rb'"code"\s*:\s*%d\b' % PARAM_INVALID_CODE)
+
+
+async def _peek_first_event(chunks, limit: int = 8192):
+    """读取首个完整 SSE 事件（或至 limit），返回 (bytes, 剩余迭代器)。
+
+    用于在**向客户端发出任何内容之前**判定流内 4001（此时才允许换 function 重试）。
+    """
+    buf = b""
+    iterator = chunks.__aiter__()
+    async for chunk in iterator:
+        buf += chunk
+        if b"\n\n" in buf or len(buf) >= limit:
+            break
+    return buf, iterator
+
+
+async def _replay(head: bytes, rest):
+    if head:
+        yield head
+    async for chunk in rest:
+        yield chunk
+
 
 def function_chain(model: str) -> list[str]:
     """该模型要依次尝试的 function 链（缓存的可用值优先，其余按序兜底）。"""
@@ -554,9 +581,15 @@ def remember_function(model: str, fn: str) -> None:
 
 
 def _is_param_invalid(err: BackendHTTPError) -> bool:
-    """上游 4001 ＝ function 与模型不匹配（param invalid），可换 function 重试。"""
+    """上游 4001 ＝ function 与模型不匹配（param invalid），可换 function 重试。
+
+    两种到达形态：HTTP 400 带 JSON body，或 HTTP 200 + 流内 event:error（body 只有文本，
+    此时靠 upstream_code 判定）。
+    """
+    if getattr(err, "upstream_code", None) == PARAM_INVALID_CODE:
+        return True
     try:
-        return b"4001" in (err.body or b"")
+        return _CODE_RE.search(err.body or b"") is not None
     except Exception:
         return False
 
@@ -1004,10 +1037,10 @@ async def normalize_solo_stream(chunks, *, model: str = "", raise_on_error: bool
             code = classify_stream_code(ev.get("error_code") or 0)
             message = ev.get("error_message") or ""
             if raise_on_error:
-                raise BackendHTTPError(code, message, emitted=False)
+                raise BackendHTTPError(code, message, emitted=False, upstream_code=int(ev.get("error_code") or 0))
             yield _error_chunk(code, message)
             yield b"data: [DONE]\n\n"
-            raise BackendHTTPError(code, message, emitted=True)
+            raise BackendHTTPError(code, message, emitted=True, upstream_code=int(ev.get("error_code") or 0))
 
     if not saw_done:
         # 幂等兜底：上游中断（无 done）仍补 [DONE]；若还有未挂载的 usage（上游只发了
@@ -1084,9 +1117,15 @@ class TraeBackend(BackendSpec):
                     if r.status_code != 200:
                         raw = await r.aread()
                         status = classify_http_status(r.status_code, raw.decode("utf-8", "replace"))
-                        raise BackendHTTPError(status, raw)
+                        raise BackendHTTPError(status, raw,
+                                               upstream_code=PARAM_INVALID_CODE if _CODE_RE.search(raw) else None)
+                    # 先窥探首个事件：若上游以「HTTP 200 + 流内 4001」拒绝该 function，
+                    # 此刻尚未向客户端输出，抛出（未 emitted）让上层换 function 重试。
+                    head, rest = await _peek_first_event(r.aiter_bytes())
+                    if _CODE_RE.search(head or b""):
+                        raise BackendHTTPError(400, head, upstream_code=PARAM_INVALID_CODE)
                     async for chunk in normalize_solo_stream(
-                        r.aiter_bytes(),
+                        _replay(head, rest),
                         model=str(prepared.get("model") or ""),
                         raise_on_error=raise_on_error,
                     ):
