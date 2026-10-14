@@ -21,6 +21,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from core.backends import trae as trae_backend
+from core.backends.registry import trae_enabled
+
 BACKEND = "https://copilot.tencent.com"
 ORIGIN = "https://www.codebuddy.cn"
 USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
@@ -51,9 +54,11 @@ def _label(model):
 
 
 class ModelRegistry:
-    def __init__(self, get_credential=None, clock=time.time):
-        """get_credential: callable returning a manager whose get_headers() yields auth headers."""
+    def __init__(self, get_credential=None, clock=time.time, trae_credential_getter=None):
+        """get_credential: callable returning a manager whose get_headers() yields auth headers.
+        trae_credential_getter: callable returning a TraeCredentialManager (dynamic Trae catalog)."""
         self.get_credential = get_credential
+        self.trae_credential_getter = trae_credential_getter
         self.clock = clock
         # RLock: snapshot() 持锁调用 active_promo()，后者经模块级引用回到
         # promotions 属性再次取锁，非重入锁会自死锁，导致 /admin/api/overview
@@ -65,6 +70,12 @@ class ModelRegistry:
         self._promotions = []   # dynamic discounts parsed from the product config
         self._updated = 0
         self._error = None
+        # Trae 第二后端模型目录：bare config_name 存储，对外以 `trae/` 前缀暴露。
+        self._trae_catalog = {}      # id -> {name, description, credits, max_input_tokens, source}
+        self._trae_available = []    # ordered bare ids
+        self._trae_disabled = set()  # user-disabled bare ids
+        self._trae_updated = 0
+        self._trae_error = None
         _registry_ref[0] = self
 
     # -- persistence -------------------------------------------------------
@@ -72,7 +83,11 @@ class ModelRegistry:
         with self._lock:
             return {"catalog": dict(self._catalog), "available": list(self._available),
                     "disabled": sorted(self._disabled), "promotions": list(self._promotions),
-                    "updated": self._updated}
+                    "updated": self._updated,
+                    "trae_catalog": {k: dict(v) for k, v in self._trae_catalog.items()},
+                    "trae_available": list(self._trae_available),
+                    "trae_disabled": sorted(self._trae_disabled),
+                    "trae_updated": self._trae_updated, "trae_error": self._trae_error}
 
     def import_state(self, state):
         if not isinstance(state, dict):
@@ -91,6 +106,17 @@ class ModelRegistry:
             if isinstance(promotions, list):
                 self._promotions = [p for p in promotions if isinstance(p, dict)]
             self._updated = int(state.get("updated") or 0)
+            trae_catalog = state.get("trae_catalog")
+            if isinstance(trae_catalog, dict):
+                self._trae_catalog = {k: v for k, v in trae_catalog.items() if isinstance(v, dict)}
+            trae_available = state.get("trae_available")
+            if isinstance(trae_available, list):
+                self._trae_available = [str(i) for i in trae_available]
+            trae_disabled = state.get("trae_disabled")
+            if isinstance(trae_disabled, list):
+                self._trae_disabled = {str(i) for i in trae_disabled}
+            self._trae_updated = int(state.get("trae_updated") or 0)
+            self._trae_error = state.get("trae_error")
 
     # -- upstream fetch ----------------------------------------------------
     def fetch(self):
@@ -220,12 +246,70 @@ class ModelRegistry:
             self._available = [mid for mid in BUILTIN_ORDER if mid in self._catalog]
             self._updated = 0
 
+    # -- Trae 第二后端模型目录 ----------------------------------------------
+    def ensure_trae_builtin(self):
+        """无动态表时用 Trae 静态 32 条兜底（ Trae 后端恒在 /v1/models 可见）。"""
+        with self._lock:
+            if self._trae_available:
+                return
+            self._trae_catalog = {m["id"]: {"name": m["id"], "description": None, "credits": None,
+                                            "max_input_tokens": m.get("context_length"), "source": "builtin"}
+                                  for m in trae_backend.TRAE_STATIC_MODELS}
+            self._trae_available = [m["id"] for m in trae_backend.TRAE_STATIC_MODELS]
+            self._trae_updated = 0
+
+    def refresh_trae_models(self):
+        """拉取 Trae 动态模型表（get_detail_param，需一个启用的 Trae 账号）。
+
+        失败保留上次快照；从未拉到过则维持 builtin。返回是否拉到新表。
+        """
+        manager = None
+        if self.trae_credential_getter is not None:
+            try:
+                manager = self.trae_credential_getter()
+            except Exception:
+                manager = None
+        entries = None
+        if manager is not None:
+            try:
+                entries = manager.fetch_models()
+            except Exception as e:
+                with self._lock:
+                    self._trae_error = f"拉取失败：{type(e).__name__}"
+                return False
+        if not entries:
+            return False
+        with self._lock:
+            catalog = {}
+            for e in entries:
+                mid = str(e.get("id") or "").strip()
+                if not mid:
+                    continue
+                catalog[mid] = {"name": str(e.get("name") or mid), "description": None, "credits": None,
+                                "max_input_tokens": e.get("context_length"), "source": "upstream"}
+            if not catalog:
+                return False
+            self._trae_catalog = catalog
+            self._trae_available = [str(e["id"]) for e in entries if str(e.get("id") or "") in catalog]
+            self._trae_disabled &= set(self._trae_available)
+            self._trae_updated = int(self.clock())
+            self._trae_error = None
+        return True
+
+    def trae_entries(self):
+        """供 core.backends.trae 目录提供者：bare id 列表（含被禁用的——禁用只挡客户端请求）。"""
+        with self._lock:
+            return [{"id": mid, "name": (self._trae_catalog.get(mid) or {}).get("name") or mid,
+                     "context_length": (self._trae_catalog.get(mid) or {}).get("max_input_tokens") or 131072}
+                    for mid in self._trae_available if mid in self._trae_catalog]
+
     # -- queries -----------------------------------------------------------
     def snapshot(self):
         """Full catalog with management flags and current promo, for the admin UI.
 
         排序规则：启用的在前、禁用的在后；同组内按单价（credits）升序，
         None（按标准计费）视为 0，与免费模型并列最前。
+        Trae 模型固定排在 WorkBuddy 之后（backend="trae"），组内启用在前。
         """
         now = datetime.now(CN)
         with self._lock:
@@ -244,23 +328,42 @@ class ModelRegistry:
                 m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,
                 self._available.index(m["id"]),
             ))
+            if trae_enabled():
+                trae_models = []
+                for mid in self._trae_available:
+                    entry = self._trae_catalog.get(mid)
+                    if not entry:
+                        continue
+                    trae_models.append(dict(entry, id="trae/" + mid, backend="trae",
+                                            enabled=mid not in self._trae_disabled))
+                trae_models.sort(key=lambda m: not m["enabled"])
+                models.extend(trae_models)
             return {"updated": self._updated, "error": self._error, "models": models}
 
     def enabled_models(self):
-        """Ids available to API clients: upstream list minus user-disabled."""
+        """Ids available to API clients: upstream list minus user-disabled (+ Trae 前缀表)。"""
         with self._lock:
-            return [mid for mid in self._available if mid not in self._disabled]
+            result = [mid for mid in self._available if mid not in self._disabled]
+            if trae_enabled():
+                result += ["trae/" + mid for mid in self._trae_available if mid not in self._trae_disabled]
+            return result
 
     def snapshot_ids(self):
         """All known ids (enabled + disabled), for distinguishing 'disabled' from 'unknown'."""
         with self._lock:
-            return set(self._available)
+            return set(self._available) | {"trae/" + mid for mid in self._trae_available}
 
     def set_enabled(self, mid, enabled):
         with self._lock:
-            if mid not in self._catalog and mid not in self._available:
-                raise KeyError(mid)
-            self._disabled.discard(mid) if enabled else self._disabled.add(mid)
+            if mid.startswith("trae/"):
+                bare = mid[len("trae/"):]
+                if bare not in self._trae_catalog and bare not in self._trae_available:
+                    raise KeyError(mid)
+                self._trae_disabled.discard(bare) if enabled else self._trae_disabled.add(bare)
+            else:
+                if mid not in self._catalog and mid not in self._available:
+                    raise KeyError(mid)
+                self._disabled.discard(mid) if enabled else self._disabled.add(mid)
         return self.export_state()
 
     def info(self, mid):

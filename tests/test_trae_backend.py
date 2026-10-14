@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -764,13 +765,90 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert r.status_code == 200
         assert flow["id"] not in self.app.state.store.trae_flows
 
-    async def test_trae_account_actions_gated(self):
+    async def test_trae_account_checkin_and_credits(self):
+        # v1.1：Trae 账号支持积分查询与签到（ug 接口），不再门控。
         headers = await self.login_admin()
         aid = self.trae_aid()
-        r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
+        calls = []
+        state = {"claimed": False}
+
+        def handler(req):
+            calls.append(req.url.path)
+            if req.url.path.endswith("/checkin_credits/status"):
+                return httpx.Response(200, json={"checked_in": state["claimed"], "credits": 50, "enable": True})
+            if req.url.path.endswith("/checkin_credits/claim"):
+                state["claimed"] = True
+                return httpx.Response(200, json={})
+            if req.url.path.endswith("/ide_user_ent_usage"):
+                return httpx.Response(200, json={"is_credits_billing": True, "user_entitlement_pack_list": [
+                    {"entitlement_base_info": {"quota": {"credits_limit": 120}}},
+                    {"entitlement_base_info": {"quota": {"credits_limit": 30}}},
+                ]})
+            return httpx.Response(404)
+
+        real = _REAL_SYNC_CLIENT
+        self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        try:
+            r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
+        finally:
+            self.admin_server.httpx.Client = real
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True, body
+        assert body["message"] == "签到成功"
+        assert body["remaining"] == 150.0  # 120 + 30
+        status = self.app.state.store.data["account_status"][aid]
+        assert status["remaining"] == 150.0 and status["packages"] == 1
+        assert status["credits_updated"] > 0
+        today = datetime.fromtimestamp(time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        assert status["checkin_date"] == today
+        assert "/trae/api/v2/ug/checkin_credits/claim" in calls
+
+    async def test_trae_account_status_pulls_credits_without_checkin(self):
+        # action=status：只查状态 + 积分，不执行签到。
+        headers = await self.login_admin()
+        aid = self.trae_aid()
+        calls = []
+
+        def handler(req):
+            calls.append(req.url.path)
+            if req.url.path.endswith("/checkin_credits/status"):
+                return httpx.Response(200, json={"checked_in": False, "credits": 0, "enable": True})
+            if req.url.path.endswith("/ide_user_ent_usage"):
+                return httpx.Response(200, json={"user_entitlement_pack_list": []})
+            return httpx.Response(404)
+
+        real = _REAL_SYNC_CLIENT
+        self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        try:
+            r = await self.client.post(f"/admin/api/accounts/{aid}/actions/status", headers=headers)
+        finally:
+            self.admin_server.httpx.Client = real
+        assert r.status_code == 200, r.text
+        assert r.json()["ok"] is True
+        assert "/trae/api/v2/ug/checkin_credits/claim" not in calls
+        # 无权益包 → remaining 0 但不置 packages（不误判 exhausted）
+        status = self.app.state.store.data["account_status"][aid]
+        assert status["remaining"] == 0.0 and status.get("packages", 0) == 0
+
+    async def test_trae_account_ug_401_marks_auth_invalid(self):
+        headers = await self.login_admin()
+        aid = self.trae_aid()
+
+        def handler(req):
+            return httpx.Response(401, json={"message": "token dead"})
+
+        real = _REAL_SYNC_CLIENT
+        self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        try:
+            r = await self.client.post(f"/admin/api/accounts/{aid}/actions/status", headers=headers)
+        finally:
+            self.admin_server.httpx.Client = real
         assert r.status_code == 200
         body = r.json()
-        assert body["ok"] is False and "暂不支持" in body["message"]
+        assert body["ok"] is False and "重新授权" in body["message"]
+        status = self.app.state.store.data["account_status"][aid]
+        assert status["auth_invalid"] is True and status["cooldown_until"] > 0
 
     async def test_admin_static_has_trae_entry(self):
         html = (await self.client.get("/admin/", headers={"Authorization": "Bearer " + API}))
@@ -926,3 +1004,316 @@ def test_cred_backend_mismatch_503():
         assert getattr(ei.value, "status_code", None) == 503
     finally:
         pool.REQUEST_CREDENTIAL.reset(token)
+
+# ---------------------------------------------------------------------------
+# G. v1.1：ug API（模型表 / 签到 / 积分）+ 动态目录 + 禁用管理 + 404 软冷却
+# ---------------------------------------------------------------------------
+
+def _sync_transport(handler):
+    real = _REAL_SYNC_CLIENT
+    return real, (lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+
+
+def test_fetch_models_parses_config_info_list():
+    real, factory = _sync_transport(lambda req: httpx.Response(200, json={"config_info_list": [
+        {"config_name": "glm-5.2", "display_config": {"display_name": "GLM 5.2"}},
+        {"config_name": "kimi-k3", "display_config": {"display_name": "Kimi K3"}},
+        {"config_name": "", "display_config": {"display_name": "跳过空名"}},
+    ]}))
+    with real(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"config_info_list": [
+        {"config_name": "glm-5.2", "display_config": {"display_name": "GLM 5.2"}},
+        {"config_name": "kimi-k3", "display_config": {"display_name": "Kimi K3"}},
+        {"config_name": "", "display_config": {"display_name": "跳过空名"}},
+    ]}))) as client:
+        models = T.fetch_models(client, {"Authorization": "x"})
+    assert [m["id"] for m in models] == ["glm-5.2", "kimi-k3"]
+    assert models[0]["name"] == "GLM 5.2"
+    assert models[0]["context_length"] == T._CTX
+
+
+def test_fetch_models_envelope_and_errors():
+    def make(payload, status=200):
+        return httpx.Response(status, json=payload)
+    # Result 包装也认
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: make({"Result": {"config_info_list": [
+        {"config_name": "sagitta"}]}}))) as client:
+        assert [m["id"] for m in T.fetch_models(client, {})] == ["sagitta"]
+    # 非 200 → TraeAPIError 带 status
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: make({}, 500))) as client:
+        with pytest.raises(T.TraeAPIError) as ei:
+            T.fetch_models(client, {})
+        assert ei.value.status == 500
+    # 空列表 → TraeAPIError
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: make({"config_info_list": []}))) as client:
+        with pytest.raises(T.TraeAPIError):
+            T.fetch_models(client, {})
+
+
+def test_checkin_status_and_claim_and_ent_usage(tmp_path):
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mgr = T.TraeCredentialManager(p)
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        if req.url.path.endswith("/checkin_credits/status"):
+            # UgHeaders：Cloud-IDE-JWT + X-User-Region + X-Device-Id
+            assert req.headers["Authorization"] == "Cloud-IDE-JWT TRAE-ACCESS"
+            assert req.headers["X-User-Region"] == "CN"
+            assert req.headers["X-Device-Id"] == "d" * 32
+            assert req.headers["User-Agent"] == T.CLIENT_UA
+            return httpx.Response(200, json={"checked_in": True, "credits": 66, "enable": False})
+        if req.url.path.endswith("/checkin_credits/claim"):
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={"user_entitlement_pack_list": [
+            {"entitlement_base_info": {"quota": {"credits_limit": 10}}},
+            {"entitlement_base_info": {"quota": {"credits_limit": 5}}},
+            {"entitlement_base_info": {}},
+            "junk",
+        ]})
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(handler)) as client:
+        ci = mgr.checkin_status(client)
+        assert ci == {"checked": True, "credits": 66, "enable": False}
+        mgr.checkin_claim(client)
+        assert mgr.user_ent_usage(client) == 15
+    assert paths.count("/trae/api/v2/ug/checkin_credits/claim") == 1
+
+
+def test_manager_fetch_models_uses_solo_headers(tmp_path):
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mgr = T.TraeCredentialManager(p)
+    seen = {}
+
+    def handler(req):
+        seen["accept"] = req.headers["Accept"]
+        seen["uid"] = req.headers.get("X-Uid")
+        seen["auth"] = req.headers["Authorization"]
+        seen["body"] = req.content
+        return httpx.Response(200, json={"config_info_list": [{"config_name": "glm-5.2", "display_config": {"display_name": "GLM"}}]})
+
+    real = _REAL_SYNC_CLIENT
+    orig = httpx.Client
+    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(handler), **kw)
+    try:
+        models = mgr.fetch_models()
+    finally:
+        httpx.Client = orig
+    assert [m["id"] for m in models] == ["glm-5.2"]
+    assert seen["accept"] == "application/json"  # 非流式
+    assert seen["uid"] == "trae-user"
+    assert seen["auth"] == "Cloud-IDE-JWT TRAE-ACCESS"
+    assert json.loads(seen["body"])["function"] == "solo_work_lite"
+
+
+def test_ug_api_error_paths():
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(403, text="no"))) as client:
+        with pytest.raises(T.TraeAPIError) as ei:
+            T.checkin_status(client, {})
+        assert ei.value.status == 403
+        with pytest.raises(T.TraeAPIError):
+            T.checkin_claim(client, {})
+        with pytest.raises(T.TraeAPIError):
+            T.user_ent_usage(client, {})
+
+
+def test_catalog_provider_drives_map_model_and_ids():
+    from core.backends import registry as R
+    assert R.trae_model_ids() == [m["id"] for m in T.TRAE_STATIC_MODELS]  # 无提供者→静态
+    T.set_catalog_provider(lambda: [{"id": "brand-new-model", "name": "BN", "context_length": 999}])
+    try:
+        assert T.trae_model_catalog()[0]["id"] == "brand-new-model"
+        assert T.map_model("trae/brand-new-model") == "brand-new-model"
+        assert T.map_model("brand_new_model") == "brand-new-model"
+        assert R.trae_model_ids() == ["brand-new-model"]
+        with pytest.raises(T.UnknownTraeModel):
+            T.map_model("glm-5.2")  # 动态表没有它 → 未知
+    finally:
+        T.set_catalog_provider(None)
+    assert T.map_model("glm-5.2") == "glm-5.2"  # 恢复静态
+
+
+def test_catalog_provider_exception_falls_back_static():
+    def boom():
+        raise RuntimeError("registry gone")
+    T.set_catalog_provider(boom)
+    try:
+        assert len(T.trae_model_catalog()) == 32
+        assert T.map_model("glm-5.2") == "glm-5.2"
+    finally:
+        T.set_catalog_provider(None)
+
+
+# ---- ModelRegistry 的 Trae 目录 ----
+
+def _registry(clock=None):
+    import admin.models as M
+    return M.ModelRegistry(get_credential=None, clock=clock or time.time)
+
+
+def test_registry_trae_builtin_seed_and_disable():
+    reg = _registry()
+    reg.ensure_trae_builtin()
+    ids = reg.snapshot_ids()
+    assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 32
+    enabled = reg.enabled_models()
+    assert "trae/glm-5.2" in enabled
+    snap = reg.snapshot()["models"]
+    trae_rows = [m for m in snap if m.get("backend") == "trae"]
+    assert len(trae_rows) == 32 and all(m["enabled"] for m in trae_rows)
+    # 禁用 trae/glm-5.2
+    state = reg.set_enabled("trae/glm-5.2", False)
+    assert "trae/glm-5.2" not in reg.enabled_models()
+    assert "trae/glm-5.2" in reg.snapshot_ids()  # 仍「已知」→ 中间件报禁用而非未知
+    # 导出/导入往返保留禁用态
+    reg2 = _registry()
+    reg2.import_state(state)
+    assert "trae/glm-5.2" not in reg2.enabled_models()
+    # 未知 trae 模型 → KeyError
+    with pytest.raises(KeyError):
+        reg2.set_enabled("trae/nope", True)
+
+
+def test_registry_refresh_trae_models_replaces_builtin():
+    reg = _registry()
+    reg.ensure_trae_builtin()
+
+    class FakeManager:
+        def fetch_models(self):
+            return [{"id": "dyn-a", "name": "DynA", "context_length": 2048},
+                    {"id": "dyn-b", "name": "DynB", "context_length": 4096}]
+
+    reg.trae_credential_getter = lambda: FakeManager()
+    assert reg.refresh_trae_models() is True
+    ids = {i for i in reg.snapshot_ids() if i.startswith("trae/")}
+    assert ids == {"trae/dyn-a", "trae/dyn-b"}  # 静态 32 条被动态表替换
+    assert reg.trae_entries()[0] == {"id": "dyn-a", "name": "DynA", "context_length": 2048}
+    # 失败保留上次快照
+    class Boom:
+        def fetch_models(self):
+            raise T.TraeAPIError("boom", status=500)
+    reg.trae_credential_getter = lambda: Boom()
+    assert reg.refresh_trae_models() is False
+    assert {i for i in reg.snapshot_ids() if i.startswith("trae/")} == {"trae/dyn-a", "trae/dyn-b"}
+    # 无 Trae 账号 → 静默保留
+    reg.trae_credential_getter = lambda: None
+    assert reg.refresh_trae_models() is False
+    assert "trae/dyn-a" in reg.snapshot_ids()
+
+
+def test_registry_kill_switch_hides_trae(monkeypatch):
+    import os
+    reg = _registry()
+    reg.ensure_trae_builtin()
+    monkeypatch.setenv("CODEBUDDY_ENABLE_TRAE", "0")
+    assert all(not m.startswith("trae/") for m in reg.enabled_models())
+    assert all(m.get("backend") != "trae" for m in reg.snapshot()["models"])
+
+
+# ---- e2e：模型禁用 + 404 软冷却 ----
+
+async def _e2e_disable_trae_model(self):
+    headers = await self.login_admin()
+    # 管理页禁用 trae/glm-5.2
+    r = await self.client.patch("/admin/api/models/trae/glm-5.2", json={"enabled": False}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert "trae/glm-5.2" not in self.app.state.model_registry.enabled_models()
+    # /v1/models 不再出现
+    models = (await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})).json()["data"]
+    assert "trae/glm-5.2" not in [m["id"] for m in models]
+    # 调用被中间件拒绝（400，不打上游）
+    self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
+    r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
+                               json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400 and "禁用" in r.json()["detail"]
+    # 恢复启用
+    r = await self.client.patch("/admin/api/models/trae/glm-5.2", json={"enabled": True}, headers=headers)
+    assert r.status_code == 200
+    assert "trae/glm-5.2" in self.app.state.model_registry.enabled_models()
+
+
+async def _e2e_trae_404_soft_cooldown(self):
+    self.patch_upstream(lambda req: httpx.Response(404, content=b'{"message":"config not found"}'))
+    aid = self.trae_aid()
+    r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
+                               json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 404
+    status = self.app.state.store.data["account_status"][aid]
+    # 软冷却：cooldown_until 置位、不计入连续失败、不触发积分重查
+    assert status["cooldown_until"] > time.time()
+    assert not status.get("consecutive_fails")
+    assert "404" in (status.get("last_error") or "")
+
+
+TraeEndToEnd.test_e2e_disable_trae_model = _e2e_disable_trae_model
+TraeEndToEnd.test_e2e_trae_404_soft_cooldown = _e2e_trae_404_soft_cooldown
+
+async def _e2e_batch_checkin_covers_trae(self):
+    # 批量签到覆盖 Trae 账号（ug 接口），错峰关掉避免测试睡眠。
+    pool = self.app.state.pool
+    self.app.state.store.data["pool"]["batch_spread"] = 0
+    state = {"claimed": False}
+
+    def handler(req):
+        if req.url.path.endswith("/checkin_credits/status"):
+            return httpx.Response(200, json={"checked_in": state["claimed"], "credits": 0, "enable": True})
+        if req.url.path.endswith("/checkin_credits/claim"):
+            state["claimed"] = True
+            return httpx.Response(200, json={})
+        if req.url.path.endswith("/ide_user_ent_usage"):
+            return httpx.Response(200, json={"user_entitlement_pack_list": [
+                {"entitlement_base_info": {"quota": {"credits_limit": 7}}}]})
+        return httpx.Response(404)
+
+    real = _REAL_SYNC_CLIENT
+    self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+    try:
+        result = await pool.batch("checkin")
+    finally:
+        self.admin_server.httpx.Client = real
+    by_id = {r["id"]: r for r in result["results"]}
+    trae_result = by_id[self.trae_aid()]
+    assert trae_result["ok"] is True, trae_result
+    assert trae_result["remaining"] == 7.0
+    assert self.app.state.store.data["account_status"][self.trae_aid()]["checkin_date"]
+
+
+async def _e2e_dynamic_catalog_replaces_static(self):
+    headers = await self.login_admin()
+
+    def handler(req):
+        if req.url.path.endswith("/get_detail_param"):
+            return httpx.Response(200, json={"config_info_list": [
+                {"config_name": "dyn-x", "display_config": {"display_name": "Dyn X"}}]})
+        return httpx.Response(404)
+
+    real = _REAL_SYNC_CLIENT
+    self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+    try:
+        r = await self.client.post("/admin/api/models/refresh", headers=headers)
+    finally:
+        self.admin_server.httpx.Client = real
+    assert r.status_code == 200, r.text
+    # 动态表替换静态表：/v1/models 只剩 trae/dyn-x
+    models = (await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})).json()["data"]
+    assert [m["id"] for m in models if m["id"].startswith("trae/")] == ["trae/dyn-x"]
+    # 管理页模型表出现 Trae 行
+    overview = await self.client.get("/admin/api/overview", headers=headers)
+    trae_rows = [m for m in overview.json()["models"]["models"] if m.get("backend") == "trae"]
+    assert [m["id"] for m in trae_rows] == ["trae/dyn-x"]
+    # map_model 接受动态 id：chat 路由不再 400
+    self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
+    r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
+                               json={"model": "trae/dyn-x", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    # 静态 glm-5.2 不在动态表里 → 未知模型 400
+    r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
+                               json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+
+
+TraeEndToEnd.test_e2e_batch_checkin_covers_trae = _e2e_batch_checkin_covers_trae
+TraeEndToEnd.test_e2e_dynamic_catalog_replaces_static = _e2e_dynamic_catalog_replaces_static

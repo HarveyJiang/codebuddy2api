@@ -47,6 +47,11 @@ def backend_name_for(model) -> str:
     return "workbuddy"
 
 
+def trae_enabled() -> bool:
+    """kill switch：CODEBUDDY_ENABLE_TRAE=0 时全链路禁用 Trae（模型列表/路由/目录）。"""
+    return os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") != "0"
+
+
 def resolve_backend(model) -> tuple[BackendSpec, str]:
     """返回 (spec, upstream_model)。
 
@@ -55,7 +60,7 @@ def resolve_backend(model) -> tuple[BackendSpec, str]:
     其余 → WorkBuddyBackend + 原模型名（空/auto 由各端点自行 setdefault）。
     """
     if isinstance(model, str) and model.startswith(TRAE_PREFIX):
-        if os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") == "0":
+        if not trae_enabled():
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -102,5 +107,5 @@ def make_credential(path):
 
 
 def trae_model_ids() -> list[str]:
-    """Trae 静态模型表的 id 列表（32 条 config_name）。"""
-    return [m["id"] for m in _trae_module().TRAE_STATIC_MODELS]
+    """Trae 模型表的 id 列表（动态表优先，静态 32 条兜底）。"""
+    return [m["id"] for m in _trae_module().trae_model_catalog()]

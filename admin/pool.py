@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from core.backends.registry import backend_name_for
+from core.backends.trae import TraeAPIError
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
@@ -264,7 +265,13 @@ class AccountPool:
             data = self.store.data["account_status"].setdefault(aid, {})
             data["request_count"] = data.get("request_count", 0) + 1
             data["last_request"] = int(self.clock())
-            if status in (401, 403, 402, 429):
+            backend = self.store.data["accounts"][aid].get("backend", "workbuddy")
+            if status == 404 and backend == "trae":
+                # Trae 404＝该 config_name 不存在/不可用：软冷却 10 分钟，不计入连续失败
+                # （账号本身通常是好的，不升级到 2h 硬冷却）。
+                data.update(cooldown_until=self.clock() + 600,
+                            last_error="模型不可用（404），已软冷却 10 分钟")
+            elif status in (401, 403, 402, 429):
                 # 指数退避：连续失败翻倍冷却时长，上限 2 小时；成功请求重置计数。
                 fails = data.get("consecutive_fails", 0) + 1
                 data["consecutive_fails"] = fails
@@ -339,9 +346,9 @@ class AccountPool:
                         manager._refresh()
                     self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
-                # Trae 账号（v1）：刷新走 ExchangeToken 已支持；积分/签到暂不支持。
+                # Trae 账号：刷新（上方）走 ExchangeToken；积分/签到走 ug 接口。
                 if item.get("backend", "workbuddy") == "trae":
-                    return {"id": aid, "ok": False, "message": "Trae 账号暂不支持积分查询与签到（v1）"}
+                    return self._operate_trae(aid, manager, action)
                 headers = manager.get_headers()
                 if "workbuddy.ai" in str(headers.get("X-Domain", "")).lower():
                     return {"id": aid, "ok": False, "message": "当前仅支持国内账号积分与签到"}
@@ -380,11 +387,58 @@ class AccountPool:
                 if e.status in (401, 403):
                     self.update(aid, cooldown_until=self.clock()+300)
                 return {"id": aid, "ok": False, "message": str(e)}
+            except TraeAPIError as e:
+                # Trae ug 接口失败：401/403＝凭据失效（冷却 + 标记待重新授权），其余原样暴露。
+                if e.status in (401, 403):
+                    self.update(aid, auth_invalid=True, cooldown_until=self.clock() + 300,
+                                last_error="Trae 登录凭据已失效，请重新授权")
+                    return {"id": aid, "ok": False, "message": "Trae 登录凭据已失效，请重新授权"}
+                self.update(aid, last_error=str(e))
+                return {"id": aid, "ok": False, "message": str(e)}
             except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError):
                 # Do not expose raw refresh responses or bearer credentials.
                 message = "操作失败：请检查登录凭据或网络，必要时重新授权"
                 self.update(aid, last_error=message)
                 return {"id": aid, "ok": False, "message": message}
+
+    def _operate_trae(self, aid, manager, action):
+        """Trae 账号的积分/签到：ug 接口（checkin_credits status/claim + ide_user_ent_usage）。
+
+        与 WorkBuddy 路径同构：先查签到状态 → 按需执行签到 → 拉积分余额。
+        签到查询失败不阻断积分拉取（action=checkin 除外，必须显式报错）。
+        """
+        today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
+        message = "积分状态已更新"
+        with self.client_factory() as client:
+            checkin_error = None
+            try:
+                ci = manager.checkin_status(client)
+                if ci["checked"]:
+                    self.update(aid, checkin_date=today)
+                if action == "checkin":
+                    if ci["checked"]:
+                        message = "今日已签到，无需重复签到"
+                    elif not ci["enable"]:
+                        message = "当前没有可参与的签到活动"
+                    else:
+                        manager.checkin_claim(client)
+                        ci = manager.checkin_status(client)
+                        if not ci["checked"]:
+                            raise BillingError("签到已提交，但上游尚未确认；请刷新状态")
+                        self.update(aid, checkin_date=today)
+                        message = "签到成功"
+            except (BillingError, httpx.HTTPError):
+                if action == "checkin":
+                    raise
+                checkin_error = "签到状态暂时无法查询"
+            remain = manager.user_ent_usage(client)
+            # remain>0 说明至少有一个权益包；为 0 时不置 packages（避免把「无权益包」
+            # 误判成 exhausted，真实耗尽由上游 1005→402 冷却兜底）。
+            self.update(aid, remaining=float(remain), packages=1 if remain > 0 else 0,
+                        credits_updated=int(self.clock()), auth_invalid=False, last_error=checkin_error)
+            if remain > 0 and action == "checkin":
+                self.update(aid, cooldown_until=0)
+            return {"id": aid, "ok": True, "message": message, "remaining": float(remain)}
 
     async def batch(self, action):
         if self.jobs.locked():
@@ -435,7 +489,8 @@ class AccountPool:
         now = datetime.fromtimestamp(self.clock(), CN)
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
-            due = [aid for aid, item in self.store.data["accounts"].items() if item.get("backend", "workbuddy") == "workbuddy" and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
+            # 自动签到覆盖两后端（WorkBuddy 走 billing，Trae 走 ug checkin_credits）。
+            due = [aid for aid, item in self.store.data["accounts"].items() if item.get("backend", "workbuddy") in ("workbuddy", "trae") and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
         if cfg["auto_checkin"]:
             for aid in due:
                 _, due_time = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), 0)
@@ -619,7 +674,7 @@ class PoolMiddleware:
                             code = err.get("code") if isinstance(err, dict) else None
                             if isinstance(code, str) and code.isdigit():
                                 code = int(code)
-                            if code in (401, 402, 403, 429):
+                            if code in (401, 402, 403, 404, 429):
                                 status = code
                         except (ValueError, AttributeError):
                             pass

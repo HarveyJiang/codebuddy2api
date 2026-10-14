@@ -102,12 +102,45 @@ TRAE_STATIC_MODELS = [
     )
 ]
 
-_TRAE_MODEL_IDS = {m["id"] for m in TRAE_STATIC_MODELS}
-_TRAE_MODEL_IDS_LOWER = {m["id"].lower(): m["id"] for m in TRAE_STATIC_MODELS}
+# ---------------------------------------------------------------------------
+# 模型目录：动态表（get_detail_param）优先，静态 32 条兜底
+# ---------------------------------------------------------------------------
+
+_CATALOG_PROVIDER = None
+
+
+def set_catalog_provider(provider):
+    """注入动态模型表提供者（admin ModelRegistry 用）。
+
+    provider: 无参 callable，返回 [{"id","name","context_length"}]（bare config_name）
+    或 None/空（回落静态表）。异常同样回落静态表。
+    """
+    global _CATALOG_PROVIDER
+    _CATALOG_PROVIDER = provider
+
+
+def trae_model_catalog() -> list[dict]:
+    """当前生效的 Trae 模型目录（动态优先，静态兜底）。"""
+    if _CATALOG_PROVIDER is not None:
+        try:
+            dynamic = _CATALOG_PROVIDER()
+        except Exception:
+            dynamic = None
+        if dynamic:
+            return list(dynamic)
+    return TRAE_STATIC_MODELS
 
 
 class UnknownTraeModel(Exception):
     """客户端请求了静态模型表里没有的 Trae 模型。"""
+
+
+class TraeAPIError(RuntimeError):
+    """Trae ug/api 调用失败（模型表 / 签到 / 积分）。status 为 HTTP 状态码（可选）。"""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def normalize_model_name(s: str) -> str:
@@ -140,13 +173,16 @@ def map_model(model: str) -> str:
         return DEFAULT_CONFIG_NAME
     if "__" in name:
         name = name.split("__", 1)[0]
-    if name in _TRAE_MODEL_IDS:
+    catalog = trae_model_catalog()
+    ids = {m["id"] for m in catalog}
+    if name in ids:
         return name
     norm = normalize_model_name(name)
-    if norm in _TRAE_MODEL_IDS:
+    if norm in ids:
         return norm
     # 大小写不敏感兜底（只影响原本会失败的请求）
-    return _TRAE_MODEL_IDS_LOWER.get(name.lower()) or _TRAE_MODEL_IDS_LOWER.get(norm.lower()) or _unknown(name, model)
+    lower = {m["id"].lower(): m["id"] for m in catalog}
+    return lower.get(name.lower()) or lower.get(norm.lower()) or _unknown(name, model)
 
 
 def _unknown(name, original):
@@ -359,6 +395,104 @@ def get_user_info(client: httpx.Client, api_host: str, token: str) -> tuple[str,
 
 
 # ---------------------------------------------------------------------------
+# ug API：动态模型表 / 签到 / 积分（对应 Go FetchModels / Checkin* / UserEntUsage）
+# 头集合对应 Go UgHeaders：Authorization + X-User-Region + X-Device-Id。
+# ---------------------------------------------------------------------------
+
+FETCH_MODELS_BODY = {
+    "function": FUNCTION,
+    "config_names": None,
+    "need_prompt": False,
+    "current_config_info": None,
+    "poly_prompt": True,
+    "mode_type": None,
+    "agent_type": None,
+}
+
+
+def _pick(data, key):
+    """ug/SOLO 响应取值：依次尝试顶层、Result、data 包装（实测形态不固定，全部兼容）。"""
+    if not isinstance(data, dict):
+        return None
+    for scope in (data, data.get("Result"), data.get("data")):
+        if isinstance(scope, dict) and key in scope:
+            return scope[key]
+    return None
+
+
+def fetch_models(client: httpx.Client, headers: dict, agent_host: str | None = None) -> list[dict]:
+    """拉 SOLO 动态模型表（get_detail_param）。返回 [{id,name,context_length}]；空表抛 TraeAPIError。"""
+    host = agent_host or AGENT_HOST
+    r = client.post(host + EP_MODELS, headers=headers, json=FETCH_MODELS_BODY)
+    if r.status_code != 200:
+        raise TraeAPIError(f"模型表接口返回 HTTP {r.status_code}", status=r.status_code)
+    try:
+        data = r.json()
+    except ValueError:
+        raise TraeAPIError("模型表接口返回非 JSON")
+    out = []
+    for cfg in _pick(data, "config_info_list") or []:
+        if not isinstance(cfg, dict):
+            continue
+        cid = str(cfg.get("config_name") or "").strip()
+        if not cid:
+            continue
+        display = cfg.get("display_config") if isinstance(cfg.get("display_config"), dict) else {}
+        out.append({"id": cid, "name": str(display.get("display_name") or cid), "context_length": _CTX})
+    if not out:
+        raise TraeAPIError("模型表接口返回空列表")
+    return out
+
+
+def checkin_status(client: httpx.Client, headers: dict, ug_host: str | None = None) -> dict:
+    """查询签到状态。返回 {checked, credits, enable}。"""
+    host = ug_host or UG_HOST
+    r = client.post(host + EP_CHECKIN_STATUS, headers=headers, json={})
+    if r.status_code != 200:
+        raise TraeAPIError(f"签到状态接口返回 HTTP {r.status_code}", status=r.status_code)
+    try:
+        data = r.json()
+    except ValueError:
+        raise TraeAPIError("签到状态接口返回非 JSON")
+    try:
+        credits = int(_pick(data, "credits") or 0)
+    except (TypeError, ValueError):
+        credits = 0
+    return {"checked": bool(_pick(data, "checked_in")), "credits": credits, "enable": bool(_pick(data, "enable"))}
+
+
+def checkin_claim(client: httpx.Client, headers: dict, ug_host: str | None = None) -> None:
+    """执行签到。失败抛 TraeAPIError。"""
+    host = ug_host or UG_HOST
+    r = client.post(host + EP_CHECKIN_CLAIM, headers=headers, json={})
+    if r.status_code != 200:
+        raise TraeAPIError(f"签到接口返回 HTTP {r.status_code}", status=r.status_code)
+
+
+def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None) -> int:
+    """聚合剩余积分（user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit 求和）。"""
+    host = ug_host or UG_HOST
+    r = client.post(host + EP_ENT_USAGE, headers=headers, json={})
+    if r.status_code != 200:
+        raise TraeAPIError(f"积分接口返回 HTTP {r.status_code}", status=r.status_code)
+    try:
+        data = r.json()
+    except ValueError:
+        raise TraeAPIError("积分接口返回非 JSON")
+    remain = 0
+    for pack in _pick(data, "user_entitlement_pack_list") or []:
+        if not isinstance(pack, dict):
+            continue
+        base = pack.get("entitlement_base_info") if isinstance(pack.get("entitlement_base_info"), dict) else {}
+        quota = base.get("quota") if isinstance(base.get("quota"), dict) else {}
+        try:
+            remain += int(quota.get("credits_limit") or 0)
+        except (TypeError, ValueError):
+            continue
+    return remain
+
+
+# ---------------------------------------------------------------------------
 # 凭据管理（对应 Go internal/auth.Auth + client.RefreshToken）
 # ---------------------------------------------------------------------------
 
@@ -485,11 +619,47 @@ class TraeCredentialManager:
             h["X-Device-Id"] = device_id
         return h
 
-    def get_headers(self) -> dict:
+    def get_headers(self, stream: bool = True) -> dict:
         with self._lock:
             if self._is_expired():
                 self._refresh()
-            return self._solo_headers(stream=True)
+            return self._solo_headers(stream=stream)
+
+    # -- ug API（动态模型表 / 签到 / 积分） --
+
+    def ug_headers(self) -> dict:
+        """签到/积分（api.trae.cn）头：确保 token 新鲜后构造（对应 Go UgHeaders）。"""
+        with self._lock:
+            if self._is_expired():
+                self._refresh()
+            auth = self._auth()
+            token = str(auth.get("accessToken") or "")
+            h = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": CLIENT_UA,
+                "Authorization": f"Cloud-IDE-JWT {token}",
+                "X-User-Region": "CN",
+            }
+            device_id = str(auth.get("deviceId") or "")
+            if device_id:
+                h["X-Device-Id"] = device_id
+            return h
+
+    def fetch_models(self) -> list[dict]:
+        """拉动态模型表（SOLO 头、Accept: application/json；token 自动刷新）。"""
+        headers = self.get_headers(stream=False)
+        with httpx.Client(timeout=20) as client:
+            return fetch_models(client, headers)
+
+    def checkin_status(self, client) -> dict:
+        return checkin_status(client, self.ug_headers())
+
+    def checkin_claim(self, client) -> None:
+        return checkin_claim(client, self.ug_headers())
+
+    def user_ent_usage(self, client) -> int:
+        return user_ent_usage(client, self.ug_headers())
 
     def summary(self) -> dict:
         acct = self._account()

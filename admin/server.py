@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 from core import converter
-from core.backends.registry import make_credential, trae_model_ids
+from core.backends.registry import make_credential
 from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
@@ -180,6 +180,14 @@ class Store:
                     return self.manager_for(aid, item)
             return None
 
+    def any_trae_manager(self):
+        """任一启用的 Trae 账号凭据管理器（动态模型表 / 签到 / 积分用）。"""
+        with self.lock:
+            for aid, item in self.data["accounts"].items():
+                if item["enabled"] and item.get("backend", "workbuddy") == "trae":
+                    return self.manager_for(aid, item)
+            return None
+
     def account_rows(self):
         result = []
         for aid, item in self.data["accounts"].items():
@@ -331,8 +339,9 @@ class AdminMiddleware:
 
 
 def _stale_catalog(registry):
-    """缓存 catalog 是否为旧格式（描述含英文、或未按单价升序）时需重新拉取。"""
-    models = registry.snapshot().get("models") or []
+    """缓存 catalog 是否为旧格式（描述含英文、或未按单价升序）时需重新拉取。
+    只检查 WorkBuddy 行——Trae 行无单价、固定排在后面，不参与排序判断。"""
+    models = [m for m in (registry.snapshot().get("models") or []) if m.get("backend") != "trae"]
     if not models:
         return False
     for entry in models:
@@ -353,9 +362,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
     metrics = RequestMetrics()
-    model_registry = ModelRegistry(get_credential=store.any_enabled_manager)
+    model_registry = ModelRegistry(get_credential=store.any_enabled_manager,
+                                   trae_credential_getter=store.any_trae_manager)
     model_registry.import_state(store.data.get("model_registry"))
     model_registry.ensure_builtin()
+    # Trae 模型目录：动态表由 registry 拉取维护，bare id 经提供者暴露给
+    # core.backends.trae（map_model / 模型列表）；无动态表时用静态 32 条兜底。
+    model_registry.ensure_trae_builtin()
+    from core.backends import trae as trae_module
+    trae_module.set_catalog_provider(model_registry.trae_entries)
     # 缓存里的描述是旧逻辑（中文+英文拼接、上游原始顺序）时重新拉取一次，
     # 让展示立即变成「只有中文 + 按单价升序」。
     if _stale_catalog(model_registry):
@@ -383,7 +398,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         pool_task = asyncio.create_task(pool_worker())
         async def models_worker():
             # 每天在 04:00-05:00 之间随机选一分钟刷新模型配置（上游免鉴权接口，
-            # 低峰期随机时刻，避免固定时间打点）。
+            # 低峰期随机时刻，避免固定时间打点）。WorkBuddy 与 Trae 两张表都刷。
             while True:
                 now = datetime.now(CN)
                 next_run = (now + timedelta(days=1)).replace(hour=4, minute=random.randint(0, 59), second=random.randint(0, 59), microsecond=0)
@@ -393,6 +408,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                         next_run = today
                 await asyncio.sleep(max(60, (next_run - now).total_seconds()))
                 model_registry.fetch()
+                try:
+                    model_registry.refresh_trae_models()
+                except Exception:
+                    pass
                 with store.lock:
                     store.data["model_registry"] = model_registry.export_state()
                     store.save()
@@ -424,11 +443,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     _original_available_models = converter.get_available_models  # 捕获原函数，防自递归
 
     def _managed_models():
+        # WorkBuddy 动态表 + Trae 目录（trae/ 前缀）均由 ModelRegistry 统一管理
+        #（含管理页禁用）；kill switch 时 registry 自动剔除 Trae 条目。
         models = model_registry.enabled_models()
-        base = list(models or _original_available_models())
-        if os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") != "0":
-            base += [f"trae/{mid}" for mid in trae_model_ids()]
-        return base
+        return list(models or _original_available_models())
     converter.get_available_models = _managed_models
     app.add_middleware(AdminMiddleware)
     app.add_middleware(PoolMiddleware, pool=pool, model_registry=model_registry)
@@ -543,15 +561,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def models_refresh(req: Request):
         store.require_admin(req)
         ok = await asyncio.to_thread(model_registry.fetch)
+        # Trae 动态表独立刷新：失败不影响 WorkBuddy 表，反之亦然。
+        trae_ok = await asyncio.to_thread(model_registry.refresh_trae_models)
         with store.lock:
             store.data["model_registry"] = model_registry.export_state()
             store.save()
         snapshot = model_registry.snapshot()
-        if not ok:
+        if not ok and not trae_ok:
             raise HTTPException(502, snapshot.get("error") or "拉取失败")
         return {"ok": True, "count": len(snapshot["models"])}
 
-    @app.patch("/admin/api/models/{mid}")
+    # mid 用 :path——Trae 模型 id 带斜杠（trae/glm-5.2），单段 {mid} 匹配不到。
+    @app.patch("/admin/api/models/{mid:path}")
     async def model_toggle(mid: str, req: Request):
         store.require_admin(req)
         body = await payload(req)
