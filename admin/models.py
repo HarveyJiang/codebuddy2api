@@ -58,7 +58,10 @@ class ModelRegistry:
         """get_credential: callable returning a manager whose get_headers() yields auth headers."""
         self.get_credential = get_credential
         self.clock = clock
-        self._lock = threading.Lock()
+        # RLock: snapshot() 持锁调用 active_promo()，后者经模块级引用回到
+        # promotions 属性再次取锁，非重入锁会自死锁，导致 /admin/api/overview
+        # 永久挂起（登录成功但账号/模型全部加载不出）。
+        self._lock = threading.RLock()
         self._catalog = {}      # id -> {name, description, credits, max_input_tokens, source}
         self._available = []    # ordered ids from the upstream cli agent
         self._disabled = set()  # user-disabled ids
@@ -343,7 +346,11 @@ def active_promo(mid, now=None):
         return best
 
     registry = _registry_ref[0] if _registry_ref[0] is not None else None
-    best = _hit(registry.promotions if registry is not None else [])
+    if registry is None:
+        return _hit(PROMOTIONS)
+    with registry._lock:
+        promos = list(registry._promotions)
+    best = _hit(promos)
     if best is None:
         best = _hit(PROMOTIONS)
     return best

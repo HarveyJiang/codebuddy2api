@@ -1,6 +1,7 @@
 """Model registry: upstream pull, builtin fallback, enable/disable management."""
 import json
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -45,6 +46,27 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertIsNone(_credits_multiplier(""))
         self.assertIsNone(_credits_multiplier(None))
 
+    def test_snapshot_does_not_deadlock_with_promotions(self):
+        """snapshot() 持锁期间调用 active_promo() → promotions 再取锁。
+        非重入锁会自死锁，表现为 /admin/api/overview 永久挂起。"""
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = upstream_payload()
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+        done = threading.Event()
+
+        def call():
+            snap = registry.snapshot()
+            self.assertTrue(snap["models"])
+            done.set()
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        if not done.wait(timeout=5):
+            self.fail("snapshot() 自死锁：active_promo 在持锁时回取 promotions 锁")
+
     def test_fetch_parses_upstream_and_skips_disabled(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         response = unittest.mock.Mock(status_code=200)
@@ -54,8 +76,10 @@ class ModelRegistryTests(unittest.TestCase):
             self.assertTrue(registry.fetch())
         snap = registry.snapshot()
         ids = [m["id"] for m in snap["models"]]
-        # disabled 上游模型与不在 cli agent 列表里的 ghost 均不出现。
-        self.assertEqual(ids, ["glm-5.2", "step-5-preview", "space-bunny"])
+        # disabled 上游模型与不在 cli agent 列表里的 ghost 均不出现；
+        # 三档智能路由固定附加在末尾。
+        self.assertEqual(ids, ["glm-5.2", "step-5-preview", "space-bunny",
+                               "fast-model", "balanced-model", "deep-model"])
         glm = snap["models"][0]
         self.assertEqual(glm["credits"], 0.79)
         self.assertEqual(glm["max_input_tokens"], 1000000)
