@@ -99,17 +99,31 @@ class ModelRegistry:
     def fetch(self):
         """Pull the live product config. Returns True on success. Never raises.
 
-        Endpoint: GET https://www.workbuddy.cn/v3/config — free of auth but
-        requires the official CLI User-Agent (fake tokens pass; the gateway
-        checks UA, not the bearer). The desktop client caches this response to
-        .workbuddy/cache/acc-product-config-v3.json. Returns data.agents (the
-        cli agent's models array is the official UI menu), data.models
-        (credits/maxInputTokens/description...) and data.modelPromotions.
+        Endpoint: GET https://www.workbuddy.cn/v3/config — the gateway checks the
+        CLI User-Agent (a fake bearer alone is not enough): without valid account
+        credentials it answers with an empty shell (agents/models all null), so
+        an enabled account's headers are sent when available. The desktop client
+        caches this response to .workbuddy/cache/acc-product-config-v3.json. It
+        carries data.agents (the cli agent's models array is the official UI
+        menu), data.models (credits/maxInputTokens/description...) and
+        data.modelPromotions.
         """
         try:
+            headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+            # 未登录时上游只返回空壳（agents/models 全为 null），必须带账号凭据。
+            manager = None
+            if self.get_credential is not None:
+                try:
+                    manager = self.get_credential()
+                except Exception:
+                    manager = None
+            if manager is not None:
+                try:
+                    headers.update(manager.get_headers())
+                except Exception:
+                    pass
             with httpx.Client(timeout=FETCH_TIMEOUT) as client:
-                response = client.get(CONFIG_URL, headers={"User-Agent": USER_AGENT,
-                                                           "Accept": "application/json"})
+                response = client.get(CONFIG_URL, headers=headers)
             if response.status_code != 200:
                 self._record(f"配置接口返回 {response.status_code}")
                 return False
@@ -122,6 +136,9 @@ class ModelRegistry:
             agents = payload.get("agents") or []
             if not isinstance(models, list) or not isinstance(agents, list):
                 self._record("配置缺少 models/agents 字段")
+                return False
+            if not agents:
+                self._record("上游返回空配置（凭据可能已失效，请重新授权账号）")
                 return False
             by_id = {m.get("id"): m for m in models if isinstance(m, dict) and m.get("id")}
             cli_ids = next((a.get("models") for a in agents

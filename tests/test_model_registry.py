@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent)]
 
-from admin.models import ModelRegistry, BUILTIN_ORDER, BUILTIN_MODELS, PROMOTIONS, active_promo, CN, _credits_multiplier
+from admin.models import ModelRegistry, BUILTIN_ORDER, BUILTIN_MODELS, PROMOTIONS, USER_AGENT, active_promo, CN, _credits_multiplier
 
 
 class FakeManager:
@@ -67,6 +67,19 @@ class ModelRegistryTests(unittest.TestCase):
         if not done.wait(timeout=5):
             self.fail("snapshot() 自死锁：active_promo 在持锁时回取 promotions 锁")
 
+    def test_fetch_empty_shell_reports_credential_hint(self):
+        # 上游对无凭据请求返回 {"code":0,"data":{"agents":null,"models":null}}
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = {"code": 0, "data": {"agent": {"agents": None}, "models": None}}
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            self.assertFalse(registry.fetch())
+        self.assertIn("凭据", registry.snapshot()["error"])
+        # 失败保留内置列表，不崩溃。
+        registry.ensure_builtin()
+        self.assertEqual(registry.enabled_models(), BUILTIN_ORDER)
+
     def test_fetch_parses_upstream_and_skips_disabled(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         response = unittest.mock.Mock(status_code=200)
@@ -74,6 +87,10 @@ class ModelRegistryTests(unittest.TestCase):
         with patch("admin.models.httpx.Client") as client_cls:
             client_cls.return_value.__enter__.return_value.get.return_value = response
             self.assertTrue(registry.fetch())
+            # 未登录时上游只返回空壳，必须带账号凭据（Authorization）请求。
+            sent = client_cls.return_value.__enter__.return_value.get.call_args.kwargs["headers"]
+            self.assertEqual(sent.get("Authorization"), "Bearer token")
+            self.assertEqual(sent.get("User-Agent"), USER_AGENT)
         snap = registry.snapshot()
         ids = [m["id"] for m in snap["models"]]
         # disabled 上游模型与不在 cli agent 列表里的 ghost 均不出现；
