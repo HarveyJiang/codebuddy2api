@@ -1066,6 +1066,9 @@ def test_feature_rate_prefers_discount_then_base():
 
 def test_fetch_remote_models_parses_menu_and_dedupes():
     payload = _menu(
+        ("solo_design_remote", [  # 同名不同值：应被 work 组覆盖
+            {"name": "glm-5.3", "display_name": "GLM-5.3(design)", "context_window_tokens": {"dev": 232768},
+             "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.9}}}'}]),
         ("solo_work_remote", [
             {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000},
              "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'},
@@ -1080,6 +1083,7 @@ def test_fetch_remote_models_parses_menu_and_dedupes():
     with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
         models = T.fetch_remote_models(client, {})
     assert [m["id"] for m in models] == ["glm-5.3", "Doubao-Seed-Code"]
+    # work 组优先 → 取 work 的上下文/倍率，且组内去重
     assert models[0] == {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}
     assert models[1]["credits"] == 0.03
 

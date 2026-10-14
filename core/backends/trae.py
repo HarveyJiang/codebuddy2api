@@ -52,6 +52,9 @@ EP_MODELS = "/api/ide/v1/get_detail_param"
 REMOTE_MODELS_HOST = "https://work.trae.cn"
 EP_REMOTE_MODELS = "/api/remote/v1/models"
 REMOTE_MODELS_FUNCTIONS = "solo_agent_remote,solo_work_remote,solo_design_remote"
+# 同名模型在不同 function 组里的上下文/倍率可能不同（实测 design=232768 vs work/agent=256000），
+# 按优先级取首个，保证结果确定；本网关走 solo_work_lite，故 work 组优先。
+REMOTE_MODELS_FUNCTION_ORDER = ("solo_work_remote", "solo_agent_remote", "solo_design_remote")
 EP_EXCHANGE = "/cloudide/api/v3/trae/oauth/ExchangeToken"
 EP_USERINFO = "/cloudide/api/v3/trae/GetUserInfo"
 EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
@@ -505,9 +508,10 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
     if isinstance(data, dict) and data.get("code") not in (None, 0):
         raise TraeAPIError(f"模型菜单接口返回 code={data.get('code')}")
     out, seen = [], set()
-    for group in ((data or {}).get("data") or {}).get("list") or []:
-        if not isinstance(group, dict):
-            continue
+    groups = [g for g in ((data or {}).get("data") or {}).get("list") or [] if isinstance(g, dict)]
+    order = {fn: i for i, fn in enumerate(REMOTE_MODELS_FUNCTION_ORDER)}
+    groups.sort(key=lambda g: order.get(str(g.get("function") or ""), len(order)))
+    for group in groups:
         for item in group.get("models") or []:
             if not isinstance(item, dict):
                 continue
