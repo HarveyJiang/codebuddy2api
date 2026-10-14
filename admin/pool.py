@@ -93,12 +93,7 @@ class AccountPool:
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "credit_min_interval": 60, "sync_window": ["10:00", "20:00"], "batch_spread": 90,
-                # 排队自动切号：默认关闭。命中排队/繁忙错误时，在尚未向客户端发出任何字节前换号重试。
-                "queue_failover": False,
-                "queue_retry": 3,
-                "queue_cooldown": 60,
-                "queue_patterns": ["排队", "繁忙", "拥堵", "稍后重试", "限流", "busy", "overload", "too many", "queue", "rate limit"]})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "credit_min_interval": 60, "sync_window": ["10:00", "20:00"], "batch_spread": 90})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
@@ -214,57 +209,14 @@ class AccountPool:
             return (-int(status.get("weight", 0)), expiry is None, expiry or 0)
         return sorted(candidates, key=key)
 
-    def is_queue_error(self, status=None, text="", code=None):
-        """判断上游错误是否属于「排队/繁忙/限流」，可换号重试。"""
-        pool = self.store.data.get("pool", {})
-        if status in (429, 503):
-            return True
-        if code is not None and str(code) in {"429", "503", "11101", "11102", "11103", "11001", "50001"}:
-            # 11101 是本项目里「非流式请求不支持」的码，不视为排队；其余上游繁忙码视为可重试
-            if str(code) == "11101":
-                return False
-            return True
-        if text:
-            lowered = str(text).lower()
-            for pattern in pool.get("queue_patterns", []):
-                if pattern and str(pattern).lower() in lowered:
-                    return True
-        return False
-
-    def mark_queued(self, aid, seconds=None):
-        """账号命中排队：短期标记，期间选号优先跳过（非硬冷却）。"""
-        pool = self.store.data.get("pool", {})
-        seconds = int(seconds or pool.get("queue_cooldown", 60))
+    def select(self, affinity_key=None):
         with self.store.lock:
-            if aid not in self.store.data["accounts"]:
-                return
-            data = self.store.data["account_status"].setdefault(aid, {})
-            data["queued_until"] = self.clock() + max(1, seconds)
-            data["last_error"] = f"上游排队，已让位 {seconds} 秒"
-            self.dirty = True
-
-    def select(self, affinity_key=None, exclude=None):
-        exclude = set(exclude or ())
-        with self.store.lock:
-            candidates = [row for row in self.store.account_rows()
-                          if self.state(row) == "available" and row["id"] not in exclude]
+            candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
             if self.store.data["pool"]["routing"] == "manual":
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
             if not candidates:
-                # 全部被排除或不可用时，最后一次机会：忽略 queued 标记（但不忽略冷却/不可用）。
-                # 仅 round_robin 模式做此兜底（排队切号后让位账号可被跳过）；手动模式严格按 active。
-                if self.store.data["pool"]["routing"] != "manual":
-                    candidates = [row for row in self.store.account_rows()
-                                  if self.state(row) == "available" and row["id"] not in exclude]
-                if not candidates:
-                    raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+                raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             now = self.clock()
-            # 排队标记未过期的账号排到最后，优先用未排队的
-            def queued(row):
-                return self.store.data["account_status"].get(row["id"], {}).get("queued_until", 0) > now
-            fresh = [row for row in candidates if not queued(row)]
-            if fresh:
-                candidates = fresh
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
                 if bindings[key].get("expires", 0) <= now:
@@ -606,172 +558,66 @@ class PoolMiddleware:
                 if isinstance(model, str) and model and model not in self.model_registry.enabled_models() and model in self.model_registry.snapshot_ids():
                     raise HTTPException(400, f"模型 {model} 已在管理页禁用")
             affinity_key = request_affinity(headers, body)
-            pool_cfg = self.pool.store.data.get("pool", {})
-            failover_on = bool(pool_cfg.get("queue_failover"))
-            max_tries = max(1, int(pool_cfg.get("queue_retry", 3))) if failover_on else 1
-            tried = []
-            aid, manager = None, None
-            for attempt in range(max_tries):
-                # 每次尝试都用一个新的 replay 闭包，确保能完整重放原始请求体。
-                delivered = False
-                async def replay_receive(raw=raw, delivered_box=[False]):
-                    if not delivered_box[0]:
-                        delivered_box[0] = True
-                        return {"type": "http.request", "body": raw, "more_body": False}
-                    return {"type": "http.disconnect"}
-                receive = replay_receive
-                try:
-                    aid, manager = self.pool.select(affinity_key, exclude=tried)
-                    await asyncio.to_thread(manager.get_headers)
-                    break
-                except HTTPException:
-                    if attempt == 0:
-                        raise
-                    if attempt + 1 >= max_tries:
-                        raise
-                except Exception:
-                    if aid is not None:
-                        self.pool.update(aid, cooldown_until=self.pool.clock() + 300, last_error="凭据暂不可用，已冷却 5 分钟")
-                        tried.append(aid)
-                        aid = None
-                    if attempt + 1 >= max_tries:
-                        return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
+            original_receive = receive
+            delivered = False
+            async def replay_receive():
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": raw, "more_body": False}
+                return await original_receive()
+            receive = replay_receive
+            aid, manager = self.pool.select(affinity_key)
+            # Refresh before entering a stream; retry another eligible account only
+            # if credential preparation fails, never replay a partially emitted response.
+            try:
+                await asyncio.to_thread(manager.get_headers)
+            except Exception:
+                self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
+                aid, manager = self.pool.select(affinity_key)
+                await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
         except Exception:
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
-        if aid is None or manager is None:
-            return await JSONResponse({"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
-
+        token = REQUEST_CREDENTIAL.set(manager)
+        status = 200
+        buffer = b""
         usage_tokens = 0
-
         def extract_usage(obj):
             nonlocal usage_tokens
             usage = obj.get("usage") if isinstance(obj, dict) else None
             total = usage.get("total_tokens") if isinstance(usage, dict) else None
             if isinstance(total, (int, float)):
                 usage_tokens = max(usage_tokens, int(total))  # 流式里 usage 块通常在最后，取最大值即总量
-
-        def sniff_error(payload: bytes):
-            """从响应体里嗅出错误码与错误文案，用于判断是否属于排队/限流。
-            返回 (code, text, has_content)：has_content 表示响应里已经包含真实输出内容，
-            若有内容则即使命中排队也不应换号重放（避免重复输出）。"""
-            code, texts, has_content = None, [], False
-            for line in payload.split(b"\n"):
-                if not line.startswith(b"data:"):
-                    continue
-                try:
-                    obj = json.loads(line[5:])
-                except (ValueError, AttributeError):
-                    continue
-                if obj.get("choices") or (obj.get("response") or {}).get("choices") or obj.get("delta"):
-                    has_content = True
-                extract_usage(obj.get("response") or obj)
-                err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
-                if isinstance(err, dict):
-                    c = err.get("code")
-                    if isinstance(c, str) and c.isdigit():
-                        c = int(c)
-                    if c is not None:
-                        code = c
-                    if err.get("message"):
-                        texts.append(str(err["message"]))
-            return code, " ".join(texts), has_content
-
-        # 排队自动切号：只有在尚未向客户端发出任何字节时才能安全重放请求。
-        # 一旦开始输出内容，便不再切换账号（重复输出会破坏流）。
-        # 排队自动切号：只有在尚未向客户端发出任何字节时才能安全重放请求。
-        # 一旦开始输出内容，便不再切换账号（重复输出会破坏流）。
-        # 实现：扣留 response.start（连同后续 body）做排队判定；判定为排队则换号重放。
-        # 关键安全：无论上游如何响应，middleware 都必须向客户端完成一次完整响应——
-        # 因此在 self.app 返回后，若仍处于扣留状态（start 未发出），finally 会补发。
-        while True:
-            token = REQUEST_CREDENTIAL.set(manager)
-            state = {"status": 200, "buffer": b"", "emitted": False, "held": False,
-                     "queue": False, "code": None, "text": "", "headers": []}
-
-            async def observe(message, _s=state):
-                if message["type"] == "http.response.start":
-                    _s["status"] = message["status"]
-                    _s["headers"] = message.get("headers", [])
-                    if failover_on and not _s["emitted"] and not _s["held"]:
-                        # 扣留响应头，等第一个 body 判定是否排队
-                        _s["held"] = True
-                        return
-                    await send(message)
-                    return
-                if message["type"] == "http.response.body":
-                    payload = message.get("body", b"")
-                    more = message.get("more_body", False)
-                    if _s["held"] and not _s["emitted"]:
-                        # 首包到达即判定：排队错误通常是完整小响应（第一分片就带 error）；
-                        # 正常 SSE 流首包是内容，立即放行（不管 more_body），不再扣留后续。
-                        _s["buffer"] += payload
-                        code, text, has_content = sniff_error(_s["buffer"])
-                        _s["code"], _s["text"] = code, text
-                        if self.pool.is_queue_error(_s["status"], text, code) and not has_content:
-                            _s["queue"] = True  # 交给外层换号重试，本响应不回给客户端
-                            return
-                        _s["held"] = False
-                        _s["emitted"] = True
-                        await send({"type": "http.response.start", "status": _s["status"], "headers": _s["headers"]})
-                        await send({"type": "http.response.body", "body": _s["buffer"], "more_body": more})
-                        return
-                    if not _s["emitted"]:
-                        _s["emitted"] = True
-                    _s["buffer"] = (_s["buffer"] + payload)[-65536:]
-                    for line in _s["buffer"].split(b"\n"):
-                        if not line.startswith(b"data:"):
-                            continue
+        async def observe(message):
+            nonlocal status, buffer
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            if message["type"] == "http.response.body":
+                buffer += message.get("body", b"")
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.startswith(b"data:"):
                         try:
                             obj = json.loads(line[5:])
+                            extract_usage(obj.get("response") or obj)
+                            err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
+                            code = err.get("code") if isinstance(err, dict) else None
+                            if isinstance(code, str) and code.isdigit():
+                                code = int(code)
+                            if code in (401, 402, 403, 429):
+                                status = code
                         except (ValueError, AttributeError):
-                            continue
-                        extract_usage(obj.get("response") or obj)
-                        err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
-                        c = err.get("code") if isinstance(err, dict) else None
-                        if isinstance(c, str) and c.isdigit():
-                            c = int(c)
-                        if c in (401, 402, 403, 429):
-                            _s["status"] = c
-                    await send(message)
-                    return
-                await send(message)
-
-            try:
-                await self.app(scope, receive, observe)
-            finally:
-                REQUEST_CREDENTIAL.reset(token)
-                if state["queue"] and not state["emitted"] and len(tried) + 1 < max_tries:
-                    # 排队且未发出任何内容：标记该账号让位，换下一个账号重放
-                    self.pool.mark_queued(aid)
-                    self.pool.record(aid, 429)
-                    tried.append(aid)
-                    self.pool.flush()
-                    try:
-                        aid, manager = self.pool.select(affinity_key, exclude=tried)
-                        await asyncio.to_thread(manager.get_headers)
-                        continue
-                    except Exception:
-                        return await JSONResponse({"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
-                # 兜底：无论哪种情况（排队重试外的所有路径），必须向客户端完成一次完整响应。
-                # 若仍处于扣留状态（start 未发出），补发 start + body；若 start 已发出但
-                # body 未结束，补空 body 收尾，避免 ASGI「callable returned without
-                # completing response」。
-                if not state["emitted"] and not state["queue"]:
-                    try:
-                        await send({"type": "http.response.start", "status": state["status"], "headers": state["headers"]})
-                        await send({"type": "http.response.body", "body": state["buffer"], "more_body": False})
-                        state["emitted"] = True
-                    except Exception:
-                        pass
-                elif not state["emitted"]:
-                    try:
-                        await send({"type": "http.response.body", "body": b"", "more_body": False})
-                    except Exception:
-                        pass
-                self.pool.record(aid, state["status"])
-                if kid is not None:
-                    self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
-                self.pool.flush()
-                break
+                            pass
+                if len(buffer) > 65536:
+                    buffer = b""
+            await send(message)
+        try:
+            await self.app(scope, receive, observe)
+        finally:
+            REQUEST_CREDENTIAL.reset(token)
+            self.pool.record(aid, status)
+            if kid is not None:
+                self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
+            self.pool.flush()

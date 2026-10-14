@@ -551,31 +551,6 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 0 <= spread <= 600:
                     raise HTTPException(400, "批量签到错峰需在 0-600 秒之间")
                 settings["batch_spread"] = spread
-            if "queue_failover" in body:
-                if type(body["queue_failover"]) is not bool:
-                    raise HTTPException(400, "排队自动切号开关无效")
-                settings["queue_failover"] = body["queue_failover"]
-            if "queue_retry" in body:
-                try:
-                    retry = int(body["queue_retry"])
-                except (TypeError, ValueError):
-                    raise HTTPException(400, "排队重试次数需为整数")
-                if not 1 <= retry <= 10:
-                    raise HTTPException(400, "排队重试次数需在 1-10 之间")
-                settings["queue_retry"] = retry
-            if "queue_cooldown" in body:
-                try:
-                    cooldown = int(body["queue_cooldown"])
-                except (TypeError, ValueError):
-                    raise HTTPException(400, "排队让位时长需为整数秒")
-                if not 5 <= cooldown <= 3600:
-                    raise HTTPException(400, "排队让位时长需在 5-3600 秒之间")
-                settings["queue_cooldown"] = cooldown
-            if "queue_patterns" in body:
-                patterns = body["queue_patterns"]
-                if not isinstance(patterns, list) or not all(isinstance(p, str) and 0 < len(p) <= 40 for p in patterns):
-                    raise HTTPException(400, "排队关键词需为字符串列表（每项 1-40 字符）")
-                settings["queue_patterns"] = patterns[:50]
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}
