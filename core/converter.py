@@ -73,7 +73,9 @@ BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 # 与官方 CLI 一致（admin/models.py 同值）：上游按 UA 识别客户端，
 # 自定 UA 会导致用量接口 client 为空。
-USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
+# 与官方 CLI 对齐（host-ops/docker-factory 部署记录也引用此值）。
+# 上游按调用方身份识别用量记录的 client 字段，UA 是识别要素之一。
+USER_AGENT = "CLI/2.151.0 CodeBuddy/2.151.0"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -215,6 +217,10 @@ class CredentialManager:
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
+            "X-Product": "SaaS",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": f"https://{domain}",
+            "Referer": f"https://{domain}/",
             "User-Agent": USER_AGENT,
         }
         return h
