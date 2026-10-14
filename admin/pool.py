@@ -624,8 +624,11 @@ class AccountPool:
         if now - last < self.USAGE_MANUAL_THROTTLE:
             wait = self.USAGE_MANUAL_THROTTLE - int(now - last)
             raise HTTPException(429, f"该账号刚拉取过，请 {wait} 秒后重试")
-        self._usage_manual_at[aid] = now
+        # 时间戳必须在**拉取成功之后**才写：上游 5xx / 凭据失效是最需要重试的
+        # 场景，失败时把 60 秒窗口消耗掉，用户只会看到「刚拉取过请稍后重试」，
+        # 而实际上什么都没拉到。防连点由 jobs 锁 + 前端冷却承担。
         count = self._pull_upstream_usage(aid, item, start, end)
+        self._usage_manual_at[aid] = now
         self.update(aid, usage_manual_synced_at=int(now))
         return count
 

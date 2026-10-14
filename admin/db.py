@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .models import CN
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MICRO = 1_000_000
 
@@ -44,6 +44,7 @@ ACCOUNT_STATUS_COLUMNS = (
     "checkin_when", "checkin_offset_date", "token_refreshed", "auth_invalid", "refresh_slot",
     "refresh_slot_date", "refresh_window_date", "consecutive_fails", "cooldown_until",
     "request_count", "last_request", "last_error", "usage_synced_at", "usage_sync_error",
+    "usage_manual_synced_at",
 )
 
 ACCOUNT_STATUS_DEFAULTS = {
@@ -78,7 +79,7 @@ KEY_USAGE_KEEP_DAYS = 93     # 与 request_logs 一致
 # 上游用量报表的分组维度 -> SQL 表达式。key 来自白名单，不接受用户输入，可安全拼接。
 UPSTREAM_GROUPS = {
     "day": "date(request_time, 'unixepoch', '+8 hours')",
-    "account": "COALESCE(account_name, account_id, '未知')",
+    "account": "COALESCE(account_id, '未知')",
     "model": "COALESCE(model, '未知')",
     "client": "COALESCE(NULLIF(client, ''), '未知')",
 }
@@ -158,7 +159,8 @@ class Database:
         refresh_slot TEXT, refresh_slot_date TEXT, refresh_window_date TEXT,
         consecutive_fails INTEGER NOT NULL DEFAULT 0, cooldown_until INTEGER,
         request_count INTEGER NOT NULL DEFAULT 0, last_request INTEGER, last_error TEXT,
-        usage_synced_at INTEGER, usage_sync_error TEXT)"""
+        usage_synced_at INTEGER, usage_sync_error TEXT,
+        usage_manual_synced_at INTEGER)"""
 
     KEYS_DDL = """CREATE TABLE IF NOT EXISTS keys (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL, hint TEXT NOT NULL,
@@ -355,7 +357,9 @@ class Database:
 
     # -- migrations ---------------------------------------------------------
     # 第一个值是目标版本：(2, _v1_to_v2) 表示把库升到版本 2。
-    MIGRATIONS = ()
+    # v1→v2 的函数定义在模块末尾（本行之后），由文件底部的
+    # Database.MIGRATIONS = (2, _v1_to_v2) + ... 追加进来。
+    MIGRATIONS = ((3, "_v2_to_v3"),)
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -367,12 +371,13 @@ class Database:
             current = int(rows[0][0])
         except (TypeError, ValueError, IndexError):
             raise RuntimeError(f"state.db 的 schema 版本号不可读：{rows[0][0]!r}")
-        pending = [step for target, step in self.MIGRATIONS if target > current]
+        pending = [(target, step) for target, step in self.MIGRATIONS if target > current]
         if not pending:
             return
         with self.transaction():
-            for step in pending:
-                step(self)
+            for _, step in pending:
+                # 允许登记函数名（定义在类之后时用字符串），也允许直接给函数。
+                (step if callable(step) else globals()[step])(self)
             self._write.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
                 (str(SCHEMA_VERSION),))
@@ -765,18 +770,21 @@ class Database:
         return total - max_rows
 
     # -- key usage daily ---------------------------------------------------
-    def save_key_usage_daily(self, keys, day=None):
+    def save_key_usage_daily(self, keys):
         """把每个 key 的当日累计快照写进历史表（覆盖语义）。
 
         入参是 Store.data["keys"] 全量 dict。keys.usage 本身就是**当日累计值**
-        （换天才 clear），所以这里用 UPSERT 覆盖而非累加：usage 单调递增，
-        后写的值一定 >= 先写的值。副作用是顺带修复「重启丢最后几秒」——
-        重启后下次 flush 会用更大的累计值覆盖回来。
+        （换天才 clear），所以这里是「写当日快照」而不是累加。
 
-        day 不传则按北京时间取当天。usage_date 为空的 key 跳过（避免造空行）。
+        冲突时必须用 MAX 而不是直接覆盖：usage 只在单进程内存里单调递增，
+        **重启后内存清零**，当日计数会从 0 重新累加，此时每次 flush 写回的都
+        是比库里更小的值。直接覆盖会把当天历史改小（实测 5000 -> 1）。
+        MAX 保证只增不减，重启只丢「最后 5 秒未 flush」的增量而不会倒退。
+
+        行的 day 取 usage["date"]（即 key 侧换天的那一天），不取「现在」——
+        跨天后首个请求到来前，旧日期的快照会被再写一次，MAX 语义下无副作用。
+        usage_date 为空的 key 跳过（避免造空行）。
         """
-        if day is None:
-            day = datetime.fromtimestamp(time.time(), CN).strftime("%Y-%m-%d")
         rows = []
         for kid, item in (keys or {}).items():
             usage = item.get("usage") or {}
@@ -793,7 +801,8 @@ class Database:
                 """INSERT INTO key_usage_daily (key_id, day, count, tokens, key_name)
                    VALUES (?,?,?,?,?)
                    ON CONFLICT(key_id, day) DO UPDATE SET
-                     count=excluded.count, tokens=excluded.tokens,
+                     count=MAX(count, excluded.count),
+                     tokens=MAX(tokens, excluded.tokens),
                      key_name=excluded.key_name""", rows)
         return len(rows)
 
@@ -937,7 +946,13 @@ class Database:
             " SUM(CASE WHEN credit_micro = 0 THEN 1 ELSE 0 END) AS free,"
             " SUM(CASE WHEN credit_micro <> 0 THEN 1 ELSE 0 END) AS paid"
             f" FROM upstream_request_usage{where}", params)[0]
+        # 桶总数独立于 limit：前端要能说清「显示的是前 N 组，共 M 组」。
+        bucket_total = self.query(
+            f"SELECT COUNT(DISTINCT {expr}) AS n FROM upstream_request_usage{where}",
+            params)[0]["n"] or 0
         return {"group_by": group_by, "groups": groups,
+                "bucket_total": bucket_total,
+                "truncated": bucket_total > len(groups),
                 "total": {"count": total_row["n"] or 0,
                           "credit": _from_micro(total_row["credit_micro"] or 0),
                           "free": total_row["free"] or 0, "paid": total_row["paid"] or 0}}
@@ -994,6 +1009,23 @@ def _upgrade_keys(keys):
     return result
 
 
+def _v2_to_v3(db):
+    """v2 → v3：给 accounts 补 usage_manual_synced_at 列，并新建 key_usage_daily。
+
+    只做「补结构」，不动数据。补列必须按 PRAGMA table_info 判断后再 ALTER——
+    SCHEMA 里的 CREATE TABLE IF NOT EXISTS 对已存在的表不会补列，老库升上来
+    会缺列，而 save_accounts 只写白名单列，缺列时该字段静默丢失。
+    """
+    # 必须用写连接查 PRAGMA：db.query 走只读连接，在 v1→v2 同事务里 DROP 后
+    # 重建的表它看不到（未提交），会把新列判成缺失，ALTER 就报 duplicate column。
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
+    if "usage_manual_synced_at" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN usage_manual_synced_at INTEGER")
+    # key_usage_daily 在 SCHEMA 里用 IF NOT EXISTS，老库也会被建出来，这里只补索引。
+    db._write.execute(
+        "CREATE INDEX IF NOT EXISTS idx_key_usage_day ON key_usage_daily(day)")
+
+
 def _v1_to_v2(db):
     """v1 → v2：旧 accounts/keys 按新结构重建，kv 五键导入具名表后删除 kv。"""
     legacy = {}
@@ -1021,4 +1053,7 @@ def _v1_to_v2(db):
     db._write.execute("DROP TABLE IF EXISTS kv")
 
 
-Database.MIGRATIONS = ((2, _v1_to_v2),)
+# v1→v2 的函数到这里才定义完，所以迁移表在类外组装。
+# 必须按目标版本升序：v2 建表、v3 补列，顺序反了 v3 会打不存在的表。
+Database.MIGRATIONS = tuple(sorted(((2, _v1_to_v2),) + Database.MIGRATIONS,
+                                   key=lambda item: item[0]))

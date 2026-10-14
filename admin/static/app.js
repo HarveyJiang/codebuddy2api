@@ -171,6 +171,8 @@ async function refresh(loadCredits) {
   try {
     if (loadCredits) { try { await api("pool/refresh-credits", {method:"POST"}); } catch(e) {} }
     overview = await api("overview"); render(); $("load-error").hidden = true;
+    // 用量页的账号下拉依赖 overview，deep-link 进来时它还是 null，这里补一次。
+    if (usageInitialized) fillUsageAccounts();
     if (page === "dashboard") loadLogs(logOffset);
   }
   catch (e) { $("load-error").textContent = e.message; $("load-error").hidden = false; throw e; }
@@ -305,9 +307,14 @@ function confirmAction(title, desc, callback, field = null) {
 // token 友好格式：842 / 12.3K / 3.4M。口径是流式抓的估算值，不是精确账本。
 function fmtTokens(n) {
   const v = Number(n) || 0;
+  const trim = x => x.toFixed(1).replace(/\.0$/, "");
   if (v < 1000) return String(v);
-  if (v < 1000000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "K";
-  return (v / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (v < 1000000) {
+    // 999950 -> 1000.0K，读起来比 1M 还别扭，这种边界进位到 M。
+    if (v >= 999950) return trim(v / 1000000) + "M";
+    return trim(v / 1000) + "K";
+  }
+  return trim(v / 1000000) + "M";
 }
 $("confirm-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { await pendingConfirm(); $("confirm-dialog").close(); await refresh(); toast("操作已保存"); } catch (err) { $("confirm-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 $("accounts-body").addEventListener("click", async e => {
@@ -410,8 +417,15 @@ $("test-form").addEventListener("submit", async e => {
 /* ---------- 用量明细页 ---------- */
 let usageOffset = 0, usageTotal = 0, usageSyncCooldown = 0;
 const usageStart = () => $("usage-start").value, usageEnd = () => $("usage-end").value;
-// datetime-local 的值按北京时间解析，服务端也按北京时间解析，两边一致。
-const usageUnix = v => v ? Math.floor(new Date(v).getTime() / 1000) : null;
+// datetime-local 给的是「无时区的墙上时间」，直接 new Date(v) 会按**浏览器本地
+// 时区**解析 —— 非 +08:00 的用户会把区间整体错开，报表按日分桶就偏一整个时区。
+// 所以显式钉上 +08:00，让「输入框里填的时间 = 北京时间」在任何时区下都成立。
+const usageUnix = v => {
+  if (!v) return null;
+  const fixed = v.length === 16 ? v + ":00+08:00" : v + "+08:00";
+  const ts = new Date(fixed).getTime();
+  return Number.isFinite(ts) ? Math.floor(ts / 1000) : null;
+};
 function usageQuery(extra = {}) {
   const q = new URLSearchParams(extra);
   const a = usageUnix(usageStart()), b = usageUnix(usageEnd());
@@ -419,15 +433,30 @@ function usageQuery(extra = {}) {
   const acc = $("usage-account").value; if (acc) q.set("account_id", acc);
   return q.toString();
 }
+function accountName(id) {
+  // 报表按账号分组用的是 account_id（改名不拆组），这里再映射回可读名字。
+  const hit = (overview && overview.accounts || []).find(a => a.id === id);
+  return hit && hit.name ? hit.name : id;
+}
+let usageInitialized = false;
+function fillUsageAccounts() {
+  // 账号下拉独立出来：deep-link 进 #usage 时 overview 还是 null，
+  // 必须等 refresh() 之后再补一次，否则下拉永远是空的。
+  const keep = $("usage-account").value;
+  $("usage-account").innerHTML = '<option value="">全部账号</option>' +
+    (overview && overview.accounts ? overview.accounts : [])
+      .map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("");
+  $("usage-account").value = keep;
+}
 function initUsagePage() {
-  // 只初始化一次：默认近 30 天，账号下拉来自已有的 overview。
-  if ($("usage-start").value) return;
+  // 用显式标志位而不是「输入框有没有值」：后者在 deep-link 时会永久跳过填充。
+  if (usageInitialized) return;
+  usageInitialized = true;
   const pad = n => String(n).padStart(2, "0");
   const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   const now = new Date(), past = new Date(now.getTime() - 30 * 86400000);
   $("usage-start").value = fmt(past); $("usage-end").value = fmt(now);
-  $("usage-account").innerHTML = '<option value="">全部账号</option>' +
-    overview.accounts.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("");
+  fillUsageAccounts();
 }
 function renderUsageSummary(report) {
   const t = report.total || {};
@@ -436,14 +465,24 @@ function renderUsageSummary(report) {
     card("区间积分消耗", (t.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2}), "来自上游账单") +
     card("记录条数", (t.count ?? 0).toLocaleString("zh-CN"), `免费 ${t.free ?? 0} · 付费 ${t.paid ?? 0}`) +
     card("付费条均", t.paid ? ((t.credit ?? 0) / t.paid).toFixed(3) : "—", "不含免费调用") +
-    card("维度", {day:"按日", account:"按账号", model:"按模型", client:"按客户端"}[report.group_by] || report.group_by, `共 ${(report.groups || []).length} 组`);
+    card("维度", {day:"按日", account:"按账号", model:"按模型", client:"按客户端"}[report.group_by] || report.group_by, `共 ${report.bucket_total ?? (report.groups || []).length} 组`);
 }
 function renderUsageGroups(report) {
   // 报表分组直接画在明细表上方：用户切维度时想看的就是这个。
   const host = $("usage-groups");
   if (!host) return;
-  host.innerHTML = (report.groups || []).slice(0, 20).map(g =>
-    `<tr><td>${esc(g.bucket)}</td><td class="align-right mono">${g.count}</td>`
+  const all = report.groups || [];
+  const shown = all.slice(0, 20);
+  const note = $("usage-groups-note");
+  if (note) {
+    note.textContent = shown.length < all.length
+      ? `显示前 ${shown.length} 组（共 ${all.length} 组）`
+      : (report.truncated ? `服务端最多返回 ${all.length} 组，实际共 ${report.bucket_total} 组`
+                          : (all.length ? `共 ${all.length} 组` : ""));
+  }
+  const label = b => (report.group_by === "account" ? accountName(b) : b);
+  host.innerHTML = shown.map(g =>
+    `<tr><td>${esc(label(g.bucket))}</td><td class="align-right mono">${g.count}</td>`
     + `<td class="align-right mono">${(g.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2})}</td>`
     + `<td class="align-right mono muted">${g.free} / ${g.paid}</td></tr>`).join("")
     || '<tr><td colspan="4" class="history-empty">该区间没有记录。</td></tr>';
@@ -466,7 +505,13 @@ async function loadUsage(offset, withReport = true) {
       const report = await api("usage/report?" + usageQuery({group_by: $("usage-group").value}));
       renderUsageSummary(report); renderUsageGroups(report);
     }
-  } catch (e) { $("usage-body").innerHTML = `<tr><td colspan="6" class="history-empty">${esc(e.message)}</td></tr>`; }
+  } catch (e) {
+    $("usage-body").innerHTML = `<tr><td colspan="6" class="history-empty">${esc(e.message)}</td></tr>`;
+    // 失败时把分页按钮恢复到可翻页状态：否则会保留上一次的 disabled，
+    // 用户可能卡在既不能前进也不能后退的一页里。
+    usageTotal = 0; $("usage-page-info").textContent = "加载失败";
+    $("usage-prev").disabled = usageOffset <= 0; $("usage-next").disabled = true;
+  }
 }
 // 防抖第 1 层：按钮禁用 + 返回后 3 秒冷却。
 async function syncUsage() {
@@ -482,8 +527,15 @@ async function syncUsage() {
     toast(skipped ? `已同步 ${r.synced} 个账号，跳过 ${skipped} 个（${r.message || "刚拉取过或任务进行中"}）`
                   : `已同步 ${r.synced} 个账号`);
     await loadUsage(0);
-  } catch (e) { toast(e.message); }
-  finally { btn.textContent = label; usageSyncCooldown = Date.now() + 3000; btn.disabled = false; }
+  } catch (e) {
+    toast(e.message);
+    // 失败不设冷却：网络错或 500 之后用户马上重试是合理诉求，惩罚它会让人
+    // 以为拉取其实成功了。冷却只用来防「成功之后的连点」。
+    btn.textContent = label; btn.disabled = false;
+    return;
+  }
+  btn.textContent = label; btn.disabled = false;
+  usageSyncCooldown = Date.now() + 3000;
 }
 $("usage-sync").addEventListener("click", syncUsage);
 $("usage-refresh").addEventListener("click", () => loadUsage(usageOffset));

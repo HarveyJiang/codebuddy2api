@@ -239,6 +239,12 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("a1", called)   # setUp 里已有 session.info 账号，不止一个
         self.assertIsNone(store.data["account_status"]["a1"].get("usage_synced_at"))
         self.assertIsNotNone(store.data["account_status"]["a1"].get("usage_manual_synced_at"))
+        # 关键：留痕必须**落库**。只断言内存字典会漏掉「字段不在白名单里、
+        # 重启即丢」这类 bug（usage_manual_synced_at 曾长期落不了库）。
+        store.save()
+        rows = store.db.query("SELECT usage_manual_synced_at FROM accounts WHERE id='a1'")
+        self.assertTrue(rows, "账号未落库，留痕断言无意义")
+        self.assertIsNotNone(rows[0]["usage_manual_synced_at"])
         # 防抖：60 秒内重复拉取被节流（HTTPException 转成 skipped，不是 500）。
         again = (await self.client.post("/admin/api/usage/sync", json={
             "start": now - 7200, "end": now})).json()

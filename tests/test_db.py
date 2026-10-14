@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent)]
 
-from admin.db import Database, MICRO
+from admin.db import SCHEMA_VERSION, Database, MICRO
 from admin.server import Store
 from test_admin_server import credential
 
@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_no_kv_table_and_version_written(self):
         db = Database(self.root / "t.db")
-        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0], "2")
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0], str(SCHEMA_VERSION))
         self.assertFalse(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"))
         db.close()
 
@@ -132,11 +132,56 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(series["keys"][0]["series"]), 2)
         db.close()
 
+    def test_key_usage_daily_never_goes_backwards(self):
+        """重启后内存清零、计数从 0 重新累加，写回的小值不能把当天历史改小。
+
+        这是覆盖语义最容易踩的坑：直接 DO UPDATE SET count=excluded.count
+        会让 5000 被回灌的 1 覆盖掉，历史永久丢失。
+        """
+        db = Database(self.root / "t.db")
+        db.save_key_usage_daily({"k1": {"name": "K", "usage": {"date": "2026-10-15", "count": 5000, "tokens": 900}}})
+        # 模拟重启：内存 usage 清零后第一次 flush 只写回 1。
+        db.save_key_usage_daily({"k1": {"name": "K", "usage": {"date": "2026-10-15", "count": 1, "tokens": 0}}})
+        row = db.query("SELECT count, tokens FROM key_usage_daily")[0]
+        self.assertEqual(row["count"], 5000)
+        self.assertEqual(row["tokens"], 900)
+        # 正常递增仍然生效，且名称快照跟随最新。
+        db.save_key_usage_daily({"k1": {"name": "K2", "usage": {"date": "2026-10-15", "count": 6000, "tokens": 1000}}})
+        row = db.query("SELECT count, tokens, key_name FROM key_usage_daily")[0]
+        self.assertEqual((row["count"], row["tokens"], row["key_name"]), (6000, 1000, "K2"))
+        db.close()
+
+    def test_usage_report_group_by_account_uses_id(self):
+        """按账号分组必须用 account_id：account_name 是可变快照，改名会拆组，
+        且 name 与 id 混在同一个命名空间会把不同账号并进同一组。"""
+        db = Database(self.root / "t.db")
+        db.save_upstream_usage([
+            {"request_id": "r1", "account_id": "a1", "account_name": None,
+             "credit": 0.0, "model": "hy3", "client": "WorkBuddy",
+             "request_time": NOW - 10, "agent_purpose": ""},
+            # 名字恰好等于另一个账号的 id：用 name 分组会把 a2 并进 a1。
+            {"request_id": "r2", "account_id": "a2", "account_name": "a1",
+             "credit": 0.0, "model": "hy3", "client": "WorkBuddy",
+             "request_time": NOW - 20, "agent_purpose": ""},
+            # 同一账号改名：用 name 分组会拆成两组。
+            {"request_id": "r3", "account_id": "a1", "account_name": "新名字",
+             "credit": 0.0, "model": "hy3", "client": "WorkBuddy",
+             "request_time": NOW - 30, "agent_purpose": ""},
+        ])
+        report = db.upstream_usage_report(group_by="account")
+        buckets = {g["bucket"]: g["count"] for g in report["groups"]}
+        self.assertEqual(buckets.get("a1"), 2)   # 改名前后的两条合并
+        self.assertEqual(buckets.get("a2"), 1)   # 不被 name 串到 a1
+        self.assertEqual(report["total"]["count"], 3)
+        # 桶总数与截断标记。
+        self.assertEqual(report["bucket_total"], 2)
+        self.assertFalse(report["truncated"])
+        db.close()
+
     def test_key_usage_daily_pruned_on_boot(self):
         db = Database(self.root / "t.db")
         old_day = _day_offset(-100)
-        db.save_key_usage_daily({"k1": {"name": "K", "usage": {"date": old_day, "count": 1}}},
-                                day=old_day)
+        db.save_key_usage_daily({"k1": {"name": "K", "usage": {"date": old_day, "count": 1}}})
         self.assertEqual(len(db.query("SELECT * FROM key_usage_daily")), 1)
         db.close()
         # 重开触发裁剪。
@@ -366,7 +411,7 @@ class DatabaseTests(unittest.TestCase):
         try:
             # kv 表必须消失。
             self.assertFalse(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"))
-            self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0]["value"], "2")
+            self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0]["value"], str(SCHEMA_VERSION))
 
             accounts = db.load_accounts()
             self.assertEqual(set(accounts), {"a1", "a2"})

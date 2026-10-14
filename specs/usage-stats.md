@@ -88,12 +88,25 @@ confirmAction(title, desc, callback, { value, label, inputType = "text", placeho
 ```sql
 INSERT INTO key_usage_daily (key_id, day, count, tokens, key_name) VALUES (?,?,?,?,?)
 ON CONFLICT(key_id, day) DO UPDATE SET
-  count=excluded.count, tokens=excluded.tokens, key_name=excluded.key_name
+  count=MAX(count, excluded.count),
+  tokens=MAX(tokens, excluded.tokens),
+  key_name=excluded.key_name
 ```
 
-覆盖语义正确的原因：`usage` 单调递增，后写的值一定 ≥ 先写的值。副作用是
-**顺带修复了"重启丢最后 5 秒"**——重启后下次 flush 会用更大的累计值覆盖回来，
-不再永久丢失那几个请求。
+写的是**当日累计快照**而不是增量，所以冲突时是覆盖而非累加。但覆盖必须用
+`MAX` 而不是 `excluded.count` 直接赋值：
+
+`usage` 只在**单进程内存**里单调递增，**进程重启后内存清零**，当日计数从 0
+重新累加，此后每次 flush 写回的都是比库里**更小**的值。直接覆盖会把当天历史
+改小（实测：库中 5000 → 重启后写 1 → 变成 1，历史永久丢失）。这与一开始
+"`usage` 单调递增，后写的值一定 ≥ 先写的值"的假设相反——那个假设只在进程
+不重启时成立。
+
+`MAX` 保证只增不减：重启只丢「最后 5 秒未 flush」的增量，不会让历史倒退。
+若要跨重启精确，正确做法是从 `request_logs` 回填当天计数，不在本设计范围内。
+
+行的 `day` 取 `usage["date"]`（key 侧换天的那一天），不取「现在」：跨天后首个
+请求到来前，旧日期快照会被再写一次，`MAX` 语义下无副作用。
 
 只在 `usage_date` 非空时写，避免为每个 key 每天造空行。
 
@@ -165,6 +178,15 @@ ON CONFLICT(key_id, day) DO UPDATE SET
 - `sync_upstream_usage_range(aid, start, end)`：**手动拉取**，任意范围，只写库 +
   写 `usage_manual_synced_at` 留痕，**不动 `usage_synced_at`**。
 
+  节流时间戳 `_usage_manual_at[aid]` 必须在 `_pull_upstream_usage` **成功之后**
+  才写。上游 5xx / 凭据失效恰恰是最需要重试的场景，失败时把 60 秒窗口消耗掉，
+  用户只会看到「刚拉取过请稍后重试」而实际上什么都没拉到。防连点由 `jobs` 锁
+  与前端冷却承担，节流只负责跨请求去重。
+
+  `usage_manual_synced_at` 必须同时进 `ACCOUNT_STATUS_COLUMNS` 与 `accounts`
+  表 DDL（走 v2→v3 迁移补列）。只写内存字典的话它重启即丢，「留痕」名存实亡，
+  且**不报错**、只有主动查库才会发现。
+
 上游参数沿用驼峰（与同域 `get-user-resource` 的 `PageNumber/PageSize` 不同）：
 
 ```json
@@ -207,3 +229,18 @@ ON CONFLICT(key_id, day) DO UPDATE SET
 - 分页默认 100 条/页，翻页与总数一致。
 - 手动拉取任意短区间后，后台每日同步仍会执行（不被误标记为已同步）。
 - 跨天统计按北京时间，与 `request_logs` 的日界线一致。
+
+### 时间参数的时区口径（易错，务必照做）
+
+时间区间有三处解释，必须统一为北京时间，否则报表按日分桶会整体偏一个时区：
+
+1. **服务端 `_query_time`**：字符串（如 `2026-10-14 00:00`）按北京时间 `.replace(tzinfo=CN)`
+   解析；整数视为**绝对 unix 秒**。两种输入的语义不同，接口注释里要写死。
+2. **前端 `usageUnix`**：`<input type="datetime-local">` 的 value 是**无时区的墙上
+   时间**，直接 `new Date(v)` 会按**浏览器本地时区**解析。非 +08:00 的用户会把
+   整个区间错开（纽约实测偏 12 小时）。必须显式补 `+08:00` 再解析：
+   `new Date(v.length === 16 ? v + ":00+08:00" : v + "+08:00")`。
+3. **上游 `requestTime`**：无时区标记，按北京时间解析后再转时间戳
+   （`strptime(...).replace(tzinfo=CN).timestamp()`）。注意这不是 `.timestamp()`
+   之后再减 8 小时——`.replace(tzinfo=CN)` 已经是「把这个挂钟时间当作北京时间」
+   的正确写法，再减就成了双重偏移。
