@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -74,23 +75,18 @@ DEFAULT_DOMAIN = "www.codebuddy.cn"
 # 与官方 CLI 一致（admin/models.py 同值）：上游按 UA 识别客户端，
 # 自定 UA 会导致用量接口 client 为空。
 # ── 调用方身份（决定上游用量接口的 client 字段）────────────────────────────
-# 真实 WorkBuddy 桌面端 spawn 内置 CLI 时通过环境变量注入身份：
-#   CLIENT_INFO_PRODUCT_NAME=WorkBuddy · CLIENT_INFO_IDE_TYPE=workbuddy
-#   CLIENT_INFO_USER_AGENT_EXTENSION=CLI/2.161.0 · CLIENT_INFO_PLUGIN_NAME=workbuddy-desktop
-#   CODEBUDDY_HOST=workbuddy-desktop
-# CLI 的 ClientInfoProvider 读 env，由请求拦截器合并进 UA，最终形如：
-#   WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0
-# 上游从 UA 首段解析 client（大写），故两个稳定判据缺一不可：
-#   ① User-Agent 前缀 ^WorkBuddy/   ② X-IDE-Type: workbuddy
-# 注意 X-Product **不是**判据（别用）；UA 里的 CodeBuddyCode/1.0、axios/1.18.1 都是噪声。
-# 本网关也支持同样的 CLIENT_INFO_* 环境变量覆盖，换客户端版本时无需改代码。
-_IDE_TYPE = os.environ.get("CLIENT_INFO_IDE_TYPE") or "workbuddy"
-_UA_EXTENSION = os.environ.get("CLIENT_INFO_USER_AGENT_EXTENSION") or "CLI/2.161.0"
+# 上游用量接口的 client 字段直接取自请求头 X-IDE-Type / X-IDE-Name 的值：
+#   值写 workbuddy → 上游记录 client="workbuddy"
+#   值写 WorkBuddy → 上游记录 client="WorkBuddy"（目标）
+# 其余头保持「已验证能出值」的组合（见 git 历史 FULL 实验）。
+# 桌面端真实 UA 形如 WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0。
+# 本网关支持 CLIENT_INFO_* 环境变量覆盖。
 _PRODUCT_NAME = os.environ.get("CLIENT_INFO_PRODUCT_NAME") or "WorkBuddy"
 _PRODUCT_VERSION = os.environ.get("CLIENT_INFO_PRODUCT_VERSION") or "5.8.2"
-# 产品名出现两次（CLI 合并 env 身份与自身标识的产物），照搬以免偏离上游预期。
-USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
-IDE_TYPE = _IDE_TYPE
+_UA_EXTENSION = os.environ.get("CLIENT_INFO_USER_AGENT_EXTENSION") or "CLI/2.161.0"
+# client 字段的取值来源（大写 WorkBuddy 为目标值）。
+IDE_TYPE = _PRODUCT_NAME
+USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -233,6 +229,11 @@ class CredentialManager:
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
             "X-IDE-Type": IDE_TYPE,
+            "X-IDE-Name": IDE_TYPE,
+            "X-IDE-Version": _PRODUCT_VERSION,
+            "X-Product": "SaaS",
+            "X-Product-Version": _PRODUCT_VERSION,
+            "X-Request-ID": uuid.uuid4().hex,
             "User-Agent": USER_AGENT,
         }
         return h
