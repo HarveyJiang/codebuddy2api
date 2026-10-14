@@ -1101,17 +1101,22 @@ def test_fetch_remote_models_errors():
             T.fetch_remote_models(client, {})
 
 
-def test_merge_model_catalogs_drops_internal_slots():
-    remote = [{"id": "glm-5.3", "credits": 0.39}]
-    detail = [{"id": "glm-5.3", "credits": None}, {"id": "sagitta"},
-              {"id": "custom_model_gpt-5"}, {"id": "summary"}, {"id": "explore_sub_agent_v2"},
-              {"id": "browser_use_subagent"}, {"id": ""}]
-    merged = T.merge_model_catalogs(remote, detail)
-    assert [m["id"] for m in merged] == ["glm-5.3", "sagitta"]
-    assert merged[0]["credits"] == 0.39  # 首个来源（信息更全）胜出
+def test_build_trae_catalog_detail_drives_availability_menu_enriches():
+    menu = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78},
+            {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}]
+    detail = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 131072},
+              {"id": "sagitta", "name": "sagitta", "context_length": 131072},
+              {"id": "summary"}, {"id": "custom_model_gpt-5"}, {"id": "explore_sub_agent_v2"}, {"id": ""}]
+    catalog = T.build_trae_catalog(detail, menu)
+    # glm-5.3 只在菜单里（其它 function）→ 本 function 会 4001，剔除
+    assert [m["id"] for m in catalog] == ["glm-5.2", "sagitta"]
+    assert catalog[0] == {"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78}
+    assert catalog[1]["credits"] is None and catalog[1]["context_length"] == 131072
+    # 菜单不可用 → 目录照旧，只是没倍率
+    assert [m["id"] for m in T.build_trae_catalog(detail, None)] == ["glm-5.2", "sagitta"]
 
 
-def test_manager_fetch_models_merges_menu_and_detail(tmp_path):
+def test_manager_fetch_models_detail_validity_menu_rates(tmp_path):
     doc = trae_credential()
     p = tmp_path / "t.info"
     p.write_text(json.dumps(doc), encoding="utf-8")
@@ -1120,12 +1125,14 @@ def test_manager_fetch_models_merges_menu_and_detail(tmp_path):
     def handler(req):
         if "/api/remote/v1/models" in str(req.url):
             return httpx.Response(200, json=_menu(("solo_work_remote", [
+                {"name": "glm-5.2", "display_name": "GLM-5.2", "context_window_tokens": {"dev": 200000},
+                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.78}}}'},
                 {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000},
                  "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'}])))
         return httpx.Response(200, json={"config_info_list": [
-            {"config_name": "glm-5.3", "display_config": {"display_name": "重复"}},
-            {"config_name": "sagitta", "display_config": {"display_name": "Sagitta"}},
-            {"config_name": "summary", "display_config": {"display_name": "Summary"}}]})
+            {"config_name": "glm-5.2", "display_config": {"display_name": "GLM-5.2"}},
+            {"config_name": "sagitta", "display_config": {"display_name": "sagitta"}},
+            {"config_name": "summary", "display_config": {"display_name": "summary"}}]})
 
     real = _REAL_SYNC_CLIENT
     orig = httpx.Client
@@ -1134,9 +1141,31 @@ def test_manager_fetch_models_merges_menu_and_detail(tmp_path):
         models = mgr.fetch_models()
     finally:
         httpx.Client = orig
-    assert [m["id"] for m in models] == ["glm-5.3", "sagitta"]
-    assert models[0]["name"] == "GLM-5.3" and models[0]["credits"] == 0.39
-    assert models[0]["context_length"] == 200000
+    assert [m["id"] for m in models] == ["glm-5.2", "sagitta"]  # 菜单独有 glm-5.3 / 内部槽位 summary 剔除
+    assert models[0]["credits"] == 0.78 and models[0]["context_length"] == 200000
+    assert models[1]["credits"] is None
+
+
+def test_manager_fetch_models_detail_failure_raises(tmp_path):
+    """detail_param 不可用时不拿菜单冒充可用模型（让调用方保留上次快照）。"""
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mgr = T.TraeCredentialManager(p)
+
+    def handler(req):
+        if "/api/remote/v1/models" in str(req.url):
+            return httpx.Response(200, json=_menu(("solo_work_remote", [{"name": "glm-5.3"}])))
+        return httpx.Response(500, text="boom")
+
+    real = _REAL_SYNC_CLIENT
+    orig = httpx.Client
+    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(handler), **kw)
+    try:
+        with pytest.raises(T.TraeAPIError):
+            mgr.fetch_models()
+    finally:
+        httpx.Client = orig
 
 
 def test_checkin_status_and_claim_and_ent_usage(tmp_path):

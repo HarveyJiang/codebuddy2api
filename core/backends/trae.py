@@ -528,18 +528,29 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
     return out
 
 
-def merge_model_catalogs(*catalogs) -> list[dict]:
-    """按优先级合并目录来源：同名保留首个（信息更全的放前面），剔除内部槽位与空 id。"""
+def build_trae_catalog(detail: list[dict] | None, menu: list[dict] | None) -> list[dict]:
+    """构建 Trae 模型目录：**以 `get_detail_param` 为有效性基准**，用官方菜单补倍率/上下文。
+
+    实测（function=solo_work_lite）：`/api/remote/v1/models` 列的是其它 function
+    （solo_*_remote 远程 agent/design 模式）的菜单，纯菜单独有的 config_name 直连上游必回
+    `4001 param is invalid`，本网关 chat 走 solo_work_lite 用不了；而 detail_param 返回的
+    config_name 全部可用。故：detail_param 决定「有哪些模型」，菜单只负责「补元数据」。
+    同时剔除内部槽位（custom_model_* / subagent / 工具）。
+    """
+    rates = {m["id"]: m for m in menu or [] if isinstance(m, dict) and m.get("id")}
     out, seen = [], set()
-    for catalog in catalogs:
-        for entry in catalog or []:
-            if not isinstance(entry, dict):
-                continue
-            mid = str(entry.get("id") or "").strip()
-            if not mid or mid in seen or _is_internal_slot(mid):
-                continue
-            seen.add(mid)
-            out.append({**entry, "id": mid})
+    for entry in detail or []:
+        if not isinstance(entry, dict):
+            continue
+        mid = str(entry.get("id") or "").strip()
+        if not mid or mid in seen or _is_internal_slot(mid):
+            continue
+        seen.add(mid)
+        meta = rates.get(mid) or {}
+        out.append({"id": mid,
+                    "name": meta.get("name") or entry.get("name") or mid,
+                    "context_length": meta.get("context_length") or entry.get("context_length"),
+                    "credits": meta.get("credits")})
     return out
 
 
@@ -769,27 +780,22 @@ class TraeCredentialManager:
             return h
 
     def fetch_models(self) -> list[dict]:
-        """Trae 模型目录：官方菜单（remote，含倍率/上下文）优先，合并 get_detail_param 的额外条目。
+        """Trae 模型目录：get_detail_param 定「有哪些」（本 function 有效），官方菜单补倍率/上下文。
 
-        两套来源互补：remote 是客户端菜单、带倍率，但只列当前 function 组内的模型；
-        detail_param 含部分未列入菜单的历史 config_name。任一失败都不致命，
-        仅当两者皆空才抛错（调用方保留上次快照）。
+        两套来源职责不同：detail_param 按 solo_work_lite 过滤、返回的全部可用；
+        /api/remote/v1/models 是其它 function 的菜单，含倍率但与本 function 不完全兼容
+        （纯菜单独有项直连上游必回 4001）。
+        detail_param 失败即抛错（调用方保留上次快照），不拿菜单冒充可用模型；
+        菜单失败只是拿不到倍率，不影响目录本身。
         """
-        ug = self.ug_headers()
         solo = self.get_headers(stream=False)
-        remote = detail = None
         with httpx.Client(timeout=20) as client:
             try:
-                remote = fetch_remote_models(client, ug)
+                menu = fetch_remote_models(client, self.ug_headers())
             except (TraeAPIError, httpx.HTTPError):
-                remote = None
-            try:
-                detail = fetch_models(client, solo)
-            except (TraeAPIError, httpx.HTTPError):
-                detail = None
-        if remote is None and detail is None:
-            raise TraeAPIError("模型目录拉取失败：remote 与 get_detail_param 均不可用")
-        return merge_model_catalogs(remote, detail)
+                menu = None
+            detail = fetch_models(client, solo)  # 失败向上抛，调用方保留上次快照
+        return build_trae_catalog(detail, menu)
 
     def checkin_status(self, client) -> dict:
         return checkin_status(client, self.ug_headers())
