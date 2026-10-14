@@ -15,7 +15,7 @@
 - 中文接入指南和真实模型调用测试；测试最多等待 90 秒，生成预算上限 1024 tokens，以便推理模型完成思考并输出正文。
 - 独立管理密钥；12 小时 HttpOnly / Secure / SameSite=Strict 会话 cookie，CSRF 校验，登录失败限流，上传请求最大 1 MB。
 
-添加账号默认使用浏览器授权，也可切换到文件导入。授权链接有效期 5 分钟，完成后无需粘贴回调；新账号不会替换已选择的当前账号。当前授权仅支持国内账号。原账号和 API Key 首次启动自动迁入，之后以 management/state.json 为准。
+添加账号默认使用浏览器授权，也可切换到文件导入。授权链接有效期 5 分钟，完成后无需粘贴回调；新账号不会替换已选择的当前账号。当前授权仅支持国内账号。原账号和 API Key 首次启动自动迁入，之后以 `management/state.db`（SQLite）为准。早期版本的 `management/state.json` 只在首次启动时作为迁移输入，导入后会被改名为 `state.json.bak`，不再读写。
 
 ## 文件
 
@@ -68,7 +68,7 @@ GET https://www.workbuddy.cn/v3/config
 User-Agent: CLI/2.63.2 CodeBuddy/2.63.2
 ```
 
-该接口免鉴权（仅校验 CLI User-Agent），返回内容与官方客户端缓存的 `acc-product-config-v3.json` 完全一致，包含 cli agent 的模型菜单、`credits` 倍率、`maxInputTokens` 以及 `modelPromotions` 折扣活动。拉取成功写入 `management/state.json` 的 `model_registry` 段；失败则保留上次缓存，从未成功过则回落内置官方列表（`BUILTIN_MODELS`）。
+该接口免鉴权（仅校验 CLI User-Agent），返回内容与官方客户端缓存的 `acc-product-config-v3.json` 完全一致，包含 cli agent 的模型菜单、`credits` 倍率、`maxInputTokens` 以及 `modelPromotions` 折扣活动。拉取成功写入 `management/state.db`（SQLite）的 `model_registry` 段；失败则保留上次缓存，从未成功过则回落内置官方列表（`BUILTIN_MODELS`）。
 
 `fast-model`/`balanced-model`/`deep-model` 三档智能路由模型不在 cli 菜单中，由官方固定提供，注册表无条件附加（倍率 ×0.21 / ×0.65 / ×1.20）。
 

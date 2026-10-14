@@ -87,7 +87,12 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         await self.client.delete("/admin/api/keys/" + old)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + API})).status_code, 401)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + newkey})).status_code, 200)
-        self.assertNotIn(newkey, self.app.state.store.path.read_text(encoding="utf-8"))
+        # 完整密钥明文不得出现在持久层中。主库和 -wal 都要查：
+        # WAL 模式下未 checkpoint 的帧只在 -wal 里。
+        path = self.app.state.store.db.path
+        for suffix in ("", "-wal"):
+            blob = path.with_name(path.name + suffix).read_bytes()
+            self.assertNotIn(newkey.encode(), blob, f"明文密钥泄漏到 {suffix or '主库'}")
         await self.client.aclose()
         self.make_app()
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + API})).status_code, 401)

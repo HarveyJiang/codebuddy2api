@@ -1,5 +1,6 @@
 """Small, persistent management layer for workbuddy2api. Single-process deployment."""
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -20,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
 from .browser_login import BrowserLogin
+from .db import Database
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
 from .models import CN, ModelRegistry
@@ -51,6 +53,22 @@ def clean_name(value, fallback):
     return value.strip()
 
 
+def _id_list(value):
+    """把客户端传来的模型/账号 id 列表清洗成去重后的字符串列表（空 = 不限制）。"""
+    if not isinstance(value, list):
+        return []
+    result, seen = [], set()
+    for item in value:
+        if isinstance(item, str) and item and item not in seen and len(item) <= 128:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+# save() 里 kv 脏标记的初始值：与任何真实值都不同，保证首次一定写入。
+_MISSING = object()
+
+
 class Store:
     def __init__(self, root, auth_dir, initial_key, admin_key):
         if len(admin_key) < 20:
@@ -67,11 +85,13 @@ class Store:
         self.started = time.time()
         self.events = deque(maxlen=40)
         self.path = self.root / "state.json"
-        if self.path.exists():
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            self.data.setdefault("model_registry", {})
-        else:
-            self.data = {"accounts": {}, "active": None, "keys": {}}
+        # SQLite 是唯一持久层；内存 self.data 是工作副本，写操作后统一落库。
+        self.db = Database(self.root / "state.db", legacy_json=self.path)
+        self.data = {"accounts": {}, "active": None, "keys": {}}
+        self._dirty = {}  # kv 脏标记：值未变则跳过落库，避免每请求重写大 blob
+        self._load()
+        if not self.data["accounts"] and not self.data["keys"]:
+            # 全新部署（数据库与 state.json 都为空）：从凭据目录导入。
             for p in sorted(self.auth_dir.glob("*.info")):
                 try:
                     doc = json.loads(p.read_text(encoding="utf-8"))
@@ -83,10 +103,45 @@ class Store:
                 self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
                 if self.data["active"] is None and not doc.get("disabled"):
                     self.data["active"] = aid
-            if initial_key:
-                self.add_key("原有 API Key", initial_key)
+            if initial_key and not any(item["hash"] == digest(initial_key) for item in self.data["keys"].values()):
+                self.add_key("原有 API Key", value=initial_key)
             self.save()
         self.sync_active()
+
+    def _load(self):
+        """从 SQLite 恢复内存状态。"""
+        for row in self.db.query("SELECT id, name, file, enabled, created FROM accounts"):
+            self.data["accounts"][row["id"]] = {"name": row["name"], "file": row["file"],
+                                                "enabled": bool(row["enabled"]), "created": row["created"]}
+        for row in self.db.query("SELECT id, name, hash, hint, created, daily_limit, usage, models, accounts FROM keys"):
+            self.data["keys"][row["id"]] = {"name": row["name"], "hash": row["hash"], "hint": row["hint"],
+                                            "created": row["created"], "daily_limit": row["daily_limit"],
+                                            "usage": self._decode_dict(row["usage"]),
+                                            "models": self._decode_list(row["models"]),
+                                            "accounts": self._decode_list(row["accounts"])}
+        self.data["active"] = self.db.get_kv("active")
+        for key in ("pool", "model_registry", "account_status", "session_bindings"):
+            # 空 dict/None 都补成空壳：AccountPool 等下游仍可用 setdefault
+            # 往里填默认字段；这里保证键一定存在，避免直接访问 KeyError。
+            self.data[key] = self.db.get_kv(key) or {}
+        # 池设置可能来自旧数据（缺新字段），用默认值补齐缺失项。
+        self.data["pool"] = {**AccountPool.POOL_DEFAULTS, **self.data["pool"]}
+
+    @staticmethod
+    def _decode_list(raw):
+        try:
+            value = json.loads(raw or "[]")
+        except ValueError:
+            return []
+        return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+    @staticmethod
+    def _decode_dict(raw):
+        try:
+            value = json.loads(raw or "{}")
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def validate_credential(doc):
@@ -111,7 +166,24 @@ class Store:
                 raise HTTPException(400, "账号字段格式不正确")
 
     def save(self):
-        write_json(self.path, self.data)
+        """全量落库：账号/密钥走独立表，其余状态走 kv 表。
+
+        整份状态收进单个事务，恢复旧 write_json「要么全新要么全旧」的原子性——
+        否则账号已提交而 active 尚未提交时崩溃，重启后 active 指向不存在的
+        账号，网关会全量失败。
+
+        kv 带脏标记：只有内容真的变化时才写（model_registry 序列化后约 20KB，
+        每请求重写会明显拖慢请求路径）。脏标记存深拷贝快照——若直接存引用，
+        原地修改会同时改到快照，导致永远判定为「未变化」而漏写。
+        """
+        with self.lock, self.db.transaction():
+            self.db.replace_accounts(self.data["accounts"])
+            self.db.replace_keys(self.data["keys"])
+            for key in ("active", "pool", "model_registry", "account_status", "session_bindings"):
+                value = self.data.get(key)
+                if value != self._dirty.get(key, _MISSING):
+                    self.db.set_kv(key, value)
+                    self._dirty[key] = copy.deepcopy(value)
 
     def save_browser_account(self, doc, name):
         self.validate_credential(doc)
@@ -185,7 +257,11 @@ class Store:
             result.append(row)
         return result
 
-    def add_key(self, name, value=None, daily_limit=None):
+    def add_key(self, name, daily_limit=None, models=None, accounts=None, value=None):
+        """创建客户端密钥。models/accounts 为空列表表示不限制（全部可用）。
+
+        value：指定固定密钥值（供 CODEBUDDY2OPENAI_KEY 迁移使用），缺省随机生成。
+        """
         value = value or "sk-wb-" + secrets.token_urlsafe(32)
         kid = secrets.token_hex(8)
         limit = None
@@ -196,8 +272,17 @@ class Store:
                 raise HTTPException(400, "每日上限需为整数")
             if limit < 0:
                 raise HTTPException(400, "每日上限不能为负")
-        self.data["keys"][kid] = {"name": name, "hash": digest(value), "hint": value[:5] + "…" + value[-4:], "created": int(time.time()), "daily_limit": limit, "usage": {}}
+        self.data["keys"][kid] = {"name": name, "hash": digest(value), "hint": value[:5] + "…" + value[-4:], "created": int(time.time()), "daily_limit": limit, "usage": {},
+                                  # 空列表 = 不限制：该密钥可使用所有已启用模型 / 所有可用账号。
+                                  "models": _id_list(models), "accounts": _id_list(accounts)}
         return kid, value
+
+    def key_bindings(self, kid):
+        """返回该密钥的 (允许的模型集合或 None, 允许的账号集合或 None)。"""
+        item = self.data["keys"].get(kid) or {}
+        models = _id_list(item.get("models"))
+        accounts = _id_list(item.get("accounts"))
+        return (set(models) or None, set(accounts) or None)
 
     def _today(self):
         return datetime.fromtimestamp(time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
@@ -357,6 +442,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             except asyncio.CancelledError:
                 pass
             await browser_login.close()
+            # 优雅关闭：把 WAL 里未 checkpoint 的帧合并进主库再断开。
+            store.db.close()
             for task in (pool_task, models_task):
                 try:
                     await task
@@ -475,7 +562,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def overview(req: Request):
         store.require_admin(req)
         with store.lock:
-            keys = [{"id": kid, "usage": {"date": store._today(), "count": 0, "tokens": 0}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
+            keys = [{"id": kid, "usage": item.get("usage") or {}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
             return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": {**metrics.snapshot(), "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
 
     @app.post("/admin/api/pool/refresh-credits")

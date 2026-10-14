@@ -422,8 +422,15 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         restarted=AccountPool(self.store,clock=lambda:self.now,client_factory=self.pool.client_factory)
         await restarted.tick()
         self.assertGreaterEqual(self.checkin_posts, 1)
-        data=json.loads(self.store.path.read_text(encoding='utf-8'))
-        self.assertTrue(data['account_status'][self.a]['checkin_date'])
+        # 持久化到 SQLite：重新加载后状态仍在。
+        reloaded = Store(self.store.root, self.store.auth_dir, '', 'admin-long-enough-test-key')
+        try:
+            self.assertTrue(reloaded.data['account_status'][self.a]['checkin_date'])
+            self.assertIn(self.b, reloaded.data['account_status'])
+        finally:
+            # 关掉这条额外连接：否则它与 self.store 各持一条写连接，
+            # 且 reloaded 构造时的 sync_active() 会污染全局 converter.CONFIG。
+            reloaded.db.close()
 
     async def test_context_isolation_concurrent_requests_and_auth(self):
         async def app(scope,receive,send):

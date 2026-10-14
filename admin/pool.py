@@ -82,6 +82,12 @@ class BillingError(Exception):
 
 
 class AccountPool:
+    # 池设置默认值。Store._load 用它们补齐旧数据缺失的字段，
+    # 这里保留 setdefault 兼容直接构造 Store 的老用法。
+    POOL_DEFAULTS = {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00",
+                     "affinity_expiry_days": 3, "credit_min_interval": 60,
+                     "sync_window": ["10:00", "20:00"], "batch_spread": 90}
+
     def __init__(self, store, clock=time.time, client_factory=None):
         self.store, self.clock = store, clock
         self.client_factory = client_factory or (lambda: httpx.Client(timeout=20, follow_redirects=False))
@@ -93,7 +99,8 @@ class AccountPool:
         self.dirty = False
         self.last_flush = 0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00", "affinity_expiry_days": 3, "credit_min_interval": 60, "sync_window": ["10:00", "20:00"], "batch_spread": 90})
+            store.data.setdefault("pool", dict(self.POOL_DEFAULTS))
+            store.data["pool"] = {**self.POOL_DEFAULTS, **store.data["pool"]}
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             for item in store.data.get("keys", {}).values():
