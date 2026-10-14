@@ -1,5 +1,10 @@
 # DB 重构 Spec：去掉 kv 表，全量结构化 + 模型表
 
+> **状态：已完成（2026-10）。** 线上库已是 v3，无 `kv` 表。
+> 文中提到的 v1/`state.json` 迁移代码（`_v1_to_v2`、`_upgrade_keys`、`_absorb*`、
+> `Database(legacy_json=...)`）在确认没有旧库需要升级后**已全部移除**，本文作为
+> 设计记录保留。当前迁移表只剩 `(3, _v2_to_v3)`。
+
 ## 背景
 
 - 当前 `state.db` 共 4 张表：`schema_meta`、`accounts`、`keys`、`kv`（`admin/db.py:34`）。

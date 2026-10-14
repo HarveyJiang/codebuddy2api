@@ -242,13 +242,18 @@ class ModelRegistryTests(unittest.TestCase):
             client_cls.return_value.__enter__.return_value.get.return_value = response
             registry.fetch()
         registry.set_enabled("step-5-preview", False)
-        state = registry.export_state()
         self.assertEqual(registry.enabled_models(),
                          ["glm-5.2", "space-bunny", "fast-model", "balanced-model", "deep-model"])
         self.assertIn("step-5-preview", registry.snapshot_ids())
-        # 重新导入状态后禁用保留。
+        # 落库后由新实例读回，禁用状态保留（走真实的持久化路径）。
+        import tempfile
+        from admin.db import Database
+        root = tempfile.mkdtemp()
+        db = Database(Path(root) / "state.db")
+        registry.persist(db)
         restored = ModelRegistry(get_credential=lambda: FakeManager())
-        restored.import_state(json.loads(json.dumps(state)))
+        restored.load(db)
+        db.close()
         self.assertEqual(restored.enabled_models(),
                          ["glm-5.2", "space-bunny", "fast-model", "balanced-model", "deep-model"])
         # 再拉取时禁用跟随仍存在的模型。

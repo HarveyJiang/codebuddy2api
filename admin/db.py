@@ -8,10 +8,9 @@
   数据量很小（账号 ≤100、密钥 ≤100），全量重写足够快。
 - 金额只在这层换算：落库 ×1e6 取整成 `*_micro`，读库 ÷1e6 还原成内存里的 float。
   内存里始终是 float，`state()` 的比较和速率计算都依赖它。
-- 迁移走版本化 MIGRATIONS 列表（元素第一个值是目标版本），所有待执行迁移合并在
+- 迁移走版本化 MIGRATIONS 列表（元素是 (目标版本, 迁移函数)），所有待执行迁移合并在
   同一个事务里：任一步失败整体回滚且不写版本号，下次启动从头重跑。分步提交会出现
   「step1 已提交、step2 失败」，届时版本号还是旧值，下次会重跑 step1 而非续跑。
-- 首次启动时若存在 state.json 而数据库为空，自动导入旧数据并保留 .bak 备份。
 - 所有写操作走同一个连接（单进程多线程），用显式事务保证整份状态原子生效。
 """
 import json
@@ -24,6 +23,27 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .models import CN
+
+
+# -- schema migrations -------------------------------------------------------
+
+
+def _v2_to_v3(db):
+    """v2 → v3：给 accounts 补 usage_manual_synced_at 列，并补 key_usage_daily 索引。
+
+    只做「补结构」，不动数据。补列必须按 PRAGMA table_info 判断后再 ALTER——
+    SCHEMA 里的 CREATE TABLE IF NOT EXISTS 对已存在的表不会补列，老库升上来
+    会缺列，而 save_accounts 只写白名单列，缺列时该字段静默丢失。
+    """
+    # 必须用写连接查 PRAGMA：db.query 是只读连接，看不到本事务内未提交的
+    # DDL，会把新列判成缺失，接着 ALTER 报 duplicate column。
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
+    if "usage_manual_synced_at" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN usage_manual_synced_at INTEGER")
+    # key_usage_daily 在 SCHEMA 里用 IF NOT EXISTS，老库也会被建出来，这里只补索引。
+    db._write.execute(
+        "CREATE INDEX IF NOT EXISTS idx_key_usage_day ON key_usage_daily(day)")
+
 
 SCHEMA_VERSION = 3
 
@@ -132,20 +152,10 @@ def _decode_list(raw):
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
-def _decode_json(raw, default):
-    if isinstance(raw, (dict, list)):
-        return raw
-    try:
-        value = json.loads(raw) if raw else default
-    except (ValueError, TypeError):
-        return default
-    return value if isinstance(value, type(default)) else default
-
-
 class Database:
     """SQLite 封装：单写连接 + 每线程读连接，自动建表与旧数据迁移。"""
 
-    # accounts / keys 单独列出来：v1 库已有同名旧表，迁移时 DROP 后按新结构重建。
+    # accounts / keys 单独列出来，便于 SCHEMA 复用这两张表的 DDL。
     ACCOUNTS_DDL = """CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL DEFAULT 0,
@@ -227,7 +237,7 @@ class Database:
             ON key_usage_daily(day)""",
     )
 
-    def __init__(self, path, legacy_json=None):
+    def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._local = threading.local()
@@ -246,9 +256,6 @@ class Database:
         self.prune_request_logs()
         self.prune_upstream_usage()
         self.prune_key_usage_daily()
-        # 空库 + 存在旧 state.json：导入后把旧文件备份，避免误当新数据处理。
-        if legacy_json and Path(legacy_json).exists() and not self.query("SELECT 1 FROM accounts LIMIT 1"):
-            self._import_legacy(legacy_json)
 
     # -- connections --------------------------------------------------------
     def _reader(self):
@@ -356,10 +363,8 @@ class Database:
                 pass
 
     # -- migrations ---------------------------------------------------------
-    # 第一个值是目标版本：(2, _v1_to_v2) 表示把库升到版本 2。
-    # v1→v2 的函数定义在模块末尾（本行之后），由文件底部的
-    # Database.MIGRATIONS = (2, _v1_to_v2) + ... 追加进来。
-    MIGRATIONS = ((3, "_v2_to_v3"),)
+    # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
+    MIGRATIONS = ((3, _v2_to_v3),)
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -376,8 +381,7 @@ class Database:
             return
         with self.transaction():
             for _, step in pending:
-                # 允许登记函数名（定义在类之后时用字符串），也允许直接给函数。
-                (step if callable(step) else globals()[step])(self)
+                step(self)
             self._write.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
                 (str(SCHEMA_VERSION),))
@@ -387,80 +391,6 @@ class Database:
             self._write.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
                 (str(version),))
-
-    # -- 旧数据吸收（v1→v2 与 state.json 导入共用同一路径）-----------------
-    def _absorb(self, legacy, entities, keys):
-        """把旧 kv 五键 + 旧 accounts/keys 落到新表。
-
-        legacy: {active, pool, model_registry, account_status, session_bindings}
-        entities: {id: {name, file, enabled, created}}
-        keys: {id: 旧 key 结构}
-        """
-        legacy = legacy if isinstance(legacy, dict) else {}
-        self.save_accounts(entities or {}, legacy.get("account_status") or {})
-        self.save_keys(_upgrade_keys(keys or {}))
-        self._absorb_pool(legacy.get("pool"))
-        self._absorb_model_registry(legacy.get("model_registry"))
-        self.save_bindings(legacy.get("session_bindings") or {})
-
-    def _absorb_pool(self, pool):
-        """旧 kv.pool → settings 单行。routing 不迁移（语义下沉到 keys）。"""
-        if not isinstance(pool, dict):
-            return
-        window = pool.get("sync_window")
-        start, end = "10:00", "20:00"
-        if isinstance(window, list) and len(window) >= 2:
-            start, end = str(window[0]), str(window[1])
-        self.save_settings({
-            "auto_checkin": _to_int(pool.get("auto_checkin"), 1),
-            "checkin_time": str(pool.get("checkin_time") or "09:00"),
-            "affinity_expiry_days": _to_int(pool.get("affinity_expiry_days"), 3),
-            "credit_min_interval": _to_int(pool.get("credit_min_interval"), 60),
-            "sync_start": start,
-            "sync_end": end,
-            "batch_spread": _to_int(pool.get("batch_spread"), 90),
-            "default_routing": "round_robin",
-            "models_updated": _to_int(pool.get("models_updated"), 0),
-        })
-
-    def _absorb_model_registry(self, registry):
-        """旧 kv.model_registry → models 表 + settings.models_updated。
-
-        catalog{} 与 available[] 合并成行：available 里的决定 available=1 与
-        sort_order；只在 catalog 里（上游已消失）的保留成 available=0 行供日志 join。
-        """
-        if not isinstance(registry, dict):
-            return
-        catalog = registry.get("catalog")
-        catalog = catalog if isinstance(catalog, dict) else {}
-        disabled = {str(m) for m in registry.get("disabled") or []}
-        promotions = registry.get("promotions")
-        labels = [str(p.get("label")) for p in promotions
-                  if isinstance(p, dict) and p.get("label")] if isinstance(promotions, list) else []
-        promo = "／".join(dict.fromkeys(labels)) or None
-
-        rows = {}
-        for order, mid in enumerate(registry.get("available") or []):
-            rows[str(mid)] = {"sort_order": order, "available": 1}
-        for mid, info in catalog.items():
-            mid = str(mid)
-            row = rows.setdefault(mid, {"sort_order": 0, "available": 0})
-            info = info if isinstance(info, dict) else {}
-            row.update({
-                "name": str(info.get("name") or mid),
-                "description": info.get("description"),
-                # 传 float 单价：save_models 负责换算成 micro。这里若传已换算的
-                # credits_micro，会被再乘一次 1e6（曾把 3.5 存成 3.5e12）。
-                "credits": _to_float(info.get("credits")),
-                "max_input_tokens": _to_int(info.get("max_input_tokens")) or None,
-                "source": info.get("source") or "upstream",
-            })
-        for mid, row in rows.items():
-            row["enabled"] = 0 if mid in disabled else 1
-            # promo 只给 available 的模型：消失的模型只在表里供日志 join，不参与展示。
-            row["promo"] = promo if row["available"] else None
-        self.save_models(rows)
-        self.update_settings({"models_updated": _to_int(registry.get("updated"), 0)})
 
     # -- settings -----------------------------------------------------------
     SETTINGS_COLUMNS = (
@@ -977,23 +907,6 @@ class Database:
                           "credit": _from_micro(total_row["credit_micro"] or 0),
                           "free": total_row["free"] or 0, "paid": total_row["paid"] or 0}}
 
-    # -- legacy import ------------------------------------------------------
-    def _import_legacy(self, legacy_json):
-        try:
-            legacy = json.loads(Path(legacy_json).read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return
-        if not isinstance(legacy, dict):
-            return
-        with self.transaction():
-            self._absorb(legacy, legacy.get("accounts") or {}, legacy.get("keys") or {})
-        try:
-            backup = Path(legacy_json).with_suffix(".json.bak")
-            Path(legacy_json).replace(backup)
-        except OSError:
-            pass
-
-
 def _status_value(column, merged):
     default = ACCOUNT_STATUS_DEFAULTS.get(column)
     value = merged.get(column)
@@ -1002,78 +915,3 @@ def _status_value(column, merged):
     if column in ACCOUNT_INT_COLUMNS:
         return _to_int(value, default if default is not None else 0)
     return int(value) if isinstance(value, bool) else value
-
-
-def _upgrade_keys(keys):
-    """旧 key 结构 → 新结构：usage 摊平成三列，其余新列取默认值。"""
-    result = {}
-    for kid, item in keys.items():
-        if not isinstance(item, dict):
-            continue
-        usage = _decode_json(item.get("usage"), {})
-        result[kid] = {
-            "name": item.get("name", ""),
-            "hash": item.get("hash", ""),
-            "hint": item.get("hint", ""),
-            "created": _to_int(item.get("created")),
-            "enabled": 1,
-            "revoked_at": None,
-            "expires_at": None,
-            "daily_limit": item.get("daily_limit"),
-            "usage": {"date": usage.get("date"), "count": _to_int(usage.get("count")),
-                      "tokens": _to_int(usage.get("tokens"))},
-            "models": _decode_list(item.get("models")),
-            "accounts": _decode_list(item.get("accounts")),
-            "routing": None,
-        }
-    return result
-
-
-def _v2_to_v3(db):
-    """v2 → v3：给 accounts 补 usage_manual_synced_at 列，并新建 key_usage_daily。
-
-    只做「补结构」，不动数据。补列必须按 PRAGMA table_info 判断后再 ALTER——
-    SCHEMA 里的 CREATE TABLE IF NOT EXISTS 对已存在的表不会补列，老库升上来
-    会缺列，而 save_accounts 只写白名单列，缺列时该字段静默丢失。
-    """
-    # 必须用写连接查 PRAGMA：db.query 走只读连接，在 v1→v2 同事务里 DROP 后
-    # 重建的表它看不到（未提交），会把新列判成缺失，ALTER 就报 duplicate column。
-    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
-    if "usage_manual_synced_at" not in columns:
-        db._write.execute("ALTER TABLE accounts ADD COLUMN usage_manual_synced_at INTEGER")
-    # key_usage_daily 在 SCHEMA 里用 IF NOT EXISTS，老库也会被建出来，这里只补索引。
-    db._write.execute(
-        "CREATE INDEX IF NOT EXISTS idx_key_usage_day ON key_usage_daily(day)")
-
-
-def _v1_to_v2(db):
-    """v1 → v2：旧 accounts/keys 按新结构重建，kv 五键导入具名表后删除 kv。"""
-    legacy = {}
-    if db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"):
-        for row in db.query("SELECT key, value FROM kv"):
-            try:
-                legacy[row["key"]] = json.loads(row["value"])
-            except (ValueError, TypeError):
-                legacy[row["key"]] = None
-
-    entities, keys = {}, {}
-    for row in db.query("SELECT * FROM accounts"):
-        entities[row["id"]] = {"name": row["name"], "file": row["file"],
-                               "enabled": bool(row["enabled"]), "created": row["created"]}
-    for row in db.query("SELECT * FROM keys"):
-        keys[row["id"]] = {key: row[key] for key in row.keys()}
-
-    # v1 里这两张表已存在但列结构是旧的：SCHEMA 的 IF NOT EXISTS 不会改列，
-    # 必须 DROP 后按新 DDL 重建（数据量 ≤100 行，内存里搬运即可）。
-    db._write.execute("DROP TABLE IF EXISTS accounts")
-    db._write.execute("DROP TABLE IF EXISTS keys")
-    db._write.execute(Database.ACCOUNTS_DDL)
-    db._write.execute(Database.KEYS_DDL)
-    db._absorb(legacy, entities, keys)
-    db._write.execute("DROP TABLE IF EXISTS kv")
-
-
-# v1→v2 的函数到这里才定义完，所以迁移表在类外组装。
-# 必须按目标版本升序：v2 建表、v3 补列，顺序反了 v3 会打不存在的表。
-Database.MIGRATIONS = tuple(sorted(((2, _v1_to_v2),) + Database.MIGRATIONS,
-                                   key=lambda item: item[0]))

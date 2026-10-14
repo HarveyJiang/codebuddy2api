@@ -26,7 +26,6 @@
 
 /* 模型管理：工具栏双按钮、行内删除、添加弹窗的勾选项 */
 .toolbar-actions{display:flex;gap:10px;align-items:center}
-.models-body-actions{display:flex;gap:4px;justify-content:flex-end}
 #models-body .danger{color:#a46762;background:none;padding:6px 8px;border-radius:5px;font-size:11px}
 #models-body .danger:hover:not(:disabled){background:#fbefed}
 .check-row{display:flex;align-items:center;gap:9px;font-size:12px;margin:19px 0 7px;font-weight:600}

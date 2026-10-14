@@ -39,15 +39,11 @@ REFRESH_INTERVAL = 6 * 3600
 SOURCE_UPSTREAM = "upstream"
 SOURCE_BUILTIN = "builtin"
 SOURCE_CUSTOM = "custom"
-MODEL_SOURCES = (SOURCE_UPSTREAM, SOURCE_BUILTIN, SOURCE_CUSTOM)
-
-# 管理页的中文标签。
-SOURCE_LABELS = {SOURCE_UPSTREAM: "上游", SOURCE_BUILTIN: "内置", SOURCE_CUSTOM: "自定义"}
 
 
 def normalize_source(value):
     """收敛到三种来源之一；不认识的历史值当作上游。"""
-    return value if value in MODEL_SOURCES else SOURCE_UPSTREAM
+    return value if value in (SOURCE_UPSTREAM, SOURCE_BUILTIN, SOURCE_CUSTOM) else SOURCE_UPSTREAM
 
 
 def _credits_multiplier(text):
@@ -150,31 +146,6 @@ class ModelRegistry:
             # 上次标记 available 的、这次 catalog 里已不在的：写 available=0 保留行。
             db.save_models(rows)
             db.update_settings({"models_updated": self._updated})
-
-    def export_state(self):
-        with self._lock:
-            return {"catalog": dict(self._catalog), "available": list(self._available),
-                    "disabled": sorted(self._disabled), "promotions": list(self._promotions),
-                    "updated": self._updated}
-
-    def import_state(self, state):
-        """兼容旧的 state.json 导入路径（迁移后一般不再走，但保留以支持 state.json）。"""
-        if not isinstance(state, dict):
-            return
-        with self._lock:
-            catalog = state.get("catalog")
-            if isinstance(catalog, dict):
-                self._catalog = {k: v for k, v in catalog.items() if isinstance(v, dict)}
-            available = state.get("available")
-            if isinstance(available, list):
-                self._available = [str(i) for i in available]
-            disabled = state.get("disabled")
-            if isinstance(disabled, list):
-                self._disabled = {str(i) for i in disabled}
-            promotions = state.get("promotions")
-            if isinstance(promotions, list):
-                self._promotions = [p for p in promotions if isinstance(p, dict)]
-            self._updated = int(state.get("updated") or 0)
 
     # -- upstream fetch ----------------------------------------------------
     def fetch(self):

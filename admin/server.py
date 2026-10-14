@@ -130,9 +130,9 @@ class Store:
         self.managers = {}
         self.started = time.time()
         self.events = deque(maxlen=40)
-        self.path = self.root / "state.json"
+        self.path = self.root / "state.db"
         # SQLite 是唯一持久层；内存 self.data 是工作副本，写操作后统一落库。
-        self.db = Database(self.root / "state.db", legacy_json=self.path)
+        self.db = Database(self.path)
         self.data = {"accounts": {}, "account_status": {}, "keys": {}, "pool": {},
                      "session_bindings": {}}
         self._dirty = {}  # 脏标记：值未变则跳过落库，避免每请求重写大 blob
@@ -140,7 +140,7 @@ class Store:
         self.log_buffer = []  # request_logs 批量缓冲，随 5 秒防抖落库
         self._load()
         if not self.data["accounts"] and not self.data["keys"]:
-            # 全新部署（数据库与 state.json 都为空）：从凭据目录导入。
+            # 全新部署（数据库为空）：从凭据目录导入已有凭据。
             for p in sorted(self.auth_dir.glob("*.info")):
                 try:
                     doc = json.loads(p.read_text(encoding="utf-8"))
