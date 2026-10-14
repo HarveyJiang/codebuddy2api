@@ -11,6 +11,7 @@
 - 手动刷新凭据、查询当前周期剩余积分；支持单账号与批量签到，每日自动签到可配置时间（北京时间，默认 09:00）。
 - 查看访问令牌到期时间。到期状态来自本地凭据，是否能刷新及调用成功以真实模型测试为准。
 - 新建和撤销客户端 API Key。新密钥只显示一次，服务端仅持久化 SHA-256 摘要。
+- 模型管理：以官方客户端为准动态维护模型目录，可在页面上逐个启用/禁用模型。
 - 中文接入指南和真实模型调用测试；测试最多等待 90 秒，生成预算上限 1024 tokens，以便推理模型完成思考并输出正文。
 - 独立管理密钥；12 小时 HttpOnly / Secure / SameSite=Strict 会话 cookie，CSRF 校验，登录失败限流，上传请求最大 1 MB。
 
@@ -56,9 +57,35 @@ docker compose -f deploy/admin/docker-compose.yml up -d --build
 
 ## 模型目录更新
 
-在原列表上补充 `hy3`、`hy4-preview`、`kimi-k3`、`glm-5.3`、`glm-5.3-flash`、`deepseek-v4.1-flash` 和 `kimi-k2.8-preview`。API 与管理后台共用 `core/converter.py` 中的模型列表。
+原 `core/converter.py` 中的静态模型列表已不再作为 API 模型来源。模型目录改由管理后台的模型注册表（`admin/models.py`）动态维护，以官方客户端为准。
 
-这些名称不保证每个账号都有调用权限。2026-09-12 的验证中，`kimi-k2.8-preview` 在上游目录可见，但两个账号调用均返回 11102（模型服务不存在）；此项只加入列表，尚未验证调用成功。其余新增模型曾完成最小调用验证，可用性随上游变化。
+### 动态发现
+
+模型注册表启动时（无本地缓存时）以及每天北京时间 04:00–05:00 之间的随机时刻，拉取官方产品配置接口：
+
+```
+GET https://www.workbuddy.cn/v3/config
+User-Agent: CLI/2.63.2 CodeBuddy/2.63.2
+```
+
+该接口免鉴权（仅校验 CLI User-Agent），返回内容与官方客户端缓存的 `acc-product-config-v3.json` 完全一致，包含 cli agent 的模型菜单、`credits` 倍率、`maxInputTokens` 以及 `modelPromotions` 折扣活动。拉取成功写入 `management/state.json` 的 `model_registry` 段；失败则保留上次缓存，从未成功过则回落内置官方列表（`BUILTIN_MODELS`）。
+
+`fast-model`/`balanced-model`/`deep-model` 三档智能路由模型不在 cli 菜单中，由官方固定提供，注册表无条件附加（倍率 ×0.21 / ×0.65 / ×1.20）。
+
+### 启用 / 禁用
+
+管理后台「模型管理」页列出所有模型（官方描述、倍率含当前折扣小字、上下文长度、启用开关），可逐个启用或禁用。禁用状态持久化在 `model_registry.disabled` 中，重启保留。禁用后：
+
+- `GET /v1/models` 不再返回该模型；
+- 客户端以该模型发起 `chat/completions` 时，网关中间件直接返回 400。
+
+### 内置兜底列表
+
+`BUILTIN_MODELS` 为最近一次已知官方快照（含 `minimax-m2.7` ×0.19 等），仅在接口从未成功拉取过时作为最后兜底，正常情况下以接口实时数据为准。
+
+### 测试
+
+`tests/test_model_registry.py` 覆盖拉取解析、三档路由附加、失败保留缓存、无凭据回落内置、启停持久化、内置列表与官方 cli 菜单对齐、折扣昼夜与有效期边界、快照折后价等。
 
 ## 验证
 
@@ -67,6 +94,7 @@ python -m unittest tests.test_admin_server -v
 python -m unittest tests.test_browser_login -v
 python -m unittest tests.test_account_pool -v
 python -m unittest tests.test_request_metrics -v
+python -m unittest tests.test_model_registry -v
 node --check admin/static/app.js
 ```
 
