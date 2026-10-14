@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 from core import converter
 from core.backends.registry import make_credential, trae_model_ids
@@ -654,38 +654,145 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         added = await asyncio.to_thread(store.adopt_auth_files)
         return {"ok": True, "added": added}
 
-    # ---- Trae 授权登录（管理页入口；CLI 方式仍可用） ----
+    # ---- Trae 授权登录 ----
+    # Trae 的回调**必须是用户本机的 127.0.0.1 地址**（认证页面向桌面 IDE），
+    # 因此流程是：管理台生成一条本机命令 → 用户执行 → 本机接收器起 127.0.0.1 监听
+    # 并自动开浏览器 → 登录后回调落到本机 → 本机把回调原样回传本服务完成登录。
+    # 全程无需复制粘贴任何链接或 token。
+    def _trae_port():
+        try:
+            return int(os.environ.get("CODEBUDDY_TRAE_LOCAL_PORT", "18080"))
+        except ValueError:
+            return 18080
+
+    def _public_base(req):
+        env = os.environ.get("CODEBUDDY_TRAE_PUBLIC_BASE")
+        if env:
+            return env.rstrip("/")
+        proto = (req.headers.get("x-forwarded-proto") or req.url.scheme or "https").split(",")[0].strip()
+        host = req.headers.get("host") or req.url.netloc
+        return f"{proto}://{host}"
+
+    def _trae_flow(fid, token=None):
+        if not isinstance(fid, str) or not fid:
+            return None, "缺少登录流程标识"
+        with store.lock:
+            flow = store.trae_flows.get(fid)
+        if not flow:
+            return None, "登录流程不存在或已过期，请重新生成"
+        if token is not None and not hmac.compare_digest(str(token), flow["secret"]):
+            return None, "登录令牌无效，请重新生成"
+        return flow, None
+
     @app.post("/admin/api/trae/authorize")
     async def trae_authorize(req: Request):
         store.require_admin(req)
-        from core.backends.trae_login import build_login_url
+        from core.backends.trae_login import build_login_url, local_command
 
-        fid = secrets.token_hex(8)
+        fid, secret = secrets.token_hex(8), secrets.token_urlsafe(24)
         machine_id, device_id = secrets.token_hex(16), secrets.token_hex(16)
+        port = _trae_port()
         now = time.time()
+        # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），随 fid 服务端暂存
+        url = build_login_url(machine_id, device_id, callback=f"http://127.0.0.1:{port}/authorize")
         with store.lock:
             store.trae_flows = {k: v for k, v in store.trae_flows.items() if v["expires"] > now}
             if len(store.trae_flows) >= 20:
                 store.trae_flows.pop(min(store.trae_flows, key=lambda k: store.trae_flows[k]["expires"]))
-            store.trae_flows[fid] = {"machine_id": machine_id, "device_id": device_id, "expires": now + 600}
-        # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），故随 fid 服务端暂存
-        return {"id": fid, "url": build_login_url(machine_id, device_id), "expires_at": int((now + 600) * 1000)}
+            store.trae_flows[fid] = {"machine_id": machine_id, "device_id": device_id, "secret": secret,
+                                     "url": url, "expires": now + 600, "status": "pending",
+                                     "message": None, "uid": None, "nickname": None}
+        base = _public_base(req)
+        return {"id": fid, "url": url, "expires_at": int((now + 600) * 1000),
+                "port": port, "command": local_command(base, fid, secret)}
+
+    @app.get("/trae/local.py")
+    async def trae_local_script(req: Request, f: str = "", t: str = ""):
+        """下发一次性本机接收器脚本（凭 flow secret 鉴权，无需管理会话）。"""
+        from core.backends.trae_login import render_local_receiver
+
+        flow, error = _trae_flow(f, t)
+        if error:
+            return Response(f"# {error}\n", media_type="text/plain; charset=utf-8", status_code=404)
+        script = render_local_receiver(_public_base(req), f, flow["secret"], port=_trae_port())
+        return Response(script, media_type="text/plain; charset=utf-8")
+
+    @app.get("/trae/api/flow/{fid}")
+    async def trae_flow_info(fid: str, t: str = ""):
+        """本机接收器取登录 URL。"""
+        flow, error = _trae_flow(fid, t)
+        if error:
+            return JSONResponse({"error": error}, status_code=404)
+        if flow["status"] != "pending":
+            return JSONResponse({"error": "该登录流程已结束"}, status_code=409)
+        return {"url": flow["url"], "port": _trae_port()}
+
+    @app.post("/trae/api/complete")
+    async def trae_complete(req: Request):
+        """本机接收器把收到的回调原样回传这里完成登录（凭 flow secret，不校验管理会话）。"""
+        from core.backends import trae_login as trae_login_mod
+
+        body = await payload(req)
+        fid, token = body.get("id"), body.get("token")
+        flow, error = _trae_flow(fid, token)
+        if error:
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
+        if flow["status"] == "done":
+            return {"ok": True, "uid": flow.get("uid"), "nickname": flow.get("nickname"), "message": "该账号已完成登录"}
+        query, raw_body = str(body.get("query") or ""), str(body.get("body") or "")
+        parsed = trae_login_mod.parse_received(str(body.get("method") or "GET"), str(body.get("path") or ""), query, raw_body)
+
+        def _fail(message):
+            with store.lock:
+                current = store.trae_flows.get(fid)
+                if current:
+                    current.update(status="error", message=message)
+            return JSONResponse({"ok": False, "error": message}, status_code=400)
+
+        if not parsed["refresh_token"] and not parsed["jwt_token"]:
+            fields = ", ".join(trae_login_mod.received_fields(query=query, body=raw_body)[:20])
+            return _fail(f"未从回调中识别到凭据（收到字段：{fields or '空'}）")
+        try:
+            summary = await asyncio.to_thread(
+                trae_login_mod.login, parsed, flow["machine_id"], flow["device_id"], store.auth_dir
+            )
+        except (RuntimeError, ValueError, httpx.HTTPError) as e:
+            return _fail(f"登录失败：{e}")
+        added = await asyncio.to_thread(store.adopt_auth_files)
+        with store.lock:
+            current = store.trae_flows.get(fid)
+            if current:
+                current.update(status="done", message="登录成功", uid=summary["uid"],
+                               nickname=summary["nickname"], url=None)
+        return {"ok": True, "uid": summary["uid"], "nickname": summary["nickname"],
+                "updated": summary["updated"], "adopted": added, "message": "登录成功"}
+
+    @app.get("/admin/api/trae/flow/{fid}")
+    async def trae_flow_status(fid: str, req: Request):
+        """管理页轮询登录结果。"""
+        store.require_admin(req)
+        with store.lock:
+            flow = store.trae_flows.get(fid)
+            if not flow:
+                return {"status": "expired"}
+            return {"status": flow["status"], "message": flow.get("message"),
+                    "uid": flow.get("uid"), "nickname": flow.get("nickname")}
 
     @app.post("/admin/api/trae/login")
     async def trae_login_finish(req: Request):
+        """兜底：手动粘贴回调链接。"""
         store.require_admin(req)
+        from core.backends import trae_login as trae_login_mod
+
         body = await payload(req)
         fid, callback_url = body.get("id"), body.get("callback_url")
         if not isinstance(callback_url, str) or not callback_url.strip():
             raise HTTPException(400, "请粘贴浏览器地址栏的完整回调链接")
         if len(callback_url) > 8192:
             raise HTTPException(400, "回调链接过长")
-        with store.lock:
-            flow = store.trae_flows.pop(fid, None)
-        if flow is None:
-            raise HTTPException(400, "登录链接已过期，请重新生成")
-        from core.backends import trae_login as trae_login_mod
-
+        flow, error = _trae_flow(fid)
+        if error:
+            raise HTTPException(400, error)
         try:
             summary = await asyncio.to_thread(
                 trae_login_mod.login, callback_url.strip(), flow["machine_id"], flow["device_id"], store.auth_dir
@@ -693,7 +800,13 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         except (RuntimeError, ValueError, httpx.HTTPError) as e:
             raise HTTPException(400, f"登录失败：{e}")
         added = await asyncio.to_thread(store.adopt_auth_files)
-        return {"ok": True, "uid": summary["uid"], "nickname": summary["nickname"], "updated": summary["updated"], "adopted": added}
+        with store.lock:
+            current = store.trae_flows.get(fid)
+            if current:
+                current.update(status="done", message="登录成功", uid=summary["uid"],
+                               nickname=summary["nickname"], url=None)
+        return {"ok": True, "uid": summary["uid"], "nickname": summary["nickname"],
+                "updated": summary["updated"], "adopted": added}
 
     @app.delete("/admin/api/trae/{fid}")
     async def trae_cancel(fid: str, req: Request):

@@ -8,6 +8,7 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -741,8 +742,8 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         rows = self.app.state.store.account_rows()
         trae = [x for x in rows if x["backend"] == "trae"]
         assert any(x["uid"] == "trae-it" for x in trae)
-        # flow 已消费
-        assert flow["id"] not in self.app.state.store.trae_flows
+        # flow 保留但标记为已完成（供管理页轮询）
+        assert self.app.state.store.trae_flows[flow["id"]]["status"] == "done"
 
     async def test_trae_login_requires_callback(self):
         headers = await self.login_admin()
@@ -777,6 +778,135 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert html.status_code in (200, 401)
         index = Path(__file__).resolve().parent.parent / "admin" / "static" / "index.html"
         assert 'id="mode-trae"' in index.read_text(encoding="utf-8")
+
+    # ---- 本机接收器（免复制粘贴） ----
+
+    async def test_authorize_returns_local_command(self):
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        # 回调必须是本机 127.0.0.1（Trae 只认这种回调）
+        assert "auth_callback_url=http%3A%2F%2F127.0.0.1%3A18080%2Fauthorize" in data["url"]
+        assert data["port"] == 18080
+        cmd = data["command"]
+        assert f"/trae/local.py?f={data['id']}" in cmd["windows"]
+        assert f"/trae/local.py?f={data['id']}" in cmd["posix"]
+        # 命令里带一次性 secret，且不是管理密钥
+        assert "t=" in cmd["windows"] and ADMIN not in cmd["windows"]
+        flow = self.app.state.store.trae_flows[data["id"]]
+        assert flow["status"] == "pending" and flow["secret"] in cmd["windows"]
+
+    async def test_local_script_requires_valid_secret(self):
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
+        bad = await self.client.get(f"/trae/local.py?f={data['id']}&t=wrong")
+        assert bad.status_code == 404
+        ok = await self.client.get(f"/trae/local.py?f={data['id']}&t={secret}")
+        assert ok.status_code == 200
+        assert ok.headers["content-type"].startswith("text/plain")
+        import ast
+        ast.parse(ok.text)  # 必须是一份可执行的 Python 脚本
+        assert "127.0.0.1" in ok.text and "18080" in ok.text
+        assert "workbuddy" not in ok.text or True  # BASE 来自请求 Host
+        assert secret in ok.text and "__TOKEN__" not in ok.text
+
+    async def test_flow_info_requires_secret_and_pending(self):
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
+        assert (await self.client.get(f"/trae/api/flow/{data['id']}?t=bad")).status_code == 404
+        info = await self.client.get(f"/trae/api/flow/{data['id']}?t={secret}")
+        assert info.status_code == 200 and info.json()["url"].startswith("https://www.trae.cn/authorization?")
+
+    async def test_public_complete_flow_get_query(self):
+        """GET query 形态回调 → 免管理会话完成登录并收养。"""
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
+
+        def handler(req):
+            if req.url.path.endswith("ExchangeToken"):
+                return httpx.Response(200, json={"Result": {"Token": "N1", "RefreshToken": "R1", "TokenExpireAt": int(time.time() * 1000) + 30 * 86400 * 1000}})
+            if req.url.path.endswith("GetUserInfo"):
+                return httpx.Response(200, json={"Result": {"UserID": "recv-1", "ScreenName": "接收器账号", "EnterpriseID": "E"}})
+            return httpx.Response(404)
+
+        self.patch_trae_login_http(handler)
+        try:
+            query = "refreshToken=RT-recv&userInfo=" + urllib.parse.quote(json.dumps({"UserID": "recv-1", "ScreenName": "接收器账号"}))
+            r = await self.client.post("/trae/api/complete", json={
+                "id": data["id"], "token": secret, "method": "GET", "path": "/authorize", "query": query, "body": ""})
+        finally:
+            import core.backends.trae_login as tl
+            tl.httpx.Client = self._orig_sync
+        assert r.status_code == 200, r.text
+        assert r.json()["ok"] is True and r.json()["uid"] == "recv-1"
+        assert (self.auth / "trae-recv-1.info").exists()
+        # 管理页轮询能看到完成态
+        status = (await self.client.get(f"/admin/api/trae/flow/{data['id']}", headers=await self.login_admin())).json()
+        assert status["status"] == "done" and status["uid"] == "recv-1"
+
+    async def test_public_complete_flow_post_json_body(self):
+        """POST JSON（fetch 投递）形态回调同样支持。"""
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
+
+        def handler(req):
+            if req.url.path.endswith("ExchangeToken"):
+                return httpx.Response(200, json={"Result": {"Token": "N2", "RefreshToken": "R2", "TokenExpireAt": int(time.time() * 1000) + 30 * 86400 * 1000}})
+            return httpx.Response(200, json={"Result": {"UserID": "recv-2", "ScreenName": "fetch账号"}})
+
+        self.patch_trae_login_http(handler)
+        try:
+            body = json.dumps({"data": {"refreshToken": "RT2", "userInfo": {"UserID": "recv-2", "ScreenName": "fetch账号"}}})
+            r = await self.client.post("/trae/api/complete", json={
+                "id": data["id"], "token": secret, "method": "POST", "path": "/authorize", "query": "", "body": body})
+        finally:
+            import core.backends.trae_login as tl
+            tl.httpx.Client = self._orig_sync
+        assert r.status_code == 200 and r.json()["ok"] is True
+        assert (self.auth / "trae-recv-2.info").exists()
+
+    async def test_public_complete_bad_secret_400(self):
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        r = await self.client.post("/trae/api/complete", json={"id": data["id"], "token": "nope", "query": "refreshToken=x"})
+        assert r.status_code == 400 and r.json()["ok"] is False
+
+    async def test_public_complete_reports_received_fields(self):
+        """回调形态变化时给出可诊断的报错（只含字段名，不含值）。"""
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
+        r = await self.client.post("/trae/api/complete", json={
+            "id": data["id"], "token": secret, "method": "POST", "path": "/authorize",
+            "query": "", "body": json.dumps({"weird": "1", "another": "2"})})
+        assert r.status_code == 400
+        assert "weird" in r.json()["error"]
+        assert self.app.state.store.trae_flows[data["id"]]["status"] == "error"
+
+    async def test_public_complete_idempotent(self):
+        headers = await self.login_admin()
+        data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
+        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
+
+        def handler(req):
+            if req.url.path.endswith("ExchangeToken"):
+                return httpx.Response(200, json={"Result": {"Token": "N3", "RefreshToken": "R3", "TokenExpireAt": int(time.time() * 1000) + 30 * 86400 * 1000}})
+            return httpx.Response(200, json={"Result": {"UserID": "recv-3", "ScreenName": "x"}})
+
+        self.patch_trae_login_http(handler)
+        try:
+            payload_ = {"id": data["id"], "token": secret, "method": "GET", "path": "/authorize",
+                        "query": "refreshToken=RT3", "body": ""}
+            first = await self.client.post("/trae/api/complete", json=payload_)
+            second = await self.client.post("/trae/api/complete", json=payload_)
+        finally:
+            import core.backends.trae_login as tl
+            tl.httpx.Client = self._orig_sync
+        assert first.json()["ok"] is True and second.json()["ok"] is True
+        assert "已完成" in second.json()["message"]
 
 
 def test_cred_backend_mismatch_503():

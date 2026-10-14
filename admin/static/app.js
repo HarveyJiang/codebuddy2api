@@ -1,7 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
-let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null;
+let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null, traeTimer = null, traePlatform = (/Windows/i.test(navigator.userAgent) ? "windows" : "posix");
 const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
@@ -192,31 +192,69 @@ function setAccountMode(mode) {
   $("account-error").textContent = "";
 }
 function clearTrae() {
-  const previous = traeFlow; traeFlow = null;
+  const previous = traeFlow; traeFlow = null; clearTimeout(traeTimer);
   if (previous && csrf) api("trae/" + previous.id, {method:"DELETE"}).catch(() => {});
-  $("trae-link-box").hidden = true; $("trae-open").removeAttribute("href");
-  $("trae-start").disabled = false; $("trae-start").textContent = "生成 Trae 登录链接 ↗";
+  $("trae-cmd-box").hidden = true; $("trae-cmd").textContent = "";
+  $("trae-start").disabled = false; $("trae-start").textContent = "生成登录命令 ↗";
   $("trae-callback").value = ""; $("trae-submit").disabled = false;
   $("trae-status").className = "banner oauth-status";
-  $("trae-status").textContent = "Trae 登录链接 10 分钟内有效。同一账号重新登录会更新凭据。";
+  $("trae-status").textContent = "点击上方按钮生成登录命令，链接 10 分钟内有效。";
+}
+function renderTraeCommand() {
+  if (!traeFlow) return;
+  const label = traePlatform === "windows" ? "Windows（PowerShell / CMD）" : "macOS / Linux";
+  $("trae-cmd").textContent = traeFlow.command[traePlatform];
+  $("trae-cmd-switch").textContent = traePlatform === "windows" ? "当前：Windows · 切换到 macOS / Linux" : "当前：macOS / Linux · 切换到 Windows";
+  $("trae-status").textContent = `命令已就绪（${label}）。复制到本机终端执行——浏览器会自动打开 Trae 登录页。`;
 }
 $("mode-browser").addEventListener("click", () => setAccountMode("browser"));
 $("mode-trae").addEventListener("click", () => setAccountMode("trae"));
 $("mode-file").addEventListener("click", () => setAccountMode("file"));
+async function pollTrae() {
+  if (!traeFlow) return;
+  const flow = traeFlow;
+  try {
+    const result = await api("trae/flow/" + flow.id);
+    if (!traeFlow || traeFlow.id !== flow.id) return;
+    if (result.status === "done") {
+      traeFlow = null;
+      $("trae-status").className = "banner oauth-status";
+      $("account-dialog").close(); await refresh();
+      toast(`Trae 账号已添加${result.nickname ? "：" + result.nickname : ""}`);
+      return;
+    }
+    if (result.status === "error") {
+      $("trae-status").className = "banner warning oauth-status";
+      $("trae-status").textContent = result.message || "登录失败，请重新生成命令";
+      return;
+    }
+    if (result.status === "expired") {
+      $("trae-status").className = "banner warning oauth-status";
+      $("trae-status").textContent = "登录链接已过期，请重新生成。";
+      return;
+    }
+    $("trae-status").textContent = $("trae-status").textContent.replace(/\s*·\s*等待中\.\.\.$/, "") + " · 等待中…";
+    traeTimer = setTimeout(pollTrae, 3000);
+  } catch (e) {
+    traeTimer = setTimeout(pollTrae, 5000);
+  }
+}
 $("trae-start").addEventListener("click", async () => {
   clearTrae();
   $("trae-start").disabled = true; $("trae-start").textContent = "正在生成…"; $("account-error").textContent = "";
   try {
     const flow = await api("trae/authorize", {method:"POST", body:{}});
-    traeFlow = flow; $("trae-open").href = flow.url; $("trae-link-box").hidden = false;
-    $("trae-start").textContent = "重新生成链接";
-    $("trae-status").textContent = "登录链接已就绪：打开 Trae 完成登录，然后粘贴回调链接。";
+    traeFlow = flow; $("trae-cmd-box").hidden = false;
+    renderTraeCommand();
+    $("trae-start").textContent = "重新生成命令";
+    traeTimer = setTimeout(pollTrae, 4000);
   } catch (e) { $("account-error").textContent = e.message; }
   finally { $("trae-start").disabled = false; }
 });
-$("trae-copy").addEventListener("click", () => { if (traeFlow) copy(traeFlow.url); });
+$("trae-copy").addEventListener("click", () => { if (traeFlow) copy(traeFlow.command[traePlatform]); });
+$("trae-cmd-switch").addEventListener("click", () => { traePlatform = traePlatform === "windows" ? "posix" : "windows"; renderTraeCommand(); });
 $("trae-submit").addEventListener("click", async () => {
-  if (!traeFlow) { $("account-error").textContent = "请先生成 Trae 登录链接"; return; }
+  if (!traeFlow) { $("account-error").textContent = "请先生成登录命令"; return; }
   const callback = $("trae-callback").value.trim();
   if (!callback) { $("account-error").textContent = "请粘贴浏览器地址栏的完整回调链接"; return; }
   $("trae-submit").disabled = true; $("account-error").textContent = "";
