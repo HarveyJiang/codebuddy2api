@@ -83,32 +83,33 @@ _CTX = 131072
 # 静态兜底表（冷启动 / 上游不可用时）：= 官方菜单 solo_agent_remote 组（官网界面所见 20 个）。
 # 隐藏/别名的 config_name（custom_model_*、*subagent、summary、seed-code-pro-0430 等）不入表。
 _TRAE_STATIC_SPECS = (
-    ("Doubao-Seed-Evolving", "Seed-Evolving", 256000),
-    ("Doubao-Seed-2.1-Pro", "Seed-2.1-Pro-0915", 256000),
-    ("Doubao-Seed-2.1-Turbo", "Seed-2.1-Turbo", 256000),
-    ("Doubao-Seed-Code", "Seed-Code", 256000),
-    ("mimo-v2.6-flash", "MiMo-V2.6-Flash", 200000),
-    ("mimo-v2.6-pro", "MiMo-V2.6-Pro", 200000),
-    ("step-5-preview", "Step-5-Preview", 200000),
-    ("glm-5.3-flashx", "GLM-5.3-FlashX", 200000),
-    ("glm-5.3-flash", "GLM-5.3-Flash", 200000),
-    ("glm-5.3", "GLM-5.3", 200000),
-    ("glm-5.2", "GLM-5.2", 200000),
-    ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 200000),
-    ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash", 200000),
-    ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro", 200000),
-    ("kimi-k3", "Kimi-K3", 200000),
-    ("kimi-k2.7-code", "Kimi-K2.7-Code", 200000),
-    ("kimi-k2.6", "Kimi-K2.6", 200000),
-    ("minimax-m3", "MiniMax-M3", 200000),
-    ("qwen3.8-max", "Qwen3.8-Max", 200000),
-    ("qwen-3.7-plus", "Qwen3.7-Plus", 200000),
+    # (config_name, 官方展示名, 上下文 dev, max 模式上限；0 表示无 max 模式)
+    ("Doubao-Seed-Evolving", "Seed-Evolving", 256000, 1000000),
+    ("Doubao-Seed-2.1-Pro", "Seed-2.1-Pro-0915", 256000, 1000000),
+    ("Doubao-Seed-2.1-Turbo", "Seed-2.1-Turbo", 256000, 0),
+    ("Doubao-Seed-Code", "Seed-Code", 256000, 0),
+    ("mimo-v2.6-flash", "MiMo-V2.6-Flash", 200000, 981504),
+    ("mimo-v2.6-pro", "MiMo-V2.6-Pro", 200000, 981504),
+    ("step-5-preview", "Step-5-Preview", 200000, 1000000),
+    ("glm-5.3-flashx", "GLM-5.3-FlashX", 200000, 1000000),
+    ("glm-5.3-flash", "GLM-5.3-Flash", 200000, 1000000),
+    ("glm-5.3", "GLM-5.3", 200000, 1000000),
+    ("glm-5.2", "GLM-5.2", 200000, 1000000),
+    ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 200000, 1000000),
+    ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash", 200000, 1000000),
+    ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro", 200000, 1000000),
+    ("kimi-k3", "Kimi-K3", 200000, 1000000),
+    ("kimi-k2.7-code", "Kimi-K2.7-Code", 200000, 0),
+    ("kimi-k2.6", "Kimi-K2.6", 200000, 0),
+    ("minimax-m3", "MiniMax-M3", 200000, 1000000),
+    ("qwen3.8-max", "Qwen3.8-Max", 200000, 1000000),
+    ("qwen-3.7-plus", "Qwen3.7-Plus", 200000, 1000000),
 )
 
 TRAE_STATIC_MODELS = [
     {"id": mid, "name": name, "object": "model", "created": _CREATED, "owned_by": _OWNED_BY,
-     "context_length": ctx}
-    for mid, name, ctx in _TRAE_STATIC_SPECS
+     "context_length": ctx, "max_context_length": mx or None}
+    for mid, name, ctx, mx in _TRAE_STATIC_SPECS
 ]
 
 # ---------------------------------------------------------------------------
@@ -523,10 +524,13 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
             if not mid or mid in seen:
                 continue
             seen.add(mid)
-            ctx = (item.get("context_window_tokens") or {}).get("dev")
+            window = item.get("context_window_tokens") or {}
+            dev, mx = window.get("dev"), window.get("max")
             out.append({"id": mid, "name": str(item.get("display_name") or mid),
                         "function": str(group.get("function") or ""),
-                        "context_length": int(ctx) if isinstance(ctx, (int, float)) and ctx else None,
+                        "context_length": int(dev) if isinstance(dev, (int, float)) and dev else None,
+                        # max 模式下的上下文上限（0/缺失表示没有 max 模式）
+                        "max_context_length": int(mx) if isinstance(mx, (int, float)) and mx else None,
                         "credits": _feature_rate(item.get("features"))})
     if not out:
         raise TraeAPIError("模型菜单接口返回空列表")
@@ -626,7 +630,9 @@ def build_trae_catalog(menu: list[dict] | None) -> list[dict]:
             continue
         seen.add(mid)
         out.append({"id": mid, "name": entry.get("name") or mid,
-                    "context_length": entry.get("context_length"), "credits": entry.get("credits")})
+                    "context_length": entry.get("context_length"),
+                    "max_context_length": entry.get("max_context_length"),
+                    "credits": entry.get("credits")})
     return out
 
 

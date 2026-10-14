@@ -1085,9 +1085,24 @@ def test_fetch_remote_models_parses_menu_and_dedupes():
         models = T.fetch_remote_models(client, {})
     assert [m["id"] for m in models] == ["glm-5.3", "Doubao-Seed-Code"]
     # agent 组优先 → 取 agent 的上下文/倍率，组内去重，且带 function 标记
-    assert models[0] == {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39,
-                         "function": "solo_agent_remote"}
+    assert models[0] == {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000,
+                         "max_context_length": None, "credits": 0.39, "function": "solo_agent_remote"}
     assert models[1]["credits"] == 0.03 and models[1]["context_length"] == 256000
+
+
+def test_fetch_remote_models_keeps_max_mode_window():
+    """context_window_tokens 的 max（max 模式上限）也要带上；0/缺失 → None。"""
+    payload = _menu(("solo_agent_remote", [
+        {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000, "max": 1000000}},
+        {"name": "mimo-v2.6-pro", "display_name": "MiMo", "context_window_tokens": {"dev": 200000, "max": 981504}},
+        {"name": "kimi-k2.6", "display_name": "Kimi", "context_window_tokens": {"dev": 200000, "max": 0}},
+        {"name": "Doubao-Seed-Code", "display_name": "Code", "context_window_tokens": {"dev": 256000}},
+    ]))
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        models = T.fetch_remote_models(client, {})
+    got = {m["id"]: (m["context_length"], m["max_context_length"]) for m in models}
+    assert got == {"glm-5.3": (200000, 1000000), "mimo-v2.6-pro": (200000, 981504),
+                   "kimi-k2.6": (200000, None), "Doubao-Seed-Code": (256000, None)}
 
 
 def test_fetch_remote_models_errors():
@@ -1105,15 +1120,16 @@ def test_fetch_remote_models_errors():
 
 def test_build_trae_catalog_uses_agent_group():
     """目录取官方菜单的 solo_agent_remote 组（= 官网界面所见），而非其它 function 组。"""
-    menu = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78,
-             "function": "solo_agent_remote"},
+    menu = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "max_context_length": 500000,
+             "credits": 0.78, "function": "solo_agent_remote"},
             {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39,
              "function": "solo_agent_remote"},
             {"id": "design-only", "name": "Design", "context_length": 1000, "credits": 0.1,
              "function": "solo_design_remote"}]
     catalog = T.build_trae_catalog(menu)
     assert [m["id"] for m in catalog] == ["glm-5.2", "glm-5.3"]
-    assert catalog[0] == {"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78}
+    assert catalog[0] == {"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000,
+                          "max_context_length": 500000, "credits": 0.78}
     # 该组缺失 → 退回全部组；内部槽位始终剔除
     only_design = [{"id": "design-only", "name": "D", "context_length": 1000, "credits": 0.1,
                     "function": "solo_design_remote"},

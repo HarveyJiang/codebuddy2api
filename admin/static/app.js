@@ -84,7 +84,10 @@ function renderModels() {
     const credits = m.credits === null || m.credits === undefined ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
     const promoNote = m.promo ? `<small class="cell-note">${esc(m.promo.label)} ×${m.promo.credits}</small>` : "";
     const ctx = m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : m.max_input_tokens) : "—";
-    return `<tr><td><strong>${esc(m.id)}</strong>${m.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}<small class="cell-note">${esc(m.name || "")}</small></td><td>${esc(m.description || "—")}</td><td><span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${credits}</span>${promoNote}</td><td class="mono">${ctx}</td><td><span class="pill ${m.enabled ? "green" : ""}">${m.enabled ? "启用" : "禁用"}</span></td><td class="align-right"><button data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}">${m.enabled ? "禁用" : "启用"}</button></td></tr>`;
+    // max 模式（上游 max_mode=true）下的上下文上限；无 max 模式则不显示
+    const ctxNote = m.max_context_length && m.max_context_length > (m.max_input_tokens || 0)
+      ? `<small class="cell-note">max 模式 ${Math.round(m.max_context_length / 1000)}K</small>` : "";
+    return `<tr><td><strong>${esc(m.id)}</strong>${m.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}<small class="cell-note">${esc(m.name || "")}</small></td><td>${esc(m.description || "—")}</td><td><span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${credits}</span>${promoNote}</td><td class="mono">${ctx}${ctxNote}</td><td><span class="pill ${m.enabled ? "green" : ""}">${m.enabled ? "启用" : "禁用"}</span></td><td class="align-right"><button data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}">${m.enabled ? "禁用" : "启用"}</button></td></tr>`;
   }).join("") || '<tr><td colspan="6" class="muted">模型列表为空，请点击「立即拉取」。</td></tr>';
 }
 function renderDashboard() {

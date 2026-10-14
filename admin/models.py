@@ -253,7 +253,9 @@ class ModelRegistry:
             if self._trae_available:
                 return
             self._trae_catalog = {m["id"]: {"name": m["id"], "description": None, "credits": None,
-                                            "max_input_tokens": m.get("context_length"), "source": "builtin"}
+                                            "max_input_tokens": m.get("context_length"),
+                                            "max_context_length": m.get("max_context_length"),
+                                            "source": "builtin"}
                                   for m in trae_backend.TRAE_STATIC_MODELS}
             self._trae_available = [m["id"] for m in trae_backend.TRAE_STATIC_MODELS]
             self._trae_updated = 0
@@ -288,7 +290,9 @@ class ModelRegistry:
                 catalog[mid] = {"name": str(e.get("name") or mid),
                                 "description": e.get("description") or None,
                                 "credits": e.get("credits"),
-                                "max_input_tokens": e.get("context_length"), "source": "upstream"}
+                                "max_input_tokens": e.get("context_length"),
+                                "max_context_length": e.get("max_context_length"),
+                                "source": "upstream"}
             if not catalog:
                 return False
             self._trae_catalog = catalog
