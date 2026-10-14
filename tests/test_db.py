@@ -20,6 +20,13 @@ from admin.db import Database, MICRO
 from admin.server import Store
 from test_admin_server import credential
 
+def _day_offset(days):
+    """相对今天偏移 N 天的北京时间日期字符串。"""
+    from datetime import datetime, timedelta, timezone
+    cn = timezone(timedelta(hours=8))
+    return (datetime.now(cn) + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 ADMIN = "admin-test-credential-long-enough"
 # request_logs 启动时会裁掉 93 天前的行，测试数据必须用「现在」的时间戳。
 NOW = int(time.time())
@@ -97,6 +104,78 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(k["accounts"], [])
         self.assertEqual(k["routing"], "random")
         self.assertEqual(k["daily_limit"], 10)
+        db.close()
+
+    def test_key_usage_daily_upsert_and_series(self):
+        """当日累计快照：同天覆盖（取更大值），换天新增行。"""
+        db = Database(self.root / "t.db")
+        keys = {"k1": {"name": "K1", "usage": {"date": "2026-10-14", "count": 3, "tokens": 100}}}
+        db.save_key_usage_daily(keys)
+        # 同天再写更大的累计值：覆盖，不是累加。
+        keys["k1"]["usage"] = {"date": "2026-10-14", "count": 7, "tokens": 250}
+        db.save_key_usage_daily(keys)
+        rows = db.query("SELECT * FROM key_usage_daily")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["count"], 7)
+        self.assertEqual(rows[0]["tokens"], 250)
+        # 换天 = 新行。
+        keys["k1"]["usage"] = {"date": "2026-10-15", "count": 2, "tokens": 50}
+        db.save_key_usage_daily(keys)
+        self.assertEqual(len(db.query("SELECT * FROM key_usage_daily")), 2)
+        # usage_date 为空的 key 不写（避免每天造空行）。
+        db.save_key_usage_daily({"k2": {"name": "K2", "usage": {}}})
+        self.assertEqual(len(db.query("SELECT * FROM key_usage_daily")), 2)
+        # 序列与合计。
+        series = db.key_usage_series(days=30)
+        self.assertEqual(series["total"]["count"], 9)
+        self.assertEqual(series["total"]["tokens"], 300)
+        self.assertEqual(len(series["keys"][0]["series"]), 2)
+        db.close()
+
+    def test_key_usage_daily_pruned_on_boot(self):
+        db = Database(self.root / "t.db")
+        old_day = _day_offset(-100)
+        db.save_key_usage_daily({"k1": {"name": "K", "usage": {"date": old_day, "count": 1}}},
+                                day=old_day)
+        self.assertEqual(len(db.query("SELECT * FROM key_usage_daily")), 1)
+        db.close()
+        # 重开触发裁剪。
+        db = Database(self.root / "t.db")
+        self.assertEqual(len(db.query("SELECT * FROM key_usage_daily")), 0)
+        db.close()
+
+    def test_upstream_usage_paging_and_report(self):
+        db = Database(self.root / "t.db")
+        db.save_upstream_usage([
+            {"request_id": f"r{i}", "account_id": "a1", "account_name": "账号一",
+             "credit": 0.0 if i % 2 else 0.5, "model": "hy3" if i % 3 else "step-5",
+             "client": "WorkBuddy", "request_time": NOW - i * 60, "agent_purpose": ""}
+            for i in range(25)])
+        page = db.page_upstream_usage(limit=10, offset=0)
+        self.assertEqual(len(page["rows"]), 10)
+        self.assertEqual(page["total"], 25)
+        self.assertEqual(page["limit"], 10)
+        # 倒序：第一页第一条是最新（request_time 最大）。
+        self.assertEqual(page["rows"][0]["request_id"], "r0")
+        # credit 读回是 float（_from_micro 还原）。
+        self.assertIsInstance(page["rows"][1]["credit"], float)
+        second = db.page_upstream_usage(limit=10, offset=10)
+        self.assertEqual(second["rows"][0]["request_id"], "r10")
+        # 时间过滤。
+        filtered = db.page_upstream_usage(since=NOW - 5 * 60, limit=100)
+        self.assertEqual(filtered["total"], 6)
+        # 报表：免费与付费分开计。
+        report = db.upstream_usage_report(group_by="day")
+        self.assertEqual(report["total"]["count"], 25)
+        self.assertEqual(report["total"]["paid"], 13)   # i 为偶数 -> credit 0.5
+        self.assertEqual(report["total"]["free"], 12)
+        self.assertAlmostEqual(report["total"]["credit"], 13 * 0.5, places=6)
+        # 按模型分组，合计与总量一致。
+        by_model = db.upstream_usage_report(group_by="model")
+        self.assertEqual(sum(g["count"] for g in by_model["groups"]), 25)
+        # 非法维度必须报错，不能拼进 SQL。
+        with self.assertRaises(ValueError):
+            db.upstream_usage_report(group_by="model; DROP TABLE keys")
         db.close()
 
     def test_models_upsert_and_available_filter(self):

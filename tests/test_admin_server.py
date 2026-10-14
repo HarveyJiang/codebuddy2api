@@ -194,6 +194,72 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         metrics = (await self.client.get("/admin/api/overview")).json()["metrics"]
         self.assertEqual(metrics["completed"], 25)
 
+    async def test_usage_endpoints_paging_report_and_throttle(self):
+        """用量三个接口：分页只读本地、报表聚合、手动拉取的防抖与不写 usage_synced_at。"""
+        await self.login()
+        store = self.app.state.store
+        now = int(time.time())
+        store.db.save_upstream_usage([
+            {"request_id": f"r{i}", "account_id": "a1", "account_name": "账号一",
+             "credit": 0.0 if i % 2 else 0.5, "model": "hy3", "client": "WorkBuddy",
+             "request_time": now - i * 60, "agent_purpose": ""}
+            for i in range(25)])
+        # 分页：默认 100，这里显式 10。
+        page = (await self.client.get("/admin/api/usage?limit=10&offset=0")).json()
+        self.assertEqual(len(page["rows"]), 10)
+        self.assertEqual(page["total"], 25)
+        self.assertEqual(page["rows"][0]["request_id"], "r0")
+        # 非法参数 400，不能变成 500。
+        self.assertEqual((await self.client.get("/admin/api/usage?limit=abc")).status_code, 400)
+        self.assertEqual((await self.client.get("/admin/api/usage?start=昨天")).status_code, 400)
+        # 报表：四种维度。
+        for group in ("day", "account", "model", "client"):
+            resp = await self.client.get(f"/admin/api/usage/report?group_by={group}")
+            self.assertEqual(resp.status_code, 200, resp.text)
+            report = resp.json()
+            self.assertEqual(report["group_by"], group)
+            self.assertEqual(report["total"]["count"], 25)
+            self.assertEqual(sum(g["count"] for g in report["groups"]), 25)
+        # 非法维度 400。
+        self.assertEqual((await self.client.get("/admin/api/usage/report?group_by=nope")).status_code, 400)
+
+        # 手动拉取：起止时间非法 -> 400。
+        self.assertEqual((await self.client.post("/admin/api/usage/sync", json={
+            "start": now, "end": now - 3600})).status_code, 400)
+        # 手动拉取不写 usage_synced_at（否则后台每日同步会误以为已同步而留空洞）。
+        store.data["accounts"]["a1"] = {
+            "name": "一", "file": "session.info", "enabled": True, "created": now}
+        store.data["account_status"]["a1"] = {}
+        pool = self.app.state.pool
+        called = []
+        pool._pull_upstream_usage = lambda aid, item, st, en: called.append(aid) or 0
+        result = await self.client.post("/admin/api/usage/sync", json={
+            "start": now - 7200, "end": now})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertIn("a1", called)   # setUp 里已有 session.info 账号，不止一个
+        self.assertIsNone(store.data["account_status"]["a1"].get("usage_synced_at"))
+        self.assertIsNotNone(store.data["account_status"]["a1"].get("usage_manual_synced_at"))
+        # 防抖：60 秒内重复拉取被节流（HTTPException 转成 skipped，不是 500）。
+        again = (await self.client.post("/admin/api/usage/sync", json={
+            "start": now - 7200, "end": now})).json()
+        self.assertEqual(again["synced"], 0)
+        self.assertTrue(any("刚拉取过" in (x.get("reason") or "") for x in again["skipped"]))
+
+    async def test_key_usage_history_endpoint(self):
+        """密钥按日用量历史：换天留新行，接口能按 key 取到序列。"""
+        await self.login()
+        store = self.app.state.store
+        kid, _ = store.add_key("历史测试")
+        store.data["keys"][kid]["usage"] = {"date": "2026-10-14", "count": 3, "tokens": 100}
+        store.save()
+        store.data["keys"][kid]["usage"] = {"date": "2026-10-15", "count": 5, "tokens": 200}
+        store.save()
+        data = (await self.client.get("/admin/api/keys/usage?days=30")).json()
+        mine = next(k for k in data["keys"] if k["id"] == kid)
+        self.assertEqual([d["count"] for d in mine["series"]], [5, 3])  # 按 day DESC
+        self.assertEqual(data["total"]["count"], 8)
+        self.assertEqual((await self.client.get("/admin/api/keys/usage?days=0")).status_code, 400)
+
     async def test_credit_refresh_endpoint_and_settings(self):
         # 未登录不可用。
         self.assertEqual((await self.client.post("/admin/api/pool/refresh-credits")).status_code, 401)

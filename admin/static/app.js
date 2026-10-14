@@ -8,6 +8,7 @@ const labels = {
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   models: ["模型管理", "MODEL CATALOG", "与官方客户端一致的模型列表，可按需启用或禁用。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
+  usage: ["用量明细", "USAGE LEDGER", "查看上游账单级的积分消耗，默认只读本地库，点击「拉取上游」才请求上游。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
 };
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -38,6 +39,7 @@ function goPage(next) {
   const dot = document.createElement("span"); dot.className = "title-dot"; dot.textContent = "."; $("page-title").append(dot);
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
+  if (next === "usage") initUsagePage();
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
@@ -73,7 +75,7 @@ function render() {
     const expired = !!k.expires_at && k.expires_at <= now;
     const scope = (list, noun) => (Array.isArray(list) && list.length)
       ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? u.tokens + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<select class="routing-select" data-routing="${k.id}" title="该密钥的账号分配策略"><option value=""${routing === "" ? " selected" : ""}>跟随默认</option><option value="round_robin"${routing === "round_robin" ? " selected" : ""}>轮转</option><option value="random"${routing === "random" ? " selected" : ""}>随机</option><option value="expiry_first"${routing === "expiry_first" ? " selected" : ""}>优先快过期</option></select>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型与账号">权限</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<select class="routing-select" data-routing="${k.id}" title="该密钥的账号分配策略"><option value=""${routing === "" ? " selected" : ""}>跟随默认</option><option value="round_robin"${routing === "round_robin" ? " selected" : ""}>轮转</option><option value="random"${routing === "random" ? " selected" : ""}>随机</option><option value="expiry_first"${routing === "expiry_first" ? " selected" : ""}>优先快过期</option></select>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型与账号">权限</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
   }).join("");
   renderModels();
   const modelIds = Array.isArray(models?.models) ? models.models.filter(m => m.enabled).map(m => m.id) : [];
@@ -286,10 +288,26 @@ $("account-form").addEventListener("submit", async e => {
     $("account-dialog").close(); await refresh(); toast("账号已导入");
   } catch (err) { $("account-error").textContent = err.message; } finally { e.submitter.disabled = false; }
 });
-function confirmAction(title, desc, callback, rename = null) {
+// field 为 null 时不显示输入框（纯确认）；否则 {value, label, type, placeholder}。
+// label 由调用点给——原先写死成「账号备注」，设置请求上限时文案是错的。
+function confirmAction(title, desc, callback, field = null) {
   $("confirm-title").textContent = title; $("confirm-desc").textContent = desc; $("confirm-error").textContent = "";
-  $("rename-label").hidden = $("rename-value").hidden = rename === null; $("rename-value").value = rename || "";
+  const input = $("rename-value");
+  $("rename-label").hidden = input.hidden = field === null;
+  input.value = field ? (field.value ?? "") : "";
+  $("rename-label").textContent = field ? field.label : "";
+  input.type = field && field.type ? field.type : "text";
+  if (field && field.min !== undefined) input.min = field.min; else input.removeAttribute("min");
+  if (field && field.max !== undefined) input.max = field.max; else input.removeAttribute("max");
+  if (field && field.placeholder) input.placeholder = field.placeholder; else input.removeAttribute("placeholder");
   pendingConfirm = callback; $("confirm-dialog").showModal();
+}
+// token 友好格式：842 / 12.3K / 3.4M。口径是流式抓的估算值，不是精确账本。
+function fmtTokens(n) {
+  const v = Number(n) || 0;
+  if (v < 1000) return String(v);
+  if (v < 1000000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+  return (v / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
 }
 $("confirm-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { await pendingConfirm(); $("confirm-dialog").close(); await refresh(); toast("操作已保存"); } catch (err) { $("confirm-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 $("accounts-body").addEventListener("click", async e => {
@@ -301,8 +319,8 @@ $("accounts-body").addEventListener("click", async e => {
     catch(err){toast(err.message);} finally {b.disabled=false;} return;
   }
   const update = body => api("accounts/" + a.id, {method:"PATCH", body});
-  if (b.dataset.action === "rename") confirmAction("编辑账号备注", "备注仅用于在管理后台识别账号。", () => update({name:$("rename-value").value}), a.name);
-  if (b.dataset.action === "weight") confirmAction("设置调度权重", "权重 0-100，越大越优先分配请求；同权重时优先消耗积分最早过期的账号。", () => update({weight:Number($("rename-value").value)}), String(a.weight || 0));
+  if (b.dataset.action === "rename") confirmAction("编辑账号备注", "备注仅用于在管理后台识别账号。", () => update({name:$("rename-value").value}), {value:a.name, label:"账号备注"});
+  if (b.dataset.action === "weight") confirmAction("设置调度权重", "权重 0-100，越大越优先分配请求；同权重时优先消耗积分最早过期的账号。", () => update({weight:Number($("rename-value").value)}), {value:String(a.weight || 0), label:"调度权重（0-100）", type:"number", min:0, max:100});
   if (b.dataset.action === "toggle") confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？", "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。", () => update({enabled:!a.enabled}));
   if (b.dataset.action === "delete") confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。`, () => api("accounts/" + a.id, {method:"DELETE"}));
 });
@@ -318,7 +336,7 @@ $("keys-body").addEventListener("click", e => {
   const bind = e.target.closest("[data-bind]");
   if (bind) { openKeyBind(overview.keys.find(x => x.id === bind.dataset.bind)); return; }
   const limit = e.target.closest("[data-limit]");
-  if (limit) { const k = overview.keys.find(x => x.id === limit.dataset.limit); confirmAction("设置每日请求上限", "每天最多允许的请求数，0 或留空表示不限制。超限的请求会返回 429。", () => api("keys/" + k.id, {method:"PATCH", body:{daily_limit:Number($("rename-value").value) || null}}), k.daily_limit ?? ""); return; }
+  if (limit) { const k = overview.keys.find(x => x.id === limit.dataset.limit); confirmAction("设置每日请求上限", "该密钥每天最多可发起的请求数。留空或填 0 表示不限制。超限后新请求返回 429，次日北京时间 00:00 自动重置。只统计进入转发的对话接口，成功与失败都计入；被限流、被模型白名单拒绝的不计入。", () => api("keys/" + k.id, {method:"PATCH", body:{daily_limit:Number($("rename-value").value) || null}}), {value:k.daily_limit ?? "", label:"每日请求上限（次）", type:"number", min:0, placeholder:"留空或 0 = 不限制"}); return; }
   const toggle = e.target.closest("[data-toggle]");
   if (toggle) { const k = overview.keys.find(x => x.id === toggle.dataset.toggle); const next = !k.enabled; confirmAction(next ? "恢复这枚密钥？" : "停用这枚密钥？", next ? `恢复后「${k.name}」可再次发起请求。` : `停用后「${k.name}」立即无法发起新请求，可随时恢复。`, () => api("keys/" + k.id, {method:"PATCH", body:{enabled: next}})); return; }
   const b = e.target.closest("[data-revoke]"); if (!b) return; const k = overview.keys.find(x => x.id === b.dataset.revoke); confirmAction("撤销客户端密钥？", `使用「${k.name}」的客户端将无法发起新请求。此操作不可撤销。`, () => api("keys/" + k.id, {method:"DELETE"}));
@@ -389,4 +407,115 @@ $("test-form").addEventListener("submit", async e => {
   catch (err) { $("test-status").className = "pill red"; $("test-status").textContent = "请求失败"; $("test-output").textContent = err.message; }
   finally { busy = false; $("test-submit").textContent = "发送测试 ↗"; await refresh().catch(() => {}); }
 });
+/* ---------- 用量明细页 ---------- */
+let usageOffset = 0, usageTotal = 0, usageSyncCooldown = 0;
+const usageStart = () => $("usage-start").value, usageEnd = () => $("usage-end").value;
+// datetime-local 的值按北京时间解析，服务端也按北京时间解析，两边一致。
+const usageUnix = v => v ? Math.floor(new Date(v).getTime() / 1000) : null;
+function usageQuery(extra = {}) {
+  const q = new URLSearchParams(extra);
+  const a = usageUnix(usageStart()), b = usageUnix(usageEnd());
+  if (a) q.set("start", a); if (b) q.set("end", b);
+  const acc = $("usage-account").value; if (acc) q.set("account_id", acc);
+  return q.toString();
+}
+function initUsagePage() {
+  // 只初始化一次：默认近 30 天，账号下拉来自已有的 overview。
+  if ($("usage-start").value) return;
+  const pad = n => String(n).padStart(2, "0");
+  const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const now = new Date(), past = new Date(now.getTime() - 30 * 86400000);
+  $("usage-start").value = fmt(past); $("usage-end").value = fmt(now);
+  $("usage-account").innerHTML = '<option value="">全部账号</option>' +
+    overview.accounts.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("");
+}
+function renderUsageSummary(report) {
+  const t = report.total || {};
+  const card = (label, value, note) => `<article><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`;
+  $("usage-summary").innerHTML =
+    card("区间积分消耗", (t.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2}), "来自上游账单") +
+    card("记录条数", (t.count ?? 0).toLocaleString("zh-CN"), `免费 ${t.free ?? 0} · 付费 ${t.paid ?? 0}`) +
+    card("付费条均", t.paid ? ((t.credit ?? 0) / t.paid).toFixed(3) : "—", "不含免费调用") +
+    card("维度", {day:"按日", account:"按账号", model:"按模型", client:"按客户端"}[report.group_by] || report.group_by, `共 ${(report.groups || []).length} 组`);
+}
+function renderUsageGroups(report) {
+  // 报表分组直接画在明细表上方：用户切维度时想看的就是这个。
+  const host = $("usage-groups");
+  if (!host) return;
+  host.innerHTML = (report.groups || []).slice(0, 20).map(g =>
+    `<tr><td>${esc(g.bucket)}</td><td class="align-right mono">${g.count}</td>`
+    + `<td class="align-right mono">${(g.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2})}</td>`
+    + `<td class="align-right mono muted">${g.free} / ${g.paid}</td></tr>`).join("")
+    || '<tr><td colspan="4" class="history-empty">该区间没有记录。</td></tr>';
+}
+async function loadUsage(offset, withReport = true) {
+  const size = Number($("usage-page-size").value) || 100;
+  try {
+    const data = await api("usage?" + usageQuery({limit: size, offset}));
+    usageOffset = data.offset; usageTotal = data.total;
+    $("usage-body").innerHTML = data.rows.map(r => `<tr><td class="mono muted">${esc(stamp(r.request_time * 1000))}</td>`
+      + `<td>${esc(r.account_name || r.account_id || "—")}</td><td class="mono">${esc(r.model || "—")}</td>`
+      + `<td>${esc(r.client || "—")}</td><td class="align-right mono">${(r.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2})}</td>`
+      + `<td class="muted">${esc(r.agent_purpose || "")}</td></tr>`).join("")
+      || '<tr><td colspan="6" class="history-empty">该区间没有记录。可点击「拉取上游」同步。</td></tr>';
+    const pages = Math.max(1, Math.ceil(usageTotal / size));
+    $("usage-page-info").textContent = usageTotal ? `第 ${Math.floor(data.offset / size) + 1} / ${pages} 页 · 共 ${usageTotal.toLocaleString("zh-CN")} 条` : "暂无记录";
+    $("usage-prev").disabled = data.offset <= 0;
+    $("usage-next").disabled = data.offset + size >= usageTotal;
+    if (withReport) {
+      const report = await api("usage/report?" + usageQuery({group_by: $("usage-group").value}));
+      renderUsageSummary(report); renderUsageGroups(report);
+    }
+  } catch (e) { $("usage-body").innerHTML = `<tr><td colspan="6" class="history-empty">${esc(e.message)}</td></tr>`; }
+}
+// 防抖第 1 层：按钮禁用 + 返回后 3 秒冷却。
+async function syncUsage() {
+  const now = Date.now();
+  if (now < usageSyncCooldown) { toast(`请 ${Math.ceil((usageSyncCooldown - now) / 1000)} 秒后再试`); return; }
+  const btn = $("usage-sync");
+  btn.disabled = true; const label = btn.textContent; btn.textContent = "拉取中…";
+  try {
+    const r = await api("usage/sync", {method: "POST", body: {
+      start: usageUnix(usageStart()), end: usageUnix(usageEnd()),
+      account_id: $("usage-account").value || null}});
+    const skipped = (r.skipped || []).length;
+    toast(skipped ? `已同步 ${r.synced} 个账号，跳过 ${skipped} 个（${r.message || "刚拉取过或任务进行中"}）`
+                  : `已同步 ${r.synced} 个账号`);
+    await loadUsage(0);
+  } catch (e) { toast(e.message); }
+  finally { btn.textContent = label; usageSyncCooldown = Date.now() + 3000; btn.disabled = false; }
+}
+$("usage-sync").addEventListener("click", syncUsage);
+$("usage-refresh").addEventListener("click", () => loadUsage(usageOffset));
+$("usage-prev").addEventListener("click", () => loadUsage(Math.max(0, usageOffset - (Number($("usage-page-size").value) || 100))));
+$("usage-next").addEventListener("click", () => loadUsage(usageOffset + (Number($("usage-page-size").value) || 100)));
+$("usage-page-size").addEventListener("change", () => loadUsage(0));
+$("usage-group").addEventListener("change", () => loadUsage(usageOffset));
+$("usage-account").addEventListener("change", () => loadUsage(0));
+$("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsage(0); });
+
+/* ---------- 密钥用量历史 ---------- */
+$("keys-body").addEventListener("click", async e => {
+  const cell = e.target.closest("[data-usage]");
+  if (!cell) return;
+  const kid = cell.dataset.usage;
+  const k = overview.keys.find(x => x.id === kid);
+  $("usage-history-name").textContent = `密钥「${k ? k.name : kid}」`;
+  $("usage-history-body").innerHTML = '<tr><td colspan="3" class="history-empty">加载中…</td></tr>';
+  $("usage-history-dialog").showModal();
+  try {
+    const data = await api("keys/usage?days=30");
+    const mine = data.keys.find(x => x.id === kid);
+    const series = mine ? mine.series : [];
+    const sum = series.reduce((acc, d) => ({count: acc.count + d.count, tokens: acc.tokens + d.tokens}), {count: 0, tokens: 0});
+    $("usage-history-body").innerHTML = series.map(d =>
+      `<tr><td class="mono muted">${esc(d.day)}</td><td class="align-right mono">${d.count}</td>`
+      + `<td class="align-right mono">${fmtTokens(d.tokens)}</td></tr>`).join("")
+      || '<tr><td colspan="3" class="history-empty">近 30 天还没有记录。</td></tr>';
+    $("usage-history-total").textContent = series.length
+      ? `区间合计：${sum.count.toLocaleString("zh-CN")} 次 · ${fmtTokens(sum.tokens)} tokens（共 ${series.length} 天有记录）`
+      : "";
+  } catch (err) { $("usage-history-body").innerHTML = `<tr><td colspan="3" class="history-empty">${esc(err.message)}</td></tr>`; }
+});
+
 (async () => { try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();

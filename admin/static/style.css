@@ -14,3 +14,12 @@
 .check-item input{width:15px;height:15px;flex-shrink:0;padding:0}
 .check-item span{overflow:hidden;text-overflow:ellipsis}
 #key-bind-dialog{max-height:92vh;overflow-y:auto;min-width:min(560px,92vw)}
+
+.usage-filter{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0 16px;align-items:end;padding:16px 20px;margin-bottom:20px;background:var(--white);border:1px solid var(--line);border-radius:var(--radius)}
+.usage-filter label{margin-top:0}
+.usage-summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;padding:18px 20px;margin-bottom:20px;background:var(--white);border:1px solid var(--line);border-radius:var(--radius)}
+.usage-summary strong{font-size:22px;margin:6px 0}
+.usage-groups-wrap{margin-bottom:20px}
+.usage-groups-wrap h3{font-size:15px;margin-bottom:8px}
+.usage-cell{cursor:pointer}
+.usage-cell:hover{background:#f8fbfa}

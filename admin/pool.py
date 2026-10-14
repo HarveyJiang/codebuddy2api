@@ -125,6 +125,7 @@ class AccountPool:
         self.affinity_rebinds = 0
         self.dirty = False
         self.last_flush = 0
+        self._usage_manual_at = {}   # aid -> 上次手动拉取时间戳，进程内节流
         with store.lock:
             store.data.setdefault("pool", dict(self.POOL_DEFAULTS))
             store.data["pool"] = {**self.POOL_DEFAULTS, **store.data["pool"]}
@@ -565,13 +566,11 @@ class AccountPool:
             page += 1
         return rows
 
-    def sync_upstream_usage(self, aid):
-        """单个账号同步上游用量：成功写 usage_synced_at，失败写 usage_sync_error。"""
-        item = self.store.data["accounts"].get(aid)
-        if not item:
-            raise HTTPException(404, "账号不存在")
-        end = datetime.fromtimestamp(self.clock(), CN)
-        start = end - timedelta(days=USAGE_SYNC_DAYS)
+    # 手动拉取的每账号节流（秒）：连点「拉取上游」不该反复打上游。
+    USAGE_MANUAL_THROTTLE = 60
+
+    def _pull_upstream_usage(self, aid, item, start, end):
+        """拉一个账号在 [start, end) 区间的用量并落库，返回记录数。"""
         fmt = "%Y-%m-%d %H:%M:%S"
         with self.operation_lock(aid):
             manager = self.store.manager_for(aid, item)
@@ -594,8 +593,41 @@ class AccountPool:
                 "agent_purpose": row.get("agentPurpose"),
             })
         self.store.db.save_upstream_usage(records)
-        self.update(aid, usage_synced_at=int(self.clock()), usage_sync_error=None)
         return len(records)
+
+    def sync_upstream_usage(self, aid):
+        """后台每日同步：固定 30 天窗口，成功写 usage_synced_at。"""
+        item = self.store.data["accounts"].get(aid)
+        if not item:
+            raise HTTPException(404, "账号不存在")
+        end = datetime.fromtimestamp(self.clock(), CN)
+        start = end - timedelta(days=USAGE_SYNC_DAYS)
+        count = self._pull_upstream_usage(aid, item, start, end)
+        self.update(aid, usage_synced_at=int(self.clock()), usage_sync_error=None)
+        return count
+
+    def sync_upstream_usage_range(self, aid, start, end):
+        """手动拉取：任意区间，只写库 + 留痕，**不写 usage_synced_at**。
+
+        写了 usage_synced_at 会让后台每日同步认为「今天已同步」而跳过当天，
+        其余时段永远拉不到，留下永久空洞。所以手动与自动的留痕字段必须分开。
+        """
+        item = self.store.data["accounts"].get(aid)
+        if not item:
+            raise HTTPException(404, "账号不存在")
+        if start >= end:
+            raise HTTPException(400, "开始时间必须早于结束时间")
+        if (end - start).days > 366:
+            raise HTTPException(400, "单次拉取区间不能超过 366 天")
+        now = self.clock()
+        last = self._usage_manual_at.get(aid, 0)
+        if now - last < self.USAGE_MANUAL_THROTTLE:
+            wait = self.USAGE_MANUAL_THROTTLE - int(now - last)
+            raise HTTPException(429, f"该账号刚拉取过，请 {wait} 秒后重试")
+        self._usage_manual_at[aid] = now
+        count = self._pull_upstream_usage(aid, item, start, end)
+        self.update(aid, usage_manual_synced_at=int(now))
+        return count
 
     async def sync_upstream_usage_batch(self):
         """每天每账号一次；失败写 usage_sync_error 并当天不再重试（避免每 60 秒打上游）。"""
@@ -638,6 +670,44 @@ class AccountPool:
                     results["failed"] += 1
                 else:
                     results["synced"] += 1
+        return results
+
+    async def sync_upstream_usage_manual(self, start, end, account_id=None):
+        """手动批量拉取：只打启用账号，走 jobs 并发锁防重入。
+
+        被节流/失败的账号单独记在 results["skipped"] 里返回，不影响其它账号——
+        连点按钮时应当看到「大部分已跳过」而不是整批报错。
+        """
+        with self.store.lock:
+            targets = [aid for aid, item in self.store.data["accounts"].items()
+                       if item["enabled"] and (not account_id or aid == account_id)]
+        if not targets:
+            return {"synced": 0, "failed": 0, "skipped": [], "message": "没有可拉取的账号"}
+        if self.jobs.locked():
+            return {"synced": 0, "failed": 0, "skipped": targets,
+                    "message": "已有任务进行中"}
+        results = {"synced": 0, "failed": 0, "skipped": []}
+        async with self.jobs:
+            semaphore = asyncio.Semaphore(3)
+
+            async def run(aid):
+                async with semaphore:
+                    try:
+                        return await asyncio.to_thread(
+                            self.sync_upstream_usage_range, aid, start, end)
+                    except HTTPException as e:
+                        # 429 节流不算失败：这是防抖生效的正常结果。
+                        return ("skipped", e.detail)
+                    except Exception as e:
+                        return ("error", f"{type(e).__name__}: {e}")
+            outcomes = await asyncio.gather(*(run(aid) for aid in targets))
+        for aid, outcome in zip(targets, outcomes):
+            if isinstance(outcome, tuple):
+                results["skipped"].append({"id": aid, "reason": outcome[1]})
+                if outcome[0] == "error":
+                    results["failed"] += 1
+            else:
+                results["synced"] += 1
         return results
 
 

@@ -20,7 +20,10 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
+
+from .models import CN
 
 SCHEMA_VERSION = 2
 
@@ -70,6 +73,15 @@ LOG_COLUMNS = (
 
 REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
 REQUEST_LOG_MAX_ROWS = 2_000_000
+KEY_USAGE_KEEP_DAYS = 93     # 与 request_logs 一致
+
+# 上游用量报表的分组维度 -> SQL 表达式。key 来自白名单，不接受用户输入，可安全拼接。
+UPSTREAM_GROUPS = {
+    "day": "date(request_time, 'unixepoch', '+8 hours')",
+    "account": "COALESCE(account_name, account_id, '未知')",
+    "model": "COALESCE(model, '未知')",
+    "client": "COALESCE(NULLIF(client, ''), '未知')",
+}
 
 
 def _json_default(value):
@@ -193,6 +205,10 @@ class Database:
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
             request_time INTEGER NOT NULL, agent_purpose TEXT)""",
+        """CREATE TABLE IF NOT EXISTS key_usage_daily (
+            key_id TEXT NOT NULL, day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
+            key_name TEXT, PRIMARY KEY (key_id, day))""",
         """CREATE INDEX IF NOT EXISTS idx_bindings_expires
             ON session_bindings(expires)""",
         """CREATE INDEX IF NOT EXISTS idx_logs_key_time
@@ -205,6 +221,8 @@ class Database:
             ON upstream_request_usage(model, request_time)""",
         """CREATE INDEX IF NOT EXISTS idx_upstream_account_time
             ON upstream_request_usage(account_id, request_time)""",
+        """CREATE INDEX IF NOT EXISTS idx_key_usage_day
+            ON key_usage_daily(day)""",
     )
 
     def __init__(self, path, legacy_json=None):
@@ -225,6 +243,7 @@ class Database:
         self._migrate()
         self.prune_request_logs()
         self.prune_upstream_usage()
+        self.prune_key_usage_daily()
         # 空库 + 存在旧 state.json：导入后把旧文件备份，避免误当新数据处理。
         if legacy_json and Path(legacy_json).exists() and not self.query("SELECT 1 FROM accounts LIMIT 1"):
             self._import_legacy(legacy_json)
@@ -745,6 +764,73 @@ class Database:
                 " (SELECT id FROM request_logs ORDER BY id LIMIT ?)", (total - max_rows,))
         return total - max_rows
 
+    # -- key usage daily ---------------------------------------------------
+    def save_key_usage_daily(self, keys, day=None):
+        """把每个 key 的当日累计快照写进历史表（覆盖语义）。
+
+        入参是 Store.data["keys"] 全量 dict。keys.usage 本身就是**当日累计值**
+        （换天才 clear），所以这里用 UPSERT 覆盖而非累加：usage 单调递增，
+        后写的值一定 >= 先写的值。副作用是顺带修复「重启丢最后几秒」——
+        重启后下次 flush 会用更大的累计值覆盖回来。
+
+        day 不传则按北京时间取当天。usage_date 为空的 key 跳过（避免造空行）。
+        """
+        if day is None:
+            day = datetime.fromtimestamp(time.time(), CN).strftime("%Y-%m-%d")
+        rows = []
+        for kid, item in (keys or {}).items():
+            usage = item.get("usage") or {}
+            if not usage.get("date"):
+                continue
+            rows.append((kid, usage["date"],
+                         _to_int(usage.get("count")) or 0,
+                         _to_int(usage.get("tokens")) or 0,
+                         item.get("name")))
+        if not rows:
+            return 0
+        with self.transaction():
+            self._write.executemany(
+                """INSERT INTO key_usage_daily (key_id, day, count, tokens, key_name)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(key_id, day) DO UPDATE SET
+                     count=excluded.count, tokens=excluded.tokens,
+                     key_name=excluded.key_name""", rows)
+        return len(rows)
+
+    def key_usage_series(self, days=30):
+        """按 key 取近 N 天的每日用量序列，供「今日用量」弹窗画趋势。
+
+        返回 {days: [...], keys: [{id, name, series: [{day, count, tokens}]}],
+        total: {count, tokens}}。缺天的日子不补零——图表按实际有记录的点画。
+        """
+        days = max(1, min(int(days), 365))
+        cutoff = (datetime.fromtimestamp(time.time(), CN) - timedelta(days=days - 1)
+                  ).strftime("%Y-%m-%d")
+        rows = self.query(
+            "SELECT key_id, day, count, tokens, key_name FROM key_usage_daily"
+            " WHERE day >= ? ORDER BY day DESC, key_id", (cutoff,))
+        by_key, seen_days = {}, []
+        for row in rows:
+            entry = by_key.setdefault(
+                row["key_id"], {"id": row["key_id"], "name": row["key_name"] or row["key_id"],
+                                "series": []})
+            entry["series"].append({"day": row["day"], "count": row["count"] or 0,
+                                    "tokens": row["tokens"] or 0})
+            if row["day"] not in seen_days:
+                seen_days.append(row["day"])
+        total = self.query(
+            "SELECT SUM(count) AS c, SUM(tokens) AS t FROM key_usage_daily WHERE day >= ?",
+            (cutoff,))[0]
+        return {"days": seen_days, "keys": list(by_key.values()),
+                "total": {"count": total["c"] or 0, "tokens": total["t"] or 0}}
+
+    def prune_key_usage_daily(self, keep_days=KEY_USAGE_KEEP_DAYS):
+        """启动时裁剪：day 是 TEXT 的 YYYY-MM-DD，可直接字符串比较。"""
+        cutoff = (datetime.fromtimestamp(time.time(), CN) - timedelta(days=keep_days)
+                  ).strftime("%Y-%m-%d")
+        with self.transaction():
+            self._write.execute("DELETE FROM key_usage_daily WHERE day < ?", (cutoff,))
+
     # -- upstream request usage ---------------------------------------------
     def load_upstream_usage(self, account_id=None, since=None, limit=None):
         sql, params = "SELECT * FROM upstream_request_usage", []
@@ -787,6 +873,74 @@ class Database:
                      account_name=excluded.account_name""",
                 rows)
         return len(rows)
+
+    def _upstream_where(self, since=None, until=None, account_id=None):
+        clauses, params = [], []
+        if since is not None:
+            clauses.append("request_time >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("request_time < ?")
+            params.append(int(until))
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(str(account_id))
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", tuple(params)
+
+    def page_upstream_usage(self, limit=100, offset=0, since=None, until=None,
+                            account_id=None):
+        """分页读上游用量（本地库，不打上游），返回 {rows, total, limit, offset}。
+
+        total 是不带 limit/offset 的同条件总数，供前端画页码。条件全部参数绑定。
+        """
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        where, params = self._upstream_where(since, until, account_id)
+        total = self.query(
+            f"SELECT COUNT(*) AS n FROM upstream_request_usage{where}", params)[0]["n"]
+        rows = self.query(
+            "SELECT request_id, account_id, account_name, credit_micro, model, client,"
+            f" request_time, agent_purpose FROM upstream_request_usage{where}"
+            " ORDER BY request_time DESC LIMIT ? OFFSET ?", (*params, limit, offset))
+        result = []
+        for row in rows:
+            item = {key: row[key] for key in row.keys()}
+            item["credit"] = _from_micro(item.pop("credit_micro", None))
+            result.append(item)
+        return {"rows": result, "total": total, "limit": limit, "offset": offset}
+
+    def upstream_usage_report(self, since=None, until=None, account_id=None,
+                              group_by="day", limit=500):
+        """上游用量报表：按白名单维度分组，给积分合计、条数与免费/付费拆分。
+
+        免费（credit_micro=0）与付费分开计——限免期模型照样记账，混入会低估单价。
+        group_by 只接受 UPSTREAM_GROUPS 的键，不接受任意列名。
+        """
+        if group_by not in UPSTREAM_GROUPS:
+            raise ValueError(f"不支持的分组维度：{group_by}")
+        expr = UPSTREAM_GROUPS[group_by]
+        where, params = self._upstream_where(since, until, account_id)
+        rows = self.query(
+            f"SELECT {expr} AS bucket, COUNT(*) AS n,"
+            " SUM(credit_micro) AS credit_micro,"
+            " SUM(CASE WHEN credit_micro = 0 THEN 1 ELSE 0 END) AS free,"
+            " SUM(CASE WHEN credit_micro <> 0 THEN 1 ELSE 0 END) AS paid"
+            f" FROM upstream_request_usage{where}"
+            " GROUP BY bucket ORDER BY bucket DESC LIMIT ?",
+            (*params, int(limit)))
+        groups = [{"bucket": row["bucket"], "count": row["n"],
+                   "credit": _from_micro(row["credit_micro"] or 0),
+                   "free": row["free"] or 0, "paid": row["paid"] or 0}
+                  for row in rows]
+        total_row = self.query(
+            "SELECT COUNT(*) AS n, SUM(credit_micro) AS credit_micro,"
+            " SUM(CASE WHEN credit_micro = 0 THEN 1 ELSE 0 END) AS free,"
+            " SUM(CASE WHEN credit_micro <> 0 THEN 1 ELSE 0 END) AS paid"
+            f" FROM upstream_request_usage{where}", params)[0]
+        return {"group_by": group_by, "groups": groups,
+                "total": {"count": total_row["n"] or 0,
+                          "credit": _from_micro(total_row["credit_micro"] or 0),
+                          "free": total_row["free"] or 0, "paid": total_row["paid"] or 0}}
 
     # -- legacy import ------------------------------------------------------
     def _import_legacy(self, legacy_json):

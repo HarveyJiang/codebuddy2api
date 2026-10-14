@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+from .models import CN
+
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -21,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
 from .browser_login import BrowserLogin
-from .db import Database
+from .db import UPSTREAM_GROUPS, Database
 from .pool import AccountPool, PoolMiddleware, ROUTING_POLICIES
 from .metrics import RequestMetrics, MetricsMiddleware
 from .models import CN, ModelRegistry
@@ -63,6 +65,36 @@ def _id_list(value):
             seen.add(item)
             result.append(item)
     return result
+
+
+def _query_int(params, name, default=None):
+    """查询参数转整数；空值取默认，非法值明确 400（不让它变成 500）。"""
+    raw = params.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise HTTPException(400, f"{name} 需为整数")
+
+
+def _query_time(value, name):
+    """接受秒级 unix 整数或 'YYYY-MM-DD HH:MM:SS'（北京时间），统一转 unix 秒。"""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(text, fmt).replace(tzinfo=CN).timestamp())
+        except ValueError:
+            continue
+    raise HTTPException(400, f"{name} 需为秒级时间戳或 YYYY-MM-DD HH:MM:SS")
 
 
 def _log_rows(rows):
@@ -188,6 +220,9 @@ class Store:
             with self.lock, self.db.transaction():
                 self.db.save_accounts(self.data["accounts"], self.data["account_status"])
                 self.db.save_keys(self.data["keys"])
+                # 当日用量快照随 keys 一起写（覆盖语义，见 db.save_key_usage_daily）。
+                # 放同一事务：keys 落库而历史没落库会造成两边不一致。
+                self.db.save_key_usage_daily(self.data["keys"])
                 self.keys_dirty = False
                 for key, dump, load in (("pool", self.db.save_settings, None),
                                         ("session_bindings", self.db.save_bindings, None)):
@@ -665,6 +700,61 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def pool_refresh_credits(req: Request):
         store.require_admin(req)
         return await pool.refresh_credits()
+
+    @app.get("/admin/api/keys/usage")
+    async def key_usage(req: Request):
+        """每个密钥按日的用量历史（供「今日用量」弹窗画趋势）。"""
+        store.require_admin(req)
+        params = req.query_params
+        days = _query_int(params, "days", 30)
+        if days is not None and not 1 <= days <= 365:
+            raise HTTPException(400, "days 需在 1-365 之间")
+        return store.db.key_usage_series(days=days or 30)
+
+    @app.get("/admin/api/usage")
+    async def usage(req: Request):
+        """分页读上游用量明细：只查本地库，不打上游。"""
+        store.require_admin(req)
+        params = req.query_params
+        result = store.db.page_upstream_usage(
+            limit=_query_int(params, "limit", 100), offset=_query_int(params, "offset", 0),
+            since=_query_time(params.get("start"), "start"),
+            until=_query_time(params.get("end"), "end"),
+            account_id=params.get("account_id") or None)
+        return result
+
+    @app.get("/admin/api/usage/report")
+    async def usage_report(req: Request):
+        """上游用量报表：按 day/account/model/client 分组聚合。"""
+        store.require_admin(req)
+        params = req.query_params
+        group_by = params.get("group_by") or "day"
+        if group_by not in UPSTREAM_GROUPS:
+            raise HTTPException(400, f"不支持的分组维度：{group_by}")
+        return store.db.upstream_usage_report(
+            since=_query_time(params.get("start"), "start"),
+            until=_query_time(params.get("end"), "end"),
+            account_id=params.get("account_id") or None, group_by=group_by)
+
+    @app.post("/admin/api/usage/sync")
+    async def usage_sync(req: Request):
+        """手动拉取上游用量：仅此处打上游，默认路径不碰外网。
+
+        防抖三层：前端按钮禁用 + pool.jobs 并发锁 + 每账号 60 秒节流。
+        返回 skipped 表示该账号被节流/占锁跳过，不是失败。
+        """
+        store.require_admin(req)
+        body = await payload(req)
+        now = datetime.fromtimestamp(time.time(), CN)
+        end = _query_time(body.get("end"), "end") or int(now.timestamp())
+        start = _query_time(body.get("start"), "start") or int(
+            (now - timedelta(days=30)).timestamp())
+        if start >= end:
+            raise HTTPException(400, "开始时间必须早于结束时间")
+        result = await pool.sync_upstream_usage_manual(
+            datetime.fromtimestamp(start, CN), datetime.fromtimestamp(end, CN),
+            body.get("account_id") or None)
+        return result
 
     @app.post("/admin/api/models/refresh")
     async def models_refresh(req: Request):
