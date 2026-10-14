@@ -71,7 +71,9 @@ from .system_identity import filter_system_identity
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
+# 与官方 CLI 一致（admin/models.py 同值）：上游按 UA 识别客户端，
+# 自定 UA 会导致用量接口 client 为空。
+USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录

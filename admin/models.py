@@ -118,7 +118,7 @@ class ModelRegistry:
                 try:
                     account_headers = dict(manager.get_headers())
                     # 上游校验 CLI User-Agent（非 CLI UA 返回 400 check ua），
-                    # 账号凭据里的 codebuddy2openai UA 必须让位给 CLI UA。
+                    # 账号凭据里的 UA 必须让位给 CLI UA。
                     account_headers.pop("User-Agent", None)
                     account_headers.pop("user-agent", None)
                     headers.update(account_headers)

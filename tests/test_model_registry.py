@@ -89,7 +89,7 @@ class ModelRegistryTests(unittest.TestCase):
             client_cls.return_value.__enter__.return_value.get.return_value = response
             self.assertTrue(registry.fetch())
             # 未登录时上游只返回空壳，必须带账号凭据（Authorization）请求；
-            # 账号凭据里的 codebuddy2openai UA 必须让位，否则上游 400 check ua。
+            # 账号凭据里的 UA 必须让位给 CLI UA，否则上游 400 check ua。
             sent = client_cls.return_value.__enter__.return_value.get.call_args.kwargs["headers"]
             self.assertEqual(sent.get("Authorization"), "Bearer token")
             self.assertEqual(sent.get("User-Agent"), USER_AGENT)
