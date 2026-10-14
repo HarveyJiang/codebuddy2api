@@ -72,42 +72,28 @@ _OWNED_BY = "trae-solo"
 _CREATED = 1753600000
 _CTX = 131072
 
+# 静态兜底表（冷启动 / 上游不可用时）：
+# 只保留「官方客户端菜单可见 且 solo_work_lite 可调用」的模型；隐藏/别名的 config_name
+# （custom_model_*、*subagent、summary、seed-code-pro-0430 等）不入表 —— 官网界面并不显示它们。
+_TRAE_STATIC_SPECS = (
+    ("Doubao-Seed-Evolving", "Seed-Evolving", 256000),
+    ("Doubao-Seed-2.1-Pro", "Seed-2.1-Pro-0915", 256000),
+    ("Doubao-Seed-2.1-Turbo", "Seed-2.1-Turbo", 256000),
+    ("glm-5.2", "GLM-5.2", 200000),
+    ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash", 200000),
+    ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro", 200000),
+    ("kimi-k3", "Kimi-K3", 200000),
+    ("kimi-k2.7-code", "Kimi-K2.7-Code", 200000),
+    ("kimi-k2.6", "Kimi-K2.6", 200000),
+    ("minimax-m3", "MiniMax-M3", 200000),
+    ("qwen3.8-max", "Qwen3.8-Max", 200000),
+    ("qwen-3.7-plus", "Qwen3.7-Plus", 200000),
+)
+
 TRAE_STATIC_MODELS = [
-    {"id": mid, "object": "model", "created": _CREATED, "owned_by": _OWNED_BY, "context_length": _CTX}
-    for mid in (
-        "Doubao-Seed-2.1-Pro",
-        "seed-code-pro-0430",
-        "Doubao-Seed-2.1-Turbo",
-        "Doubao-Seed-2.0-Code",
-        "DeepSeek-V4-Flash-Official",
-        "browser_use_subagent",
-        "glm-5.2",
-        "glm-5-turbo",
-        "glm-5",
-        "DeepSeek-V4-Pro",
-        "DeepSeek-V4-Flash",
-        "kimi-k3",
-        "kimi-k2.7-code",
-        "kimi-k2.6",
-        "minimax-m3",
-        "qwen-3.7-plus",
-        "sagitta",
-        "aquila",
-        "custom_model_gemini",
-        "custom_model_placeholder",
-        "custom_model_1M_text",
-        "custom_model_1M",
-        "custom_model_kimi",
-        "custom_model_claude",
-        "custom_model_gpt-5",
-        "custom_model_no-fc",
-        "custom_model_deepseek_chat",
-        "custom_model_deepseek_reasoner",
-        "custom_model_deepseek_v4",
-        "explore_sub_agent_v13",
-        "explore_sub_agent_v2",
-        "summary",
-    )
+    {"id": mid, "name": name, "object": "model", "created": _CREATED, "owned_by": _OWNED_BY,
+     "context_length": ctx}
+    for mid, name, ctx in _TRAE_STATIC_SPECS
 ]
 
 # ---------------------------------------------------------------------------
@@ -529,28 +515,30 @@ def fetch_remote_models(client: httpx.Client, headers: dict,
 
 
 def build_trae_catalog(detail: list[dict] | None, menu: list[dict] | None) -> list[dict]:
-    """构建 Trae 模型目录：**以 `get_detail_param` 为有效性基准**，用官方菜单补倍率/上下文。
+    """构建 Trae 模型目录 = **官方菜单（可见）∩ get_detail_param（本 function 可调用）**。
 
-    实测（function=solo_work_lite）：`/api/remote/v1/models` 列的是其它 function
-    （solo_*_remote 远程 agent/design 模式）的菜单，纯菜单独有的 config_name 直连上游必回
-    `4001 param is invalid`，本网关 chat 走 solo_work_lite 用不了；而 detail_param 返回的
-    config_name 全部可用。故：detail_param 决定「有哪些模型」，菜单只负责「补元数据」。
-    同时剔除内部槽位（custom_model_* / subagent / 工具）。
+    两个来源各管一件事，缺一不可：
+
+    - 官方菜单 `/api/remote/v1/models`：官网界面显示的模型（「可见」的权威），并带倍率
+      （`consumption_rate`，会员折扣生效取实付倍率）与上下文。
+    - `get_detail_param`：按 `solo_work_lite` 过滤的 config_name（「可调用」的权威），
+      但它含隐藏/别名项——`custom_model_*`、`*subagent`、`summary`、`seed-code-pro-0430`
+      （展示名竟与 Doubao-Seed-2.1-Pro 重名）等，官网界面并不显示，故不入目录。
+
+    两个方向的差异都要排除：纯菜单独有的模型（`mimo-*`、`glm-5.3*`、`step-5-preview` 等 8 个）
+    属其它 function，本 function 调用必回 `4001 param is invalid`。
     """
-    rates = {m["id"]: m for m in menu or [] if isinstance(m, dict) and m.get("id")}
+    callable_ids = {str(e.get("id") or "").strip() for e in detail or [] if isinstance(e, dict)}
     out, seen = [], set()
-    for entry in detail or []:
+    for entry in menu or []:
         if not isinstance(entry, dict):
             continue
         mid = str(entry.get("id") or "").strip()
-        if not mid or mid in seen or _is_internal_slot(mid):
+        if not mid or mid in seen or mid not in callable_ids or _is_internal_slot(mid):
             continue
         seen.add(mid)
-        meta = rates.get(mid) or {}
-        out.append({"id": mid,
-                    "name": meta.get("name") or entry.get("name") or mid,
-                    "context_length": meta.get("context_length") or entry.get("context_length"),
-                    "credits": meta.get("credits")})
+        out.append({"id": mid, "name": entry.get("name") or mid,
+                    "context_length": entry.get("context_length"), "credits": entry.get("credits")})
     return out
 
 
@@ -780,21 +768,16 @@ class TraeCredentialManager:
             return h
 
     def fetch_models(self) -> list[dict]:
-        """Trae 模型目录：get_detail_param 定「有哪些」（本 function 有效），官方菜单补倍率/上下文。
+        """Trae 模型目录：官方菜单（可见 + 倍率）∩ get_detail_param（本 function 可调用）。
 
-        两套来源职责不同：detail_param 按 solo_work_lite 过滤、返回的全部可用；
-        /api/remote/v1/models 是其它 function 的菜单，含倍率但与本 function 不完全兼容
-        （纯菜单独有项直连上游必回 4001）。
-        detail_param 失败即抛错（调用方保留上次快照），不拿菜单冒充可用模型；
-        菜单失败只是拿不到倍率，不影响目录本身。
+        两套来源缺一不可：菜单定「官网界面显示什么」并给倍率/上下文，detail_param 定
+        「本网关能不能调」。任一失败即抛错，由调用方保留上次快照——
+        宁可少刷新一次，也不把隐藏/不可调用的 config_name 当模型暴露出去。
         """
         solo = self.get_headers(stream=False)
         with httpx.Client(timeout=20) as client:
-            try:
-                menu = fetch_remote_models(client, self.ug_headers())
-            except (TraeAPIError, httpx.HTTPError):
-                menu = None
-            detail = fetch_models(client, solo)  # 失败向上抛，调用方保留上次快照
+            menu = fetch_remote_models(client, self.ug_headers())
+            detail = fetch_models(client, solo)
         return build_trae_catalog(detail, menu)
 
     def checkin_status(self, client) -> dict:

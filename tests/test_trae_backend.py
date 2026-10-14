@@ -179,10 +179,10 @@ def test_prepare_assistant_all_noname_drops_tool_calls():
     ("auto", "glm-5.2"),
     ("default", "glm-5.2"),
     ("glm-5.2__dev", "glm-5.2"),
-    ("DeepSeek-V4-Pro", "DeepSeek-V4-Pro"),
-    ("deepseek_v4_pro", "DeepSeek-V4-Pro"),
-    ("DEEPSEEK_V4_PRO", "DeepSeek-V4-Pro"),
-    ("trae/glm-5", "glm-5"),
+    ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official"),
+    ("deepseek_v4_pro_official", "DeepSeek-V4-Pro-Official"),  # 下划线/大小写不敏感兜底
+    ("DEEPSEEK_V4_PRO_OFFICIAL", "DeepSeek-V4-Pro-Official"),
+    ("trae/kimi-k3", "kimi-k3"),
 ])
 def test_map_model(model, expected):
     assert T.map_model(model) == expected
@@ -194,16 +194,16 @@ def test_map_model_unknown_raises():
 
 
 def test_trae_static_models_count():
-    assert len(TRAE_MODELS := T.TRAE_STATIC_MODELS) == 32
-    assert len(trae_model_ids()) == 32
+    assert len(TRAE_MODELS := T.TRAE_STATIC_MODELS) == 12
+    assert len(trae_model_ids()) == 12
     assert all(m["owned_by"] == "trae-solo" for m in TRAE_MODELS)
 
 
 def test_resolve_backend_trae():
-    backend, upstream = resolve_backend("trae/deepseek_v4_pro")
+    backend, upstream = resolve_backend("trae/deepseek_v4_pro_official")
     assert backend.name == "trae"
     assert backend.tencent_policies is False
-    assert upstream == "DeepSeek-V4-Pro"
+    assert upstream == "DeepSeek-V4-Pro-Official"
 
 
 def test_resolve_backend_unknown_trae_400():
@@ -548,7 +548,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert r.status_code == 200
         data = r.json()["data"]
         trae = [m for m in data if m["id"].startswith("trae/")]
-        assert len(trae) == 32
+        assert len(trae) == 12
         assert all(m["owned_by"] == "trae-solo" for m in trae)
         assert any(m["id"] == "trae/glm-5.2" for m in trae)
 
@@ -1101,22 +1101,25 @@ def test_fetch_remote_models_errors():
             T.fetch_remote_models(client, {})
 
 
-def test_build_trae_catalog_detail_drives_availability_menu_enriches():
+def test_build_trae_catalog_is_menu_intersect_detail():
+    """目录 = 官方菜单（可见）∩ detail_param（本 function 可调用）：两个方向的差异都要排除。"""
     menu = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78},
-            {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}]
+            {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}]  # 仅菜单→其它 function，会 4001
     detail = [{"id": "glm-5.2", "name": "GLM-5.2", "context_length": 131072},
-              {"id": "sagitta", "name": "sagitta", "context_length": 131072},
-              {"id": "summary"}, {"id": "custom_model_gpt-5"}, {"id": "explore_sub_agent_v2"}, {"id": ""}]
+              {"id": "seed-code-pro-0430", "name": "Doubao-Seed-2.1-Pro", "context_length": 131072},  # 仅 detail→官网不显示的隐藏项
+              {"id": "summary"}, {"id": "custom_model_gpt-5"}, {"id": "explore_sub_agent_v2"}]
     catalog = T.build_trae_catalog(detail, menu)
-    # glm-5.3 只在菜单里（其它 function）→ 本 function 会 4001，剔除
-    assert [m["id"] for m in catalog] == ["glm-5.2", "sagitta"]
+    assert [m["id"] for m in catalog] == ["glm-5.2"]
     assert catalog[0] == {"id": "glm-5.2", "name": "GLM-5.2", "context_length": 200000, "credits": 0.78}
-    assert catalog[1]["credits"] is None and catalog[1]["context_length"] == 131072
-    # 菜单不可用 → 目录照旧，只是没倍率
-    assert [m["id"] for m in T.build_trae_catalog(detail, None)] == ["glm-5.2", "sagitta"]
+    # 菜单缺失 → 无法确定可见集合 → 空目录（调用方保留上次快照）
+    assert T.build_trae_catalog(detail, None) == []
+    assert T.build_trae_catalog(None, menu) == []
+    # 静态兜底表只含官网可见模型
+    assert all(not T._is_internal_slot(m["id"]) for m in T.TRAE_STATIC_MODELS)
+    assert "seed-code-pro-0430" not in {m["id"] for m in T.TRAE_STATIC_MODELS}
 
 
-def test_manager_fetch_models_detail_validity_menu_rates(tmp_path):
+def test_manager_fetch_models_menu_intersect_detail(tmp_path):
     doc = trae_credential()
     p = tmp_path / "t.info"
     p.write_text(json.dumps(doc), encoding="utf-8")
@@ -1131,7 +1134,7 @@ def test_manager_fetch_models_detail_validity_menu_rates(tmp_path):
                  "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'}])))
         return httpx.Response(200, json={"config_info_list": [
             {"config_name": "glm-5.2", "display_config": {"display_name": "GLM-5.2"}},
-            {"config_name": "sagitta", "display_config": {"display_name": "sagitta"}},
+            {"config_name": "seed-code-pro-0430", "display_config": {"display_name": "Doubao-Seed-2.1-Pro"}},
             {"config_name": "summary", "display_config": {"display_name": "summary"}}]})
 
     real = _REAL_SYNC_CLIENT
@@ -1141,26 +1144,38 @@ def test_manager_fetch_models_detail_validity_menu_rates(tmp_path):
         models = mgr.fetch_models()
     finally:
         httpx.Client = orig
-    assert [m["id"] for m in models] == ["glm-5.2", "sagitta"]  # 菜单独有 glm-5.3 / 内部槽位 summary 剔除
+    # glm-5.3 仅菜单（其它 function）、seed-code-pro-0430 仅 detail（官网不显示）、summary 内部槽位 → 全部剔除
+    assert [m["id"] for m in models] == ["glm-5.2"]
     assert models[0]["credits"] == 0.78 and models[0]["context_length"] == 200000
-    assert models[1]["credits"] is None
 
 
-def test_manager_fetch_models_detail_failure_raises(tmp_path):
-    """detail_param 不可用时不拿菜单冒充可用模型（让调用方保留上次快照）。"""
+def test_manager_fetch_models_failure_raises(tmp_path):
+    """任一来源不可用即抛错（保留上次快照），不拿单边数据冒充可用模型。"""
     doc = trae_credential()
     p = tmp_path / "t.info"
     p.write_text(json.dumps(doc), encoding="utf-8")
     mgr = T.TraeCredentialManager(p)
 
-    def handler(req):
+    def detail_down(req):
         if "/api/remote/v1/models" in str(req.url):
             return httpx.Response(200, json=_menu(("solo_work_remote", [{"name": "glm-5.3"}])))
         return httpx.Response(500, text="boom")
 
     real = _REAL_SYNC_CLIENT
     orig = httpx.Client
-    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(handler), **kw)
+    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(detail_down), **kw)
+    try:
+        with pytest.raises(T.TraeAPIError):
+            mgr.fetch_models()
+    finally:
+        httpx.Client = orig
+
+    def menu_down(req):
+        if "/api/remote/v1/models" in str(req.url):
+            return httpx.Response(503, text="boom")
+        return httpx.Response(200, json={"config_info_list": [{"config_name": "glm-5.2"}]})
+
+    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(menu_down), **kw)
     try:
         with pytest.raises(T.TraeAPIError):
             mgr.fetch_models()
@@ -1208,6 +1223,9 @@ def test_manager_fetch_models_uses_solo_headers(tmp_path):
     seen = {}
 
     def handler(req):
+        if "/api/remote/v1/models" in str(req.url):
+            return httpx.Response(200, json=_menu(("solo_work_remote", [
+                {"name": "glm-5.2", "display_name": "GLM-5.2", "context_window_tokens": {"dev": 200000}}])))
         seen["accept"] = req.headers["Accept"]
         seen["uid"] = req.headers.get("X-Uid")
         seen["auth"] = req.headers["Authorization"]
@@ -1290,7 +1308,7 @@ def test_catalog_provider_exception_falls_back_static():
         raise RuntimeError("registry gone")
     T.set_catalog_provider(boom)
     try:
-        assert len(T.trae_model_catalog()) == 32
+        assert len(T.trae_model_catalog()) == 12
         assert T.map_model("glm-5.2") == "glm-5.2"
     finally:
         T.set_catalog_provider(None)
@@ -1307,12 +1325,12 @@ def test_registry_trae_builtin_seed_and_disable():
     reg = _registry()
     reg.ensure_trae_builtin()
     ids = reg.snapshot_ids()
-    assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 32
+    assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 12
     enabled = reg.enabled_models()
     assert "trae/glm-5.2" in enabled
     snap = reg.snapshot()["models"]
     trae_rows = [m for m in snap if m.get("backend") == "trae"]
-    assert len(trae_rows) == 32 and all(m["enabled"] for m in trae_rows)
+    assert len(trae_rows) == 12 and all(m["enabled"] for m in trae_rows)
     # 禁用 trae/glm-5.2
     state = reg.set_enabled("trae/glm-5.2", False)
     assert "trae/glm-5.2" not in reg.enabled_models()
@@ -1338,7 +1356,7 @@ def test_registry_refresh_trae_models_replaces_builtin():
     reg.trae_credential_getter = lambda: FakeManager()
     assert reg.refresh_trae_models() is True
     ids = {i for i in reg.snapshot_ids() if i.startswith("trae/")}
-    assert ids == {"trae/dyn-a", "trae/dyn-b"}  # 静态 32 条被动态表替换
+    assert ids == {"trae/dyn-a", "trae/dyn-b"}  # 静态兜底表被动态表替换
     assert reg.trae_entries()[0] == {"id": "dyn-a", "name": "DynA", "context_length": 2048}
     # 失败保留上次快照
     class Boom:
@@ -1450,6 +1468,10 @@ async def _e2e_dynamic_catalog_replaces_static(self):
     headers = await self.login_admin()
 
     def handler(req):
+        if "/api/remote/v1/models" in str(req.url):
+            return httpx.Response(200, json=_menu(("solo_work_remote", [
+                {"name": "dyn-x", "display_name": "Dyn X", "context_window_tokens": {"dev": 200000},
+                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.5}}}'}])))
         if req.url.path.endswith("/get_detail_param"):
             return httpx.Response(200, json={"config_info_list": [
                 {"config_name": "dyn-x", "display_config": {"display_name": "Dyn X"}}]})
