@@ -22,6 +22,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -47,6 +48,10 @@ CLIENT_UA = f"Trae/{IDE_VERSION}"
 
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
 EP_MODELS = "/api/ide/v1/get_detail_param"
+# 官方客户端模型菜单：带倍率（consumption_rate / 会员折扣）与上下文，比 get_detail_param 更权威
+REMOTE_MODELS_HOST = "https://work.trae.cn"
+EP_REMOTE_MODELS = "/api/remote/v1/models"
+REMOTE_MODELS_FUNCTIONS = "solo_agent_remote,solo_work_remote,solo_design_remote"
 EP_EXCHANGE = "/cloudide/api/v3/trae/oauth/ExchangeToken"
 EP_USERINFO = "/cloudide/api/v3/trae/GetUserInfo"
 EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
@@ -444,6 +449,96 @@ def fetch_models(client: httpx.Client, headers: dict, agent_host: str | None = N
     return out
 
 
+# 内部槽位（自定义模型占位 / 子代理 / 工具）不是可调用的对话模型，不入目录。
+_INTERNAL_SLOT_MARKERS = ("custom_model", "subagent", "sub_agent")
+_INTERNAL_SLOT_NAMES = {"summary", "file_search_agent"}
+
+
+def _is_internal_slot(mid: str) -> bool:
+    low = mid.lower()
+    return low in _INTERNAL_SLOT_NAMES or any(m in low for m in _INTERNAL_SLOT_MARKERS)
+
+
+def _feature_rate(features) -> float | None:
+    """features(JSON 字符串) → 实际消耗倍率。
+
+    会员/补贴折扣生效时取 `activity_discount.data.current.consumption_rate`（用户实付倍率），
+    否则取基础 `consumption_rate.data.rate`。缺失/未启用返回 None（按标准计费展示）。
+    """
+    if isinstance(features, str):
+        try:
+            features = json.loads(features)
+        except ValueError:
+            return None
+    if not isinstance(features, dict):
+        return None
+    disc = features.get("activity_discount")
+    if isinstance(disc, dict) and disc.get("enable"):
+        current = (disc.get("data") or {}).get("current") or {}
+        rate = current.get("consumption_rate")
+        if isinstance(rate, (int, float)):
+            return float(rate)
+    base = features.get("consumption_rate")
+    if isinstance(base, dict) and base.get("enable"):
+        rate = (base.get("data") or {}).get("rate")
+        if isinstance(rate, (int, float)):
+            return float(rate)
+    return None
+
+
+def fetch_remote_models(client: httpx.Client, headers: dict,
+                        host: str | None = None) -> list[dict]:
+    """拉官方客户端模型菜单（/api/remote/v1/models）。
+
+    返回 [{id,name,context_length,credits}]（credits＝倍率）；空表抛 TraeAPIError。
+    多个 function 分组按 name 去重合并。
+    """
+    base = host or REMOTE_MODELS_HOST
+    url = f"{base}{EP_REMOTE_MODELS}?functions={quote(REMOTE_MODELS_FUNCTIONS, safe='')}&show_custom_model=true"
+    r = client.get(url, headers=headers)
+    if r.status_code != 200:
+        raise TraeAPIError(f"模型菜单接口返回 HTTP {r.status_code}", status=r.status_code)
+    try:
+        data = r.json()
+    except ValueError:
+        raise TraeAPIError("模型菜单接口返回非 JSON")
+    if isinstance(data, dict) and data.get("code") not in (None, 0):
+        raise TraeAPIError(f"模型菜单接口返回 code={data.get('code')}")
+    out, seen = [], set()
+    for group in ((data or {}).get("data") or {}).get("list") or []:
+        if not isinstance(group, dict):
+            continue
+        for item in group.get("models") or []:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("name") or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            ctx = (item.get("context_window_tokens") or {}).get("dev")
+            out.append({"id": mid, "name": str(item.get("display_name") or mid),
+                        "context_length": int(ctx) if isinstance(ctx, (int, float)) and ctx else None,
+                        "credits": _feature_rate(item.get("features"))})
+    if not out:
+        raise TraeAPIError("模型菜单接口返回空列表")
+    return out
+
+
+def merge_model_catalogs(*catalogs) -> list[dict]:
+    """按优先级合并目录来源：同名保留首个（信息更全的放前面），剔除内部槽位与空 id。"""
+    out, seen = [], set()
+    for catalog in catalogs:
+        for entry in catalog or []:
+            if not isinstance(entry, dict):
+                continue
+            mid = str(entry.get("id") or "").strip()
+            if not mid or mid in seen or _is_internal_slot(mid):
+                continue
+            seen.add(mid)
+            out.append({**entry, "id": mid})
+    return out
+
+
 def checkin_status(client: httpx.Client, headers: dict, ug_host: str | None = None) -> dict:
     """查询签到状态。返回 {checked, credits, enable}。"""
     host = ug_host or UG_HOST
@@ -474,7 +569,6 @@ def _num(value) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
-
 
 def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None,
                    now: float | None = None) -> float:
@@ -671,10 +765,27 @@ class TraeCredentialManager:
             return h
 
     def fetch_models(self) -> list[dict]:
-        """拉动态模型表（SOLO 头、Accept: application/json；token 自动刷新）。"""
-        headers = self.get_headers(stream=False)
+        """Trae 模型目录：官方菜单（remote，含倍率/上下文）优先，合并 get_detail_param 的额外条目。
+
+        两套来源互补：remote 是客户端菜单、带倍率，但只列当前 function 组内的模型；
+        detail_param 含部分未列入菜单的历史 config_name。任一失败都不致命，
+        仅当两者皆空才抛错（调用方保留上次快照）。
+        """
+        ug = self.ug_headers()
+        solo = self.get_headers(stream=False)
+        remote = detail = None
         with httpx.Client(timeout=20) as client:
-            return fetch_models(client, headers)
+            try:
+                remote = fetch_remote_models(client, ug)
+            except (TraeAPIError, httpx.HTTPError):
+                remote = None
+            try:
+                detail = fetch_models(client, solo)
+            except (TraeAPIError, httpx.HTTPError):
+                detail = None
+        if remote is None and detail is None:
+            raise TraeAPIError("模型目录拉取失败：remote 与 get_detail_param 均不可用")
+        return merge_model_catalogs(remote, detail)
 
     def checkin_status(self, client) -> dict:
         return checkin_status(client, self.ug_headers())

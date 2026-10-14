@@ -285,7 +285,9 @@ class ModelRegistry:
                 mid = str(e.get("id") or "").strip()
                 if not mid:
                     continue
-                catalog[mid] = {"name": str(e.get("name") or mid), "description": None, "credits": None,
+                catalog[mid] = {"name": str(e.get("name") or mid),
+                                "description": e.get("description") or None,
+                                "credits": e.get("credits"),
                                 "max_input_tokens": e.get("context_length"), "source": "upstream"}
             if not catalog:
                 return False

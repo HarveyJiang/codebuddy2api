@@ -1049,6 +1049,92 @@ def test_fetch_models_envelope_and_errors():
             T.fetch_models(client, {})
 
 
+def _menu(*groups):
+    return {"code": 0, "message": "success",
+            "data": {"list": [{"function": fn, "models": models} for fn, models in groups]}}
+
+
+def test_feature_rate_prefers_discount_then_base():
+    assert T._feature_rate('{"consumption_rate":{"enable":true,"data":{"rate":0.8}}}') == 0.8
+    discounted = ('{"consumption_rate":{"enable":true,"data":{"rate":0.4}},'
+                  '"activity_discount":{"enable":true,"data":{"current":{"consumption_rate":0.1}}}}')
+    assert T._feature_rate(discounted) == 0.1  # 折扣生效时取实付倍率
+    assert T._feature_rate('{"consumption_rate":{"enable":false,"data":{"rate":0.9}}}') is None
+    assert T._feature_rate("not json") is None
+    assert T._feature_rate(None) is None
+
+
+def test_fetch_remote_models_parses_menu_and_dedupes():
+    payload = _menu(
+        ("solo_work_remote", [
+            {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000},
+             "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'},
+            {"name": "glm-5.3", "display_name": "重复项", "features": "{}"},
+        ]),
+        ("solo_agent_remote", [
+            {"name": "Doubao-Seed-Code", "display_name": "Seed-Code",
+             "context_window_tokens": {"dev": 256000},
+             "features": '{"activity_discount":{"enable":true,"data":{"current":{"consumption_rate":0.03}}}}'},
+        ]),
+    )
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        models = T.fetch_remote_models(client, {})
+    assert [m["id"] for m in models] == ["glm-5.3", "Doubao-Seed-Code"]
+    assert models[0] == {"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}
+    assert models[1]["credits"] == 0.03
+
+
+def test_fetch_remote_models_errors():
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(401, json={"code": 1001}))) as client:
+        with pytest.raises(T.TraeAPIError) as ei:
+            T.fetch_remote_models(client, {})
+        assert ei.value.status == 401
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"code": 7}))) as client:
+        with pytest.raises(T.TraeAPIError):
+            T.fetch_remote_models(client, {})
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=_menu()))) as client:
+        with pytest.raises(T.TraeAPIError):
+            T.fetch_remote_models(client, {})
+
+
+def test_merge_model_catalogs_drops_internal_slots():
+    remote = [{"id": "glm-5.3", "credits": 0.39}]
+    detail = [{"id": "glm-5.3", "credits": None}, {"id": "sagitta"},
+              {"id": "custom_model_gpt-5"}, {"id": "summary"}, {"id": "explore_sub_agent_v2"},
+              {"id": "browser_use_subagent"}, {"id": ""}]
+    merged = T.merge_model_catalogs(remote, detail)
+    assert [m["id"] for m in merged] == ["glm-5.3", "sagitta"]
+    assert merged[0]["credits"] == 0.39  # 首个来源（信息更全）胜出
+
+
+def test_manager_fetch_models_merges_menu_and_detail(tmp_path):
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mgr = T.TraeCredentialManager(p)
+
+    def handler(req):
+        if "/api/remote/v1/models" in str(req.url):
+            return httpx.Response(200, json=_menu(("solo_work_remote", [
+                {"name": "glm-5.3", "display_name": "GLM-5.3", "context_window_tokens": {"dev": 200000},
+                 "features": '{"consumption_rate":{"enable":true,"data":{"rate":0.39}}}'}])))
+        return httpx.Response(200, json={"config_info_list": [
+            {"config_name": "glm-5.3", "display_config": {"display_name": "重复"}},
+            {"config_name": "sagitta", "display_config": {"display_name": "Sagitta"}},
+            {"config_name": "summary", "display_config": {"display_name": "Summary"}}]})
+
+    real = _REAL_SYNC_CLIENT
+    orig = httpx.Client
+    httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(handler), **kw)
+    try:
+        models = mgr.fetch_models()
+    finally:
+        httpx.Client = orig
+    assert [m["id"] for m in models] == ["glm-5.3", "sagitta"]
+    assert models[0]["name"] == "GLM-5.3" and models[0]["credits"] == 0.39
+    assert models[0]["context_length"] == 200000
+
+
 def test_checkin_status_and_claim_and_ent_usage(tmp_path):
     doc = trae_credential()
     p = tmp_path / "t.info"
@@ -1232,6 +1318,22 @@ def test_registry_refresh_trae_models_replaces_builtin():
     reg.trae_credential_getter = lambda: None
     assert reg.refresh_trae_models() is False
     assert "trae/dyn-a" in reg.snapshot_ids()
+
+
+def test_registry_trae_credits_reach_snapshot():
+    """动态目录带来的倍率/上下文必须透传到管理页快照。"""
+    reg = _registry()
+
+    class FakeManager:
+        def fetch_models(self):
+            return [{"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}]
+
+    reg.trae_credential_getter = lambda: FakeManager()
+    assert reg.refresh_trae_models() is True
+    rows = {m["id"]: m for m in reg.snapshot()["models"]}
+    row = rows["trae/glm-5.3"]
+    assert row["backend"] == "trae" and row["credits"] == 0.39
+    assert row["max_input_tokens"] == 200000 and row["name"] == "GLM-5.3"
 
 
 def test_registry_kill_switch_hides_trae(monkeypatch):
