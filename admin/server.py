@@ -837,7 +837,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             live = metrics.snapshot()
             merged = {**live, **summary,
                       "in_flight": live["in_flight"], "started_at": summary["first_time"] or live["started_at"],
-                      "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}
+                      "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds,
+                      # 实测成本账本规模。上游若从不返回 credit，这里会长期是 0——
+                      # 这个数字就是判断「账本到底有没有在用」的唯一依据。
+                      "cost_ledger": pool.cost_ledger.stats()}
             return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "pool_groups": {k: list(v) for k, v in AccountPool.SETTING_GROUPS.items()}, "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "version": app_version.snapshot(), "events": list(store.events)}
 
     @app.get("/admin/api/logs")

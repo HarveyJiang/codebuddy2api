@@ -309,6 +309,48 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.pool.record(self.a, 402)
         self.assertEqual(self.store.data['account_status'][self.a]['credits_updated'], 0)
 
+    def test_record_uses_upstream_reset_time_when_later(self):
+        """上游明说了恢复时刻、且比本地退避更晚 → 采信上游。
+
+        本地猜的必然不准：猜短了会在窗口内反复撞墙（每次都是一次风控痕迹）。
+        """
+        from datetime import datetime, timezone, timedelta
+        CN = timezone(timedelta(hours=8))
+        # 本地退避是 1800 秒；上游说 2 小时后才恢复。
+        later = datetime.fromtimestamp(self.now + 7200, CN).strftime('%Y-%m-%d %H:%M:%S')
+        self.pool.record(self.a, 429, hint_text=f"请求过于频繁，将在 {later} 重置")
+        until = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertAlmostEqual(until - self.now, 7200, delta=2)
+        self.assertIn('上游明示', self.store.data['account_status'][self.a]['last_error'])
+
+    def test_record_ignores_upstream_time_earlier_than_local_backoff(self):
+        """上游给的时刻比本地退避还早 → 取更晚者，不缩短已有冷却。"""
+        from datetime import datetime, timezone, timedelta
+        CN = timezone(timedelta(hours=8))
+        sooner = datetime.fromtimestamp(self.now + 60, CN).strftime('%Y-%m-%d %H:%M:%S')
+        self.pool.record(self.a, 429, hint_text=f"将在 {sooner} 重置")
+        until = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertEqual(until - self.now, 1800)   # 仍是本地退避
+        self.assertIn('本地退避', self.store.data['account_status'][self.a]['last_error'])
+
+    def test_record_uses_retry_after_header(self):
+        self.pool.record(self.a, 429, hint_headers={"Retry-After": "9000"})
+        until = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertEqual(until - self.now, 9000)
+
+    def test_record_clamps_absurd_upstream_time(self):
+        """上游报到一天以后必然是脏数据，不能让它把账号永久扣住。"""
+        self.pool.record(self.a, 429, hint_headers={"Retry-After": "999999999"})
+        until = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertLessEqual(until - self.now, 86400)
+
+    def test_record_without_hint_is_unchanged(self):
+        """没有上游提示时行为必须与加这个功能之前逐字节一致。"""
+        self.pool.record(self.a, 429)
+        until = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertEqual(until - self.now, 1800)
+        self.assertIn('本地退避', self.store.data['account_status'][self.a]['last_error'])
+
     def test_flush_debounce_and_force(self):
         self.pool.update(self.a, last_error=None)
         self.assertTrue(self.pool.dirty)
@@ -467,13 +509,13 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         original_select = self.pool.select
         state = {"first": True}
 
-        def spy(affinity_key=None, kid_arg=None):
+        def spy(affinity_key=None, kid_arg=None, exclude=None, model=None):
             calls.append(kid_arg)
             if state["first"]:
                 # 第一次返回一个 get_headers 会抛的 manager，触发重试分支。
                 bad = self.store.manager_for(self.a, self.store.data["accounts"][self.a])
                 return self.a, bad
-            return original_select(affinity_key, kid_arg)
+            return original_select(affinity_key, kid_arg, exclude=exclude, model=model)
         self.pool.select = spy
         # 让 a 的 get_headers 抛错，重试才会发生。
         manager = self.store.manager_for(self.a, self.store.data["accounts"][self.a])

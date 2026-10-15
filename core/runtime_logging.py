@@ -16,6 +16,8 @@ import logging.handlers
 import sys
 from datetime import datetime, timedelta, timezone
 
+from .log_redact import RedactingFilter
+
 # 北京时间。core 层不依赖 admin.models，这里自带一份。
 CN = timezone(timedelta(hours=8))
 
@@ -51,8 +53,12 @@ def setup_logging(level="INFO", path=None):
             handler.close()
 
     formatter = _BeijingFormatter(_FORMAT, _DATEFMT)
+    redactor = RedactingFilter()
     stream = logging.StreamHandler(sys.stderr)
     stream.setFormatter(formatter)
+    # 脱敏挂在 handler 上（不是 logger）：这样 httpx / uvicorn 自己打的日志
+    # 也会被过一遍，而不只是本项目 _log() 出来的记录。
+    stream.addFilter(redactor)
     stream._workbuddy = True
     root.addHandler(stream)
     handlers = [stream]
@@ -63,6 +69,7 @@ def setup_logging(level="INFO", path=None):
                 path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
             )
             file_handler.setFormatter(formatter)
+            file_handler.addFilter(redactor)
             file_handler._workbuddy = True
             root.addHandler(file_handler)
             handlers.append(file_handler)

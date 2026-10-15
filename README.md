@@ -767,6 +767,23 @@ window is hard-bounded by `queue_hold_ms` (default 3000ms) — if no first chunk
 is treated as a slow upstream and passed through, never waited on indefinitely. A response that
 already contains real content is never replayed. See `specs/queue-failover.md`.
 
+### Upstream Failure Handling
+
+Three small modules on the account-pool failure path: cooldown deadlines are taken from the
+upstream's **stated** reset time when it provides one (falling back to bounded local backoff),
+transport errors are classified as replay-safe vs. possibly-already-billed (never replay after the
+request body is sent), and logs are scrubbed of credentials by a handler-level filter so a
+`log.exception` cannot leak a Bearer token. See `specs/upstream-failure-handling.md`.
+
+### Measured Cost Ledger
+
+Selects accounts by **observed** cost per `(account, model)`, preferring accounts measured as free —
+whether a given account is billed cannot be inferred from config (free-tier windows, nightly
+promotions and trials only show up in the response). Observations expire after 6 hours. Critically,
+the ledger is **inert until observed**: if the upstream never returns a `credit` field, it records
+nothing and selection behaves exactly as before. `observed` in `overview.metrics.cost_ledger` is
+how you tell whether it is doing anything. See `specs/upstream-failure-handling.md`.
+
 ### Capability Notes (Measured)
 
 Not official specs — measured against this project's upstream (Tencent CodeBuddy backend).

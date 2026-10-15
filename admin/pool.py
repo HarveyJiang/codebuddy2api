@@ -14,6 +14,9 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
+from admin.cost_ledger import CostLedger
+from admin.reset_at import earliest_deadline, parse_reset_at, parse_retry_after
+
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 # 池中间件观察到的路由信息，交由外层 MetricsMiddleware 合并成一行 request_logs。
 # 用 scope 传递而不是 ContextVar：middleware 是嵌套调用，内层 finally 的 reset
@@ -163,6 +166,8 @@ class AccountPool:
         self.affinity_rebinds = 0
         self.dirty = False
         self.last_flush = 0
+        # 实测成本账本（admin/cost_ledger.py）。观测不到上游价就完全不生效。
+        self.cost_ledger = CostLedger(clock=clock)
         self._usage_manual_at = {}   # aid -> 上次手动拉取时间戳，进程内节流
         with store.lock:
             store.data.setdefault("pool", dict(self.POOL_DEFAULTS))
@@ -371,7 +376,7 @@ class AccountPool:
         policy = item.get("routing") or self.store.data["pool"].get("default_routing", "round_robin")
         return policy if policy in ROUTING_POLICIES else "round_robin"
 
-    def select(self, affinity_key=None, kid=None, exclude=None):
+    def select(self, affinity_key=None, kid=None, exclude=None, model=None):
         """按 key 选账号：候选集 = key 的 accounts 白名单 ∩ 可用账号。
 
         kid=None 表示无 key 路径（管理页测试请求），此时不施加白名单。凭据失败后
@@ -397,6 +402,13 @@ class AccountPool:
             fresh = [row for row in candidates if not self.queued(row["id"])]
             if fresh:
                 candidates = fresh
+            # 实测免费的账号优先。账本为空（或该模型没有任何免费观测）时原样返回，
+            # 行为与加这个功能之前一致——见 admin/cost_ledger.py 的「观测不到就什么都不做」。
+            if model:
+                candidates = self.cost_ledger.prefer_free(
+                    candidates, model, lambda row: row["id"])
+            if not candidates:
+                raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
                 if bindings[key].get("expires", 0) <= now:
@@ -431,7 +443,7 @@ class AccountPool:
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
 
-    def try_select(self, affinity_key, kid, exclude):
+    def try_select(self, affinity_key, kid, exclude, model=None):
         """尝试选一个没试过的账号；没有候选时返回 None，不抛异常。
 
         排队切号专用：候选耗尽时我们要把上游的排队响应**原样**返回给客户端，
@@ -440,11 +452,47 @@ class AccountPool:
         「先探测候选集、再选号」两步之间的竞态窗口。
         """
         try:
-            return self.select(affinity_key, kid, exclude=exclude)
+            return self.select(affinity_key, kid, exclude=exclude, model=model)
         except HTTPException:
             return None
 
-    def record(self, aid, status=200):
+    def _observe_cost(self, aid, model, usage):
+        """从 usage 里提取实测 credit 并记入账本。
+
+        字段名有几种可能（上游未公开契约），**逐个试、试不到就放弃**：
+        宁可账本为空，也不能猜一个值出来——猜错会让选号把流量全压到
+        一个其实收费的号上。
+        """
+        if not isinstance(usage, dict):
+            return
+        credits = None
+        for field in ("credit", "credits", "total_credit", "credit_used", "cost"):
+            if field in usage:
+                credits = usage[field]
+                break
+        if credits is None:
+            return
+        tokens = usage.get("total_tokens")
+        if tokens is None:
+            # 没有 token 数就算不出单价；试一下拆分字段，仍不行就放弃。
+            prompt = usage.get("prompt_tokens")
+            completion = usage.get("completion_tokens")
+            if isinstance(prompt, (int, float)) and isinstance(completion, (int, float)):
+                tokens = prompt + completion
+        self.cost_ledger.observe(aid, model, credits, tokens)
+
+    def record(self, aid, status=200, *, hint_text=None, hint_headers=None, usage=None, model=None):
+        """记录一次请求结果，并在失败时施加冷却。
+
+        ``hint_text`` / ``hint_headers`` 是上游响应里**可能**带着的恢复时刻
+        （见 admin/reset_at.py）。给了就用它，给不出才回落本地有界退避——
+        本地猜的时长必然不准，见该模块开头的说明。
+
+        ``usage`` / ``model`` 用于实测成本账本（admin/cost_ledger.py）：只有响应里
+        真的带回了可解析的 credit 才会记录，否则账本保持为空、选号行为不变。
+        """
+        if usage and model and aid:
+            self._observe_cost(aid, model, usage)
         cooldown = 0
         recovered = False
         with self.store.lock:
@@ -459,8 +507,24 @@ class AccountPool:
                 data["consecutive_fails"] = fails
                 base = 300 if status in (401, 403) else 1800
                 cooldown = min(base * (2 ** (fails - 1)), 7200)
+                # 上游给了明确恢复时刻就采信它——本地猜的必然偏。
+                # 与本地退避取**更晚**者：提前放出来只会在窗口内反复撞墙，
+                # 每次都是一次风控痕迹。
+                explicit = earliest_deadline(
+                    parse_reset_at(hint_text, now=self.clock()),
+                    parse_retry_after(hint_headers, now=self.clock()),
+                )
+                until = self.clock() + cooldown
+                source = "本地退避"
+                if explicit:
+                    ceiling = self.clock() + 86400  # 上游报到一天以后必然是脏数据
+                    until = min(max(explicit, until), ceiling)
+                    if until == explicit:
+                        source = "上游明示"
                 label = "上游认证或访问被拒绝" if status in (401, 403) else "上游额度或频率限制"
-                data.update(cooldown_until=self.clock() + cooldown, last_error=f"{label}，已冷却 {cooldown // 60} 分钟")
+                data.update(cooldown_until=until,
+                            last_error=f"{label}，已冷却 {max(1, (until - self.clock()) // 60)} 分钟（{source}）")
+                cooldown = until - self.clock()
                 if status == 402:
                     data["credits_updated"] = 0  # 触发下个周期立即重新查询积分
             else:
@@ -964,12 +1028,16 @@ class PoolMiddleware:
             # Refresh before entering a stream; retry another eligible account only
             # if credential preparation fails, never replay a partially emitted response.
             # 重试分支也要传同一个 kid，否则凭据失败后可能选到该 key 白名单之外的账号。
-            aid, manager = self.pool.select(affinity_key, kid)
+            #
+            # 这里重试是**安全**的：失败发生在 get_headers()（本地凭据准备），
+            # 一个字节都没发给上游，不存在重复计费。上游侧的传输异常绝不在此重试，
+            # 判别依据见 core/replay_policy.py。
+            aid, manager = self.pool.select(affinity_key, kid, model=model_name)
             try:
                 await asyncio.to_thread(manager.get_headers)
             except Exception:
                 self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
-                aid, manager = self.pool.select(affinity_key, kid)
+                aid, manager = self.pool.select(affinity_key, kid, model=model_name)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
@@ -988,7 +1056,7 @@ class PoolMiddleware:
             # 开关关闭时走原路径：必须仍然用重放闭包包一层 receive，
             # 否则下游应用第二次 await receive() 会阻塞在 ASGI 上。
             return await self._serve_once(scope, _replay_receive(raw, receive), send,
-                                          aid, manager, kid, log_context)
+                                          aid, manager, kid, log_context, model=model_name)
 
         # -- 容量队列自动切换（specs/queue-failover.md） ------------------------
         # 只有在「尚未向客户端发出任何字节」时才能重放；一旦开始输出内容就必须
@@ -1001,7 +1069,7 @@ class PoolMiddleware:
         for attempt in range(max_tries):
             # 第一次尝试用调用方已选好的账号；之后每次重新选号。
             if attempt:
-                picked = self.pool.try_select(affinity_key, kid, tried_accounts)
+                picked = self.pool.try_select(affinity_key, kid, tried_accounts, model=attempt_model)
                 if picked is None:
                     # 候选账号已试尽。先看能不能换个模型再继续，否则收工，
                     # 把上游最后一次的排队响应原样返回。
@@ -1014,7 +1082,7 @@ class PoolMiddleware:
                     # 换模型后账号可以重新从头试：新模型面对的是另一个上游队列。
                     tried_accounts = []
                     _logger.info("可用账号已试尽，降级到 %s 重试", next_model)
-                    picked = self.pool.try_select(affinity_key, kid, tried_accounts)
+                    picked = self.pool.try_select(affinity_key, kid, tried_accounts, model=attempt_model)
                     if picked is None:
                         break
                 aid, manager = picked
@@ -1034,7 +1102,10 @@ class PoolMiddleware:
             outcome = await self._attempt(scope, attempt_receive, send, manager)
             if outcome["kind"] == "done":
                 # 已放行并完整结束：记录本次生效的账号与用量，收工。
-                self.pool.record(aid, outcome["status"])
+                self.pool.record(aid, outcome["status"],
+                                 hint_text=outcome.get("error_text"),
+                                 hint_headers=outcome.get("error_headers"),
+                                 usage=outcome.get("usage"), model=attempt_model)
                 if kid is not None:
                     self.pool.store.record_key_usage(kid, tokens=outcome["tokens"] or None)
                 self.pool.flush()
@@ -1054,7 +1125,9 @@ class PoolMiddleware:
             await send({"type": "http.response.start", "status": last_outcome["status"],
                         "headers": last_outcome["headers"]})
             await send({"type": "http.response.body", "body": last_outcome["body"]})
-            self.pool.record(aid, last_outcome["status"])
+            self.pool.record(aid, last_outcome["status"],
+                             hint_text=self._text_of(last_outcome),
+                             hint_headers=last_outcome.get("headers"))
             if kid is not None:
                 self.pool.store.record_key_usage(kid, tokens=None)
         else:
@@ -1091,6 +1164,8 @@ class PoolMiddleware:
         hold_ms = max(0, int(self.pool.store.data.get("pool", {}).get("queue_hold_ms", 3000)))
         state = {"status": 200, "headers": [], "held": False, "first_body": None,
                  "queue": False, "started": False, "tokens": 0}
+        # 上游错误文案：判定排队之外，冷却时长也要用它（可能写了恢复时刻）。
+        err_texts: list[str] = []
         body_ready = asyncio.Event()
 
         def sniff(payload):
@@ -1125,7 +1200,11 @@ class PoolMiddleware:
                 for holder in (err, resp, obj):
                     if isinstance(holder, dict) and holder.get("message"):
                         texts.append(str(holder["message"]))
-            return self.pool.is_queue_error(None, " ".join(texts), code), code, has_content
+            joined = " ".join(texts)
+            if joined:
+                # 冷却也要读这段文案：上游可能在这里写了恢复时刻。
+                err_texts.append(joined)
+            return self.pool.is_queue_error(None, joined, code), code, has_content
 
         async def observe(message):
             if message["type"] == "http.response.start":
@@ -1199,7 +1278,21 @@ class PoolMiddleware:
             raise
         finally:
             REQUEST_CREDENTIAL.reset(token)
-        return {"kind": "done", "status": state["status"], "tokens": state["tokens"]}
+        # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
+        # 采信上游明示的恢复时刻（见 admin/reset_at.py）。
+        return {"kind": "done", "status": state["status"], "tokens": state["tokens"],
+                "usage": state.get("usage"),
+                "error_text": " ".join(err_texts) or None,
+                "error_headers": state["headers"]}
+
+    @staticmethod
+    def _text_of(outcome):
+        """从被丢弃的原始响应体里取出可读文案，供冷却解析恢复时刻。"""
+        body = outcome.get("body") or b""
+        try:
+            return body.decode("utf-8", "replace")[:2000] or None
+        except Exception:
+            return None
 
     @staticmethod
     async def _await_app(task):
@@ -1211,7 +1304,11 @@ class PoolMiddleware:
 
     @staticmethod
     def _track_usage(payload, state):
-        """从流里提取 usage.total_tokens（与旧 observe 的行为一致）。"""
+        """从流里提取 usage（token 计数 + 可能的实测 credit）。
+
+        旧的 observe 只留 total_tokens；实测成本账本还需要 credit，所以这里
+        把整个 usage 对象留下最后一份副本（最后一次出现的 usage 才是最终用量）。
+        """
         text = payload.decode("utf-8", "replace")
         for line in text.split("\n"):
             line = line.strip()
@@ -1227,13 +1324,21 @@ class PoolMiddleware:
             total = usage.get("total_tokens") if isinstance(usage, dict) else None
             if isinstance(total, (int, float)):
                 state["tokens"] = max(state["tokens"], int(total))
+            # 留最后一份完整 usage：账本要从这里读实测 credit。
+            if isinstance(usage, dict):
+                state["usage"] = usage
 
-    async def _serve_once(self, scope, receive, send, aid, manager, kid, log_context):
+    async def _serve_once(self, scope, receive, send, aid, manager, kid, log_context, model=None):
         """开关关闭时的原路径：完全保持改动前的行为。"""
         token = REQUEST_CREDENTIAL.set(manager)
         status = 200
         buffer = b""
         usage_tokens = 0
+        # 失败冷却可能要采信上游明示的恢复时刻（见 admin/reset_at.py）。
+        resp_headers = []
+        err_texts: list[str] = []
+        # 最后一次出现的完整 usage：实测成本账本要读 credit。
+        nonlocal_last_usage = [None]
 
         def extract_usage(obj):
             nonlocal usage_tokens
@@ -1241,11 +1346,15 @@ class PoolMiddleware:
             total = usage.get("total_tokens") if isinstance(usage, dict) else None
             if isinstance(total, (int, float)):
                 usage_tokens = max(usage_tokens, int(total))
+            if isinstance(usage, dict):
+                # 账本要从这里读实测 credit。
+                nonlocal_last_usage[0] = usage
 
         async def observe(message):
             nonlocal status, buffer
             if message["type"] == "http.response.start":
                 status = message["status"]
+                resp_headers = message.get("headers", [])
             if message["type"] == "http.response.body":
                 buffer += message.get("body", b"")
                 while b"\n" in buffer:
@@ -1255,6 +1364,8 @@ class PoolMiddleware:
                             obj = json.loads(line[5:])
                             extract_usage(obj.get("response") or obj)
                             err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
+                            if isinstance(err, dict) and err.get("message"):
+                                err_texts.append(str(err["message"]))
                             code = err.get("code") if isinstance(err, dict) else None
                             if isinstance(code, str) and code.isdigit():
                                 code = int(code)
@@ -1271,7 +1382,10 @@ class PoolMiddleware:
             await self.app(scope, receive, observe)
         finally:
             REQUEST_CREDENTIAL.reset(token)
-            self.pool.record(aid, status)
+            self.pool.record(aid, status,
+                             hint_text=" ".join(err_texts) or None,
+                             hint_headers=resp_headers,
+                             usage=nonlocal_last_usage[0], model=model)
             if kid is not None:
                 self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
             self.pool.flush()
