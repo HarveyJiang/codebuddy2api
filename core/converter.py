@@ -1674,6 +1674,12 @@ def main():
     CONFIG["log_path"] = args.log
     # 日志最早初始化：之后的启动信息与请求日志才有出口。
     logging_setup.setup_logging(cfg.log_level, args.log)
+    _legacy = config.legacy_used()
+    if _legacy:
+        logging.getLogger("core.converter").info(
+            "以下配置使用旧名，仍生效，建议改为规范名：%s",
+            "、".join(f"{old}→{new}" for old, new in _legacy),
+        )
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 

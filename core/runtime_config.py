@@ -40,6 +40,9 @@ _ALIASES = {
 }
 
 _warned = set()
+# 命中的旧名及应改用者，供启动摘要一次性汇总（配置在日志初始化之前读取，
+# 此时直接 logging 会让这几行以裸 stderr 形式冲在启动横幅前面，很吵）。
+_legacy_used = []
 
 
 def _parse_env_file(path):
@@ -81,7 +84,9 @@ def raw(name, default=None):
     是一份有效配置，必须尊重。否则 ``WORKBUDDY_LOG=""``（想关掉文件日志）会被当作
     「没设」，继续落回已弃用的 CODEBUDDY2OPENAI_LOG，反而把日志打开了。
 
-    命中旧名时告警一次（每个变量只提醒一次，不刷屏）。
+    命中旧名时记入 ``legacy_used``，由启用方在日志就绪后统一提示一次
+    （配置在日志初始化之前读取，此处直接 logging 会以裸 stderr 形式冲在启动
+    横幅前面，反而更吵）。
     """
     canonical = _ALIASES.get(name, ())
     if name in os.environ:
@@ -90,13 +95,14 @@ def raw(name, default=None):
         if alias in os.environ:
             if alias not in _warned:
                 _warned.add(alias)
-                import logging
-
-                logging.getLogger("core.runtime_config").warning(
-                    "配置 %s 已弃用，请改用 %s", alias, name
-                )
+                _legacy_used.append((alias, name))
             return os.environ[alias]
     return default
+
+
+def legacy_used():
+    """返回本次启动命中的旧变量名列表 [(旧名, 新名), ...]。"""
+    return list(_legacy_used)
 
 
 def _to_bool(value, default=False):

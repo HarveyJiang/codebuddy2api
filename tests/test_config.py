@@ -82,13 +82,26 @@ class AliasTests(unittest.TestCase):
         result = run_config({"PORT": "9100"}, "print(config.get().port)")
         self.assertEqual(result.stdout.strip(), "9100")
 
-    def test_legacy_name_warns_once(self):
+    def test_legacy_name_is_recorded_once(self):
+        """旧名被记入 legacy_used 且不重复（提示由启用方在日志就绪后统一打印）。"""
         result = run_config(
             {"PORT": "9100"},
-            "config.get(); config.get(); config.get(); print('done')",
+            "config.get(); config.get(); config.get(); print(config.legacy_used())",
         )
-        self.assertIn("已弃用", result.stderr)
-        self.assertEqual(result.stderr.count("已弃用"), 1)
+        self.assertEqual(result.stdout.strip(), "[('PORT', 'WORKBUDDY_PORT')]")
+        # 提示不在配置读取期打印：那时日志还没初始化，裸 stderr 会冲在启动横幅前面。
+        self.assertNotIn("已弃用", result.stderr)
+
+    def test_legacy_summary_printed_by_entrypoint(self):
+        """启用方在日志就绪后汇总提示一次，不是每个变量一行。"""
+        result = run_config(
+            {"PORT": "9100", "ADMIN_KEY": "x" * 32},
+            "import logging, admin.server as s; "
+            "logging.basicConfig(level=logging.INFO); "
+            "s._warn_legacy_config()",
+        )
+        self.assertIn("旧名", result.stderr)
+        self.assertEqual(result.stderr.count("旧名"), 1)
 
     def test_canonical_name_beats_legacy(self):
         result = run_config({"WORKBUDDY_PORT": "8100", "PORT": "9100"})
@@ -149,6 +162,35 @@ class EntryPointTests(unittest.TestCase):
             "print('cfg.port' in src and 'cfg.api_key' in src)",
         )
         self.assertEqual(result.stdout.strip(), "True")
+
+
+class ShimTests(unittest.TestCase):
+    """admin 侧的兼容垫片必须转发 core 的全部公开名字。
+
+    手写转发名单会在 core 新增函数时静默漏掉——曾经漏掉 legacy_used()，
+    导致 create_app 直接 AttributeError 起不来。
+    """
+
+    def test_admin_shims_forward_all_public_names(self):
+        from core import runtime_config, runtime_logging
+        from admin import config as admin_config, logging_setup as admin_logging
+
+        for core_module, shim in ((runtime_config, admin_config),
+                                  (runtime_logging, admin_logging)):
+            for name in dir(core_module):
+                if name.startswith("__"):
+                    continue
+                self.assertTrue(
+                    hasattr(shim, name),
+                    f"{shim.__name__} 未转发 core 的 {name}",
+                )
+
+    def test_shims_point_at_same_implementation(self):
+        from core import runtime_config, runtime_logging
+        from admin import config as admin_config, logging_setup as admin_logging
+
+        self.assertIs(admin_config.get, runtime_config.get)
+        self.assertIs(admin_logging.setup_logging, runtime_logging.setup_logging)
 
 
 class DeploymentLayoutTests(unittest.TestCase):

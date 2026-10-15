@@ -482,6 +482,21 @@ class AdminMiddleware:
         await self.app(scope, replay, secure_send)
 
 
+def _warn_legacy_config():
+    """启动时汇总提示仍在使用的旧配置名（一次，不是每个变量一行）。
+
+    旧名继续生效，只是提示用户改用 WORKBUDDY_* 规范名。汇总成一行是为了不让几条
+    提示把启动横幅冲散——这些是「可以改但不必急着改」的信息，不该淹没真正的错误。
+    """
+    legacy = config.legacy_used()
+    if not legacy:
+        return
+    pairs = "、".join(f"{old}→{new}" for old, new in legacy)
+    logging.getLogger("admin.server").info(
+        "以下配置使用旧名，仍生效，建议改为规范名：%s", pairs
+    )
+
+
 def _stale_catalog(registry):
     """缓存 catalog 是否为旧格式（描述含英文、或未按单价升序）时需重新拉取。"""
     models = registry.snapshot().get("models") or []
@@ -504,6 +519,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     # 导入式启动也有日志出口，同时不覆盖调用方（或测试）已装好的 handler。
     if not logging_setup.configured():
         logging_setup.setup_logging(cfg.log_level, cfg.log_path)
+    _warn_legacy_config()
     store = Store(root or cfg.data_dir, auth_dir or cfg.auth_dir, initial_key if initial_key is not None else cfg.api_key, admin_key or cfg.admin_key)
     converter._check_auth = store.check_api
     # 以前这里把 log_path 硬覆盖成 None，导致设了 WORKBUDDY_LOG/CODEBUDDY2OPENAI_LOG
