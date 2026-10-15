@@ -22,6 +22,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -837,12 +838,13 @@ async def _stream_upstream(
     tool_names: list[str] = []
     usage: dict = {}
     saw_filter = False
+    saw_done = False  # 是否观察到 [DONE]：判「正常结束」还是「被截断」的依据
     buf = b""
     raw_parts: list[bytes] = []  # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
 
     def _feed(chunk: bytes):
-        nonlocal finish_reason, saw_filter, buf
+        nonlocal finish_reason, saw_filter, saw_done, buf
         # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
         buf += chunk
         while b"\n" in buf:
@@ -852,6 +854,7 @@ async def _stream_upstream(
                 continue
             data = line[5:].strip()
             if data == b"[DONE]":
+                saw_done = True
                 continue
             try:
                 obj = json.loads(data)
@@ -879,7 +882,10 @@ async def _stream_upstream(
                 saw_filter = True
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
+        # 连接/写入仍要有上限，但**读**不能设总超时：LLM 流式天然可能持续几分钟。
+        # 「卡死」由下面的逐分片空闲超时判定（间隔超过 idle 才中止，长响应不受影响）。
+        timeout = httpx.Timeout(connect=15.0, read=None, write=30.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -889,14 +895,30 @@ async def _stream_upstream(
                     _log_debug(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
                     yield _err_event(err, r.status_code)
                     return
-                async for chunk in r.aiter_bytes():
+                async for chunk in _iter_with_idle_timeout(
+                    r.aiter_bytes(), config.get().stream_idle_timeout, model_name
+                ):
                     if chunk:
                         raw_parts.append(chunk)
                         _feed(chunk)
                         yield chunk
+    except (TimeoutError, asyncio.TimeoutError):
+        # 空闲超时：客户端拿到明确错误，而不是一条永久挂起的连接。
+        _log(f"{prefix}✗ 流空闲超时 | {model_name} | 上游 {config.get().stream_idle_timeout}s 无数据")
+        yield _truncated_event(
+            f"上游 {config.get().stream_idle_timeout} 秒无数据，连接已中止"
+        )
+        return
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
+        return
+
+    # 上游在没有终止信号的情况下关闭：补一个明确事件，避免客户端把截断当正常结束。
+    # finish_reason 与 [DONE] 任一出现都算正常收尾——不同上游的终止信号不完全一致。
+    if finish_reason is None and not saw_done:
+        _log(f"{prefix}✗ 流被截断 | {model_name} | 未观察到终止事件")
+        yield _truncated_event("上游连接在完成前关闭，响应可能不完整")
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
@@ -937,6 +959,35 @@ def _err_event(msg: bytes, status: int) -> bytes:
         },
     }
     return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+
+
+def _truncated_event(reason: str) -> bytes:
+    """流被截断时补发的 OpenAI SSE 错误 chunk。
+
+    与 _err_event 分开：类型是 stream_truncated，客户端可据此区分「上游报错」
+    与「流中途断了」，而不必把截断当成正常结束。
+    """
+    chunk = {"error": {"message": reason[:500], "type": "stream_truncated"}}
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+
+
+async def _iter_with_idle_timeout(aiter, idle_seconds, label=""):
+    """逐个 yield 上游分片；相邻两个分片间隔超过 idle_seconds 就抛 TimeoutError。
+
+    约束的是**间隔**而不是总时长：用 asyncio.wait_for 包每一次 __anext__，
+    计时随每个分片重置，因此长推理、长输出的正常流不会被掐断。
+    上游卡死不关连接（TCP 还在但不发数据）时才会触发——那种情况下若用
+    timeout=None，请求会永远挂着，一直占着账号的 in-flight 名额。
+    """
+    iterator = aiter.__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=idle_seconds)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"上游 {idle_seconds} 秒无数据{('（' + label + '）') if label else ''}") from None
+        yield chunk
 
 
 def _looks_like_content_filter_text(text: str) -> bool:
@@ -1336,7 +1387,8 @@ async def _stream_anthropic(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
+        timeout = httpx.Timeout(connect=15.0, read=None, write=30.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1353,10 +1405,23 @@ async def _stream_anthropic(
                     }
                     yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
                     return
-                async for line in r.aiter_lines():
+                async for line in _iter_with_idle_timeout(
+                    r.aiter_lines(), config.get().stream_idle_timeout, model_name
+                ):
                     events = converter.feed_line(line)
                     if events:
                         yield events.encode("utf-8")
+    except (TimeoutError, asyncio.TimeoutError):
+        _log(f"{prefix}✗ 流空闲超时 | {model_name} | 上游 {config.get().stream_idle_timeout}s 无数据")
+        error_evt = {
+            "type": "error",
+            "error": {
+                "message": f"上游 {config.get().stream_idle_timeout} 秒无数据，连接已中止",
+                "type": "api_error",
+            },
+        }
+        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+        return
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         error_evt = {
@@ -1365,6 +1430,16 @@ async def _stream_anthropic(
         }
         yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
         return
+
+    # 上游未发出终止信号就结束：补一个 error 事件，客户端才不会把截断当正常结束。
+    if not converter.completed:
+        _log(f"{prefix}✗ 流被截断 | {model_name} | 未观察到终止事件")
+        error_evt = {
+            "type": "error",
+            "error": {"message": "上游连接在完成前关闭，响应可能不完整",
+                      "type": "api_error"},
+        }
+        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
 
     finish_events = converter.finish()
     if finish_events:
