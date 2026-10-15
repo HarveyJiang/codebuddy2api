@@ -5,6 +5,7 @@
 - setup_logging **幂等**（不叠加 handler）
 - /health 三态判据正确，且默认不泄露账号名
 """
+import inspect
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 
-from admin.logging_setup import configure_uvicorn_access, setup_logging, uvicorn_level
+from core.runtime_logging import setup_logging, uvicorn_level
 from admin.server import Store, create_app
 
 
@@ -83,10 +84,19 @@ class LoggingSetupTests(unittest.TestCase):
         setup_logging("ERROR")
         self.assertEqual(uvicorn_level(), "warning")
 
-    def test_uvicorn_access_log_disabled_by_default(self):
-        setup_logging("INFO")
-        logger = configure_uvicorn_access(False)
-        self.assertTrue(logger.disabled)
+    def test_entry_points_disable_uvicorn_access_log(self):
+        """访问日志用 uvicorn 自己的 access_log=False 关，而不是改 logger level。
+
+        早先的 configure_uvicorn_access 在 uvicorn.run() 之前改 uvicorn.access 的
+        level，但 uvicorn.run() 内部会 dictConfig 把它重置回去，等于没关。
+        """
+        import core.converter
+        import admin.server as server_module
+
+        self.assertIn("access_log=False", inspect.getsource(core.converter.main))
+        source = Path(server_module.__file__).read_text(encoding="utf-8")
+        self.assertIn("access_log=False", source)
+        self.assertNotIn("configure_uvicorn_access", source)
 
 
 def _write_cred(auth, name, expires_delta=3600):
@@ -132,7 +142,18 @@ class StoreHealthTests(unittest.TestCase):
         for name in ("a1", "a2"):
             _write_cred(self.auth, name)
         self._accounts({"a1": 1, "a2": 1})
-        self.store.data["account_status"] = {"a2": {"status": "auth_invalid"}}
+        # 生产代码标记认证失效用的是布尔字段 auth_invalid（见 pool.py 的判据），
+        # 不是 status="auth_invalid" 这个字符串——测试必须用真实形状，否则锁住错契约。
+        self.store.data["account_status"] = {"a2": {"auth_invalid": True}}
+        detail = self.store.health_detail()
+        self.assertEqual(detail["usable"], 1)
+        self.assertEqual(detail["auth_invalid"], 1)
+
+    def test_corrupt_credential_counts_as_auth_invalid(self):
+        """凭据文件损坏时 account_rows 标 status=invalid，也应从可用数里剔除。"""
+        _write_cred(self.auth, "a1")
+        (self.auth / "a2.info").write_text("{ not json", encoding="utf-8")
+        self._accounts({"a1": 1, "a2": 1})
         detail = self.store.health_detail()
         self.assertEqual(detail["usable"], 1)
         self.assertEqual(detail["auth_invalid"], 1)

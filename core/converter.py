@@ -35,7 +35,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from admin import config, logging_setup
+from . import runtime_config as config, runtime_logging as logging_setup
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -89,8 +89,10 @@ _PRODUCT_NAME = config.raw("WORKBUDDY_PRODUCT_NAME", "WorkBuddy")
 _PRODUCT_VERSION = config.raw("WORKBUDDY_PRODUCT_VERSION", "5.8.2")
 _UA_EXTENSION = config.raw("WORKBUDDY_UA_EXTENSION", "CLI/2.161.0")
 # 这两个开关是模块级常量（导入时求值），与其它配置一致的语义：改配置即重启。
-_RESPONSES_DESENSITIZE = config.raw("WORKBUDDY_DESENSITIZE", "0") == "1"
-_LOSSY_PROJECTION = config.raw("WORKBUDDY_LOSSY_PROJECTION", "0") == "1"
+# 必须走 config.get() 的布尔解析（认 1/true/yes/on），不要自己写 `== "1"`——
+# 两套解析器会让 WORKBUDDY_DESENSITIZE=true 只影响 chat 路径、Responses 路径静默失效。
+_RESPONSES_DESENSITIZE = config.get().desensitize
+_LOSSY_PROJECTION = config.get().lossy_projection
 # client 字段的取值来源（大写 WorkBuddy 为目标值）。
 IDE_TYPE = _PRODUCT_NAME
 USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
@@ -676,7 +678,7 @@ async def chat_completions(
                     _log(
                         f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
                     )
-                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
+                    _log_debug(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
                     raise HTTPException(
                         status_code=r.status_code,
                         detail=_safe_err_raw(raw, r.status_code),
@@ -729,8 +731,8 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
         + (f" | tool_calls={tc_names}" if tc_names else "")
         + f" | tokens={usage.get('total_tokens', '?')}"
     )
-    # 完整响应体
-    _log(
+    # 完整响应体（含模型回答全文，只在 DEBUG 级输出）
+    _log_debug(
         f"{prefix}── RESPONSE BODY ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
     )
 
@@ -843,10 +845,18 @@ async def _stream_upstream(
     raw_parts: list[bytes] = []  # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
 
-    def _feed(chunk: bytes):
+    def _feed(chunk: bytes, flush: bool = False):
+        """解析累计数据里的完整 data: 行。
+
+        flush=True 表示这是流的最后一帧：把残留的不完整行也当作一行处理。
+        上游的最后一帧（finish_reason / [DONE]）不一定带尾随换行——连接正好在
+        帧尾关闭时很常见——不 flush 就会漏掉终止信号，把正常结束误判成截断。
+        """
         nonlocal finish_reason, saw_filter, saw_done, buf
         # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
         buf += chunk
+        if flush:
+            buf += b"\n"
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             line = line.strip()
@@ -913,6 +923,10 @@ async def _stream_upstream(
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
         return
+
+    # 收尾：把缓冲区里残留的不完整行（无尾随换行）也解析掉，否则会漏掉
+    # 最后一帧里的 finish_reason / [DONE]，把正常结束误判成截断。
+    _feed(b"", flush=True)
 
     # 上游在没有终止信号的情况下关闭：补一个明确事件，避免客户端把截断当正常结束。
     # finish_reason 与 [DONE] 任一出现都算正常收尾——不同上游的终止信号不完全一致。
@@ -1041,7 +1055,7 @@ async def _post_backend_with_filter_retry(
         _log(
             f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
         )
-        _log(
+        _log_debug(
             f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
         )
         retry_status, retry_raw = await _post_backend_once(url, headers, retry_body)
@@ -1124,7 +1138,7 @@ async def create_response(
         f"| dropped_harness={projection_stats.get('dropped_harness_messages', 0)} "
         f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
     )
-    _log(
+    _log_debug(
         f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
@@ -1173,7 +1187,7 @@ async def create_response(
         response_status = int(code) if str(code).isdigit() and 400 <= int(code) <= 599 else 502
     elapsed = time.time() - t0
     _log(f"[{rid}] ◀ RESPONSES {model_name} | {elapsed:.1f}s")
-    _log(
+    _log_debug(
         f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
     )
     return JSONResponse(content=result, status_code=response_status)
@@ -1303,7 +1317,7 @@ async def create_message(
     _log(
         f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)} | user_stream={user_stream}"
     )
-    _log(
+    _log_debug(
         f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
@@ -1691,7 +1705,7 @@ def main():
     _log("==== converter 启动 ====")
 
     uvicorn.run(app, host=args.host, port=args.port,
-                log_level=logging_setup.uvicorn_level())
+                log_level=logging_setup.uvicorn_level(), access_log=False)
 
 
 if __name__ == "__main__":

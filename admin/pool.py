@@ -285,6 +285,8 @@ class AccountPool:
             return aid, self.store.manager_for(aid, item)
 
     def record(self, aid, status=200):
+        cooldown = 0
+        recovered = False
         with self.store.lock:
             if aid not in self.store.data["accounts"]:
                 return
@@ -301,19 +303,22 @@ class AccountPool:
                 data.update(cooldown_until=self.clock() + cooldown, last_error=f"{label}，已冷却 {cooldown // 60} 分钟")
                 if status == 402:
                     data["credits_updated"] = 0  # 触发下个周期立即重新查询积分
-                # 认证类失败是要人介入的状态（重新授权），必须留痕——
-                # 否则只能靠主动打开管理页才看得到「需重新授权」的红标。
-                if status in (401, 403):
-                    _logger.warning("账号 %s 上游认证被拒（HTTP %s），冷却 %d 分钟，可能需要重新授权",
-                                    aid, status, cooldown // 60)
-                else:
-                    _logger.info("账号 %s 触发上游限流（HTTP %s），冷却 %d 分钟",
-                                 aid, status, cooldown // 60)
             else:
-                if data.get("consecutive_fails"):
-                    _logger.info("账号 %s 请求恢复正常", aid)
+                recovered = bool(data.get("consecutive_fails"))
                 data["consecutive_fails"] = 0
             self.dirty = True
+        # 日志放在锁外：record() 是每请求热路径，stderr/文件 I/O 可能被管道背压拖慢，
+        # 持锁写会把所有账号选择排在同一把锁后面。
+        if status in (401, 403):
+            # 认证类失败是要人介入的状态（重新授权），必须留痕——否则只能靠主动
+            # 打开管理页才看得到「需重新授权」的红标。
+            _logger.warning("账号 %s 上游认证被拒（HTTP %s），冷却 %d 分钟，可能需要重新授权",
+                            aid, status, cooldown // 60)
+        elif status in (402, 429):
+            _logger.info("账号 %s 触发上游限流（HTTP %s），冷却 %d 分钟",
+                         aid, status, cooldown // 60)
+        elif recovered:
+            _logger.info("账号 %s 请求恢复正常", aid)
 
     def billing(self, client, headers, path, body=None):
         response = client.post(BILLING + path, headers=headers, json=body or {})

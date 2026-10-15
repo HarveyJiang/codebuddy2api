@@ -146,6 +146,29 @@ class TruncationTests(unittest.IsolatedAsyncioTestCase):
         output = await run_upstream(lines)
         self.assertIn(b"stream_truncated", output)
 
+    async def test_finish_reason_without_trailing_newline_is_not_truncation(self):
+        """末帧无尾随换行时不能误报截断。
+
+        上游 flush 边界/连接正好在帧尾关闭时，最后一帧常常不带 \\n。旧实现只在
+        「有 \\n 时」解析缓冲，会漏掉这帧里的 finish_reason，把正常结束当截断——
+        用户明明收全了答案，却额外收到错误事件，后台也记成失败请求。
+        """
+        lines = ['data: {"choices": [{"delta": {"content": "完整"}, '
+                 '"finish_reason": "stop"}]}']  # 无尾随 \n
+        output = await run_upstream(lines)
+        self.assertNotIn(b"stream_truncated", output)
+
+    async def test_done_without_trailing_newline_is_not_truncation(self):
+        """[DONE] 无尾随换行同样不能误报。"""
+        output = await run_upstream(["data: [DONE]"])
+        self.assertNotIn(b"stream_truncated", output)
+
+    async def test_no_terminal_signal_at_all_still_reported(self):
+        """末帧无换行、且确实没有终止信号：仍要报截断（别把 flush 修成「永不报」）。"""
+        lines = ['data: {"choices": [{"delta": {"content": "半句"}}]}']
+        output = await run_upstream(lines)
+        self.assertIn(b"stream_truncated", output)
+
     async def test_error_body_still_returned_on_http_error(self):
         """非 200 仍走原有的错误事件，不受本次改动影响。"""
         response = _FakeResponse([], status=500)

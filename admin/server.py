@@ -330,16 +330,18 @@ class Store:
         """
         rows = self.account_rows()
         by_id = {row["id"]: row for row in rows}
-        total = enabled = usable = 0
-        auth_invalid = 0
+        total = enabled = usable = auth_invalid = 0
         for aid, item in self.data["accounts"].items():
             total += 1
             if not item["enabled"]:
                 continue
             enabled += 1
             row = by_id.get(aid) or {}
-            status = (self.data["account_status"].get(aid) or {}).get("status")
-            if status == "auth_invalid":
+            status = self.data["account_status"].get(aid) or {}
+            # 必须与 pool.py 的判据一致：账号池标记认证失效用的是布尔字段
+            # auth_invalid（不是 status="auth_invalid" 这个字符串，生产代码从不写它）。
+            # 判据漂移会让「所有账号都失效」这种最该被发现的故障反而报 ok。
+            if row.get("status") == "invalid" or status.get("auth_invalid"):
                 auth_invalid += 1
                 continue
             if row.get("status") == "ready":
@@ -498,6 +500,10 @@ def _stale_catalog(registry):
 
 def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=True):
     cfg = config.get()
+    # 只在本进程还没配过日志时初始化：让 `uvicorn admin.server:create_app` 这类
+    # 导入式启动也有日志出口，同时不覆盖调用方（或测试）已装好的 handler。
+    if not logging_setup.configured():
+        logging_setup.setup_logging(cfg.log_level, cfg.log_path)
     store = Store(root or cfg.data_dir, auth_dir or cfg.auth_dir, initial_key if initial_key is not None else cfg.api_key, admin_key or cfg.admin_key)
     converter._check_auth = store.check_api
     # 以前这里把 log_path 硬覆盖成 None，导致设了 WORKBUDDY_LOG/CODEBUDDY2OPENAI_LOG
@@ -1166,7 +1172,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
 if __name__ == "__main__":
     cfg = config.get()
     logging_setup.setup_logging(cfg.log_level, cfg.log_path)
-    logging_setup.configure_uvicorn_access(False)
+    # access_log=False：请求已经落在 request_logs 表里，uvicorn 再记一遍是重复噪声。
+    # 注意必须在 uvicorn.run 这里传——run() 内部会 dictConfig，覆盖掉之前对
+    # uvicorn.access 做的任何设置。
     uvicorn.run(create_app(), host=cfg.host or "0.0.0.0", port=cfg.port,
-                log_level=logging_setup.uvicorn_level(),
+                log_level=logging_setup.uvicorn_level(), access_log=False,
                 proxy_headers=True, forwarded_allow_ips="*")

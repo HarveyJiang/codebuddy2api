@@ -5,6 +5,7 @@
 - 旧变量名继续生效（用户 compose 里已经写了，改名不能静默失效）
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -148,6 +149,64 @@ class EntryPointTests(unittest.TestCase):
             "print('cfg.port' in src and 'cfg.api_key' in src)",
         )
         self.assertEqual(result.stdout.strip(), "True")
+
+
+class DeploymentLayoutTests(unittest.TestCase):
+    """镜像布局必须能起得来——core 不能**无保护地**依赖 admin。
+
+    deploy/standalone/Dockerfile 只 `COPY core ./core`，所以 core 里模块级的
+    `from admin import ...` 会让「独立转换器」镜像直接 ModuleNotFoundError 起不来。
+    延迟导入且有 except ImportError 兜底的（如 converter._cred 里取
+    REQUEST_CREDENTIAL）是刻意设计：管理部署下用它做每请求凭据绑定，独立部署下
+    回落到单账号行为。这里锁住「不能是无保护的模块级导入」这个真正的风险。
+    """
+
+    def test_core_has_no_unguarded_module_level_admin_import(self):
+        core = REPO / "core"
+        offenders = []
+        for path in core.glob("*.py"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not (stripped.startswith(("from admin", "import admin")) or
+                        "from admin import" in stripped):
+                    continue
+                # 带缩进的（函数内）延迟导入允许——调用点自带 ImportError 兜底。
+                if line[:1].isspace():
+                    continue
+                offenders.append(f"{path.name}: {stripped}")
+        self.assertEqual(
+            offenders, [],
+            f"core 不得在模块级导入 admin（standalone 镜像只有 core）：{offenders}",
+        )
+
+    def test_converter_imports_without_admin_available(self):
+        """按 standalone 布局（只有 core）真跑一次导入与凭据回落路径。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "app"
+            app.mkdir()
+            shutil.copytree(REPO / "core", app / "core",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("WORKBUDDY_", "CODEBUDDY", "CLIENT_INFO_"))
+                   and k not in ("PORT", "ADMIN_KEY")}
+            script = (
+                "import core.converter as c;"
+                "assert 'admin' not in __import__('sys').modules;"
+                "c.CONFIG['cred'] = None;"
+                "ok=False\n"
+                "try:\n"
+                "    c._cred()\n"
+                "except Exception as exc:\n"
+                "    ok='admin' not in str(exc) and 'ModuleNotFound' not in str(exc)\n"
+                "assert ok, '缺少 admin 时 _cred 应回落到原有 503，而不是 ImportError'\n"
+                "print('ok')\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=app, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ok", result.stdout)
 
 
 if __name__ == "__main__":
