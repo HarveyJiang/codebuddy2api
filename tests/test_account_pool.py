@@ -731,5 +731,265 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['packages'],101)
         self.assertEqual(result['remaining'],126.25)
 
+    # -- 容量队列自动切换（specs/queue-failover.md） --------------------------
+
+    def _enable_failover(self, **overrides):
+        cfg = {"queue_failover": True}
+        cfg.update(overrides)
+        self.store.data["pool"].update(cfg)
+
+    def test_queue_error_detection_accepts_both_shapes(self):
+        # 结构化 code（用户实测的 WAITING）与 HTTP 限流码都必须判定为排队。
+        self.assertTrue(self.pool.is_queue_error(None, "", "WAITING"))
+        self.assertTrue(self.pool.is_queue_error(None, "", "waiting"))
+        self.assertTrue(self.pool.is_queue_error(None, "", "FULL"))
+        self.assertTrue(self.pool.is_queue_error(429, ""))
+        self.assertTrue(self.pool.is_queue_error(503, ""))
+        # 文案兜底：上游没给 code 时靠 message。
+        self.assertTrue(self.pool.is_queue_error(
+            None, "当前模型资源紧张，请等候。Step-5-Preview 前方约 7859 位用户排队"))
+        # 非排队：额度到顶与「非流式不支持」，换号换模型都救不了。
+        self.assertFalse(self.pool.is_queue_error(None, "个人额度已用完", "USER_LIMIT"))
+        self.assertFalse(self.pool.is_queue_error(None, "", "11101"))
+        self.assertFalse(self.pool.is_queue_error(200, "一切正常"))
+
+    def test_queued_account_is_skipped_but_never_locks_the_pool(self):
+        self.pool.mark_queued(self.a)
+        self.assertTrue(self.pool.queued(self.a))
+        # 让位期间优先选没排过队的账号。
+        self.assertEqual(self.pool.select()[0], self.b)
+        # 但**全部**都在让位期内时必须忽略标记，否则排队会把池子锁成 503。
+        self.pool.mark_queued(self.b)
+        self.assertIn(self.pool.select()[0], {self.a, self.b})
+
+    async def test_queue_hit_switches_account_and_is_transparent(self):
+        self._enable_failover()
+        # 第一次返回完整的排队小响应；之后正常回答。客户端只应看到最终那份内容。
+        seen = []
+
+        async def app(scope, receive, send):
+            await receive()
+            aid = next(k for k, v in self.store.data["accounts"].items()
+                       if v["file"] == REQUEST_CREDENTIAL.get().path.name)
+            seen.append(aid)
+            if len(seen) == 1:
+                await send({'type': 'http.response.start', 'status': 200,
+                            'headers': [(b'content-type', b'application/json')]})
+                await send({'type': 'http.response.body', 'body': json.dumps({
+                    "code": "WAITING", "model": "Step-5-Preview",
+                    "message": "当前模型资源紧张，请等候。前方约 7859 位用户排队",
+                    "data": {"queue_position": 7859, "retry_after": 5},
+                }).encode()})
+                return
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ANSWER'})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'ANSWER')       # 排队响应没有漏给客户端
+        self.assertEqual(len(seen), 2)                      # 确实重试了一次
+        # 精确断言：第一个账号被让位，换到了另一个账号（不再用 or 弱化）。
+        self.assertEqual(seen[0], self.a)
+        self.assertEqual(seen[1], self.b)
+        self.assertTrue(self.pool.queued(self.a))           # 只有排过队的那个被让位
+        self.assertFalse(self.pool.queued(self.b))
+    async def test_queue_without_content_is_never_replayed_once_content_seen(self):
+        # 首包已含真实内容时，即使同时命中排队关键词也必须放行——重放会重复输出。
+        self._enable_failover()
+        calls = []
+
+        async def app(scope, receive, send):
+            calls.append(1)
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': (
+                b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+                + json.dumps({"error": {"code": "WAITING", "message": "\u6392\u961f"}}).encode() + b'\n\n')})
+            await send({'type': 'http.response.body', 'body': b''})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(calls), 1)                     # 绝不重放
+        self.assertIn(b'hello', response.content)
+
+    async def test_slow_upstream_within_hold_window_is_passed_through(self):
+        """回归：扣留必须有硬上界。
+
+        上游只是慢（超过 queue_hold_ms 才发首包）时，必须原样放行，不能一直等——
+        历史上这功能被回滚就是因为无上界扣留把 /health 一起拖死。
+        """
+        self._enable_failover(queue_hold_ms=200)
+        async def app(scope, receive, send):
+            await receive()
+            await asyncio.sleep(0.4)          # 超过扣留窗口
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'SLOW'})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'SLOW')          # 内容完整送到
+        self.assertFalse(self.pool.queued(self.a))           # 慢 ≠ 排队，不让位
+
+    async def test_empty_response_still_completes_asgi(self):
+        """上游什么都没发就结束：必须补出完整的 start+body，不能留下半个响应。"""
+        self._enable_failover(queue_hold_ms=200)
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 204, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b''})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b'')
+        self.assertFalse(self.pool.queued(self.a))
+
+    async def test_all_accounts_queued_returns_original_response_not_503(self):
+        """所有账号都排队时：原样返回上游排队响应，**不是** 503。
+
+        503 会把「排队」这个真实原因掩盖成「没有可用账号」，客户端就无从按
+        retry_after 轮询了。这正是把「探测候选集」和「选号」合成 try_select 的原因。
+        """
+        self._enable_failover(queue_retry=3, queue_model_fallback=False)
+        body = json.dumps({"code": "WAITING", "message": "前方约 7859 位用户排队",
+                           "data": {"queue_position": 7859, "retry_after": 5}}).encode()
+        calls = []
+
+        async def app(scope, receive, send):
+            calls.append(1)
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': body})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)          # 不是 503
+        self.assertEqual(response.content, body)             # 原文透传，含 retry_after
+        self.assertEqual(len(calls), 2)                      # 两个账号都试过（受 queue_retry 限制）
+        self.assertTrue(self.pool.queued(self.a) and self.pool.queued(self.b))
+
+    async def test_queue_response_split_across_chunks_is_replayed_whole(self):
+        """排队响应分多帧送达（code 与 message 分开）时，回放必须包含**全部分片**。
+
+        只看首包判定，但被丢弃的内容不止首包——只留首分片会让客户端拿到
+        残缺的排队信息，按 retry_after 轮询也就无从谈起。
+        """
+        self._enable_failover(queue_retry=2, queue_model_fallback=False)
+        frames = [b'data: {"code":"WAITING"}\n\n',
+                  'data: {"message":"前\u65b9约 7859 位用户排队"}\n\n'.encode()]
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body', 'body': frames[0], 'more_body': True})
+            await send({'type': 'http.response.body', 'body': frames[1]})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b''.join(frames))   # 两个分片都在，顺序不变
+        self.assertTrue(self.pool.queued(self.a))
+
+    async def test_model_fallback_retries_all_accounts_again(self):
+        """降级模型后账号可以重新从头试：新模型面对的是另一个上游队列。"""
+        self._enable_failover(queue_retry=4, queue_cooldown=0)
+        registry = Mock()
+        registry.snapshot.return_value = {"models": [
+            {"id": "step-5-preview", "enabled": True, "credits": 0.0},
+            {"id": "space-bunny", "enabled": True, "credits": 0.08},
+            {"id": "fast-model", "enabled": True, "credits": 0.21},
+        ]}
+        self.pool.model_registry = registry
+        seen = []
+
+        async def app(scope, receive, send):
+            message = await receive()
+            payload = message['body']
+            model = (payload if isinstance(payload, dict) else json.loads(payload)).get("model")
+            aid = next(k for k, v in self.store.data["accounts"].items()
+                       if v["file"] == REQUEST_CREDENTIAL.get().path.name)
+            seen.append((model, aid))
+            # 原模型在**两个**账号上都排队；换成 space-bunny 后才成功。
+            if model == "step-5-preview":
+                await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+                await send({'type': 'http.response.body', 'body': b'{"code":"WAITING"}'})
+                return
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'DONE'})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses',
+                                         json={'model': 'step-5-preview', 'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.content, b'DONE')
+        # 先在同一模型上换号试了两个账号，候选耗尽后才降级 —— 顺序即 spec 4.4。
+        self.assertEqual([m for m, _ in seen], ["step-5-preview", "step-5-preview", "space-bunny"])
+        self.assertEqual({a for _, a in seen[:2]}, {self.a, self.b})   # 换号用的是不同账号
+        # 换模型后账号重新从头试：第 3 次落在被清空的候选集里（不是被 exclude 掉的那个）。
+        self.assertIn(seen[2][1], {self.a, self.b})
+
+    async def test_queued_account_recovers_after_cooldown(self):
+        """让位是临时跳过，不是硬冷却：过了 queue_cooldown 就该重新参与轮转。"""
+        self._enable_failover()
+        self.pool.mark_queued(self.a, seconds=60)
+        self.assertTrue(self.pool.queued(self.a))
+        self.assertEqual(self.pool.select()[0], self.b)      # 让位期内优先用另一个
+        self.now += 61                                       # 过掉让位窗口
+        self.assertFalse(self.pool.queued(self.a))
+        # 重新参与轮转：轮一圈必然又能选到它（而不是被永久排除）。
+        picked = {self.pool.select()[0] for _ in range(4)}
+        self.assertIn(self.a, picked)
+
+    def test_fallback_models_prefers_same_tier_then_cheap_route(self):
+        registry = Mock()
+        registry.snapshot.return_value = {"models": [
+            {"id": "step-5-preview", "enabled": True, "credits": 0.0},
+            {"id": "space-bunny", "enabled": True, "credits": 0.08},
+            {"id": "glm-5.3-flash", "enabled": True, "credits": 0.06},
+            {"id": "glm-5.3", "enabled": True, "credits": 0.79},
+            {"id": "kimi-k3-1", "enabled": False, "credits": 0.1},   # 已禁用，不出现
+            {"id": "fast-model", "enabled": True, "credits": 0.21},
+        ]}
+        self.pool.model_registry = registry
+        # 免费档 + 低价档合并，按倍率升序（越省越好），兜底模型排在最后。
+        ordered = self.pool.fallback_models("step-5-preview")
+        self.assertEqual(ordered[:2], ["glm-5.3-flash", "space-bunny"])
+        self.assertEqual(ordered[-1], "fast-model")
+        self.assertNotIn("kimi-k3-1", ordered)               # 禁用模型不参与降级
+        # 已试过的排除。
+        self.assertNotIn("space-bunny", self.pool.fallback_models(
+            "step-5-preview", tried={"space-bunny"}))
+        # 关掉模型降级就不再给候选。
+        self.store.data["pool"]["queue_model_fallback"] = False
+        self.assertEqual(self.pool.fallback_models("step-5-preview"), [])
+
+    async def test_disabled_feature_keeps_original_behaviour(self):
+        """默认关闭时行为与改动前一致：排队响应原样透传，不重试。"""
+        calls = []
+        async def app(scope, receive, send):
+            calls.append(1)
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'data: {"code":"WAITING"}\n\n',
+                        'more_body': True})
+            await send({'type': 'http.response.body', 'body': b''})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(b'WAITING', response.content)
+        self.assertFalse(self.pool.queued(self.a))
+
 
 if __name__=='__main__':unittest.main()

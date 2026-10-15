@@ -286,6 +286,38 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         # 旧的积分同步间隔字段已移除。
         self.assertNotIn("sync_interval", (await self.client.get("/admin/api/overview")).json()["pool"])
 
+    async def test_queue_failover_settings_and_validation(self):
+        """容量队列自动切换的设置项：默认关闭、可开启、非法值拒绝、重启保留。"""
+        await self.login()
+        overview = (await self.client.get("/admin/api/overview")).json()
+        # 默认关闭：这是唯一会重放请求的功能，必须用户显式打开。
+        self.assertFalse(overview["pool"]["queue_failover"])
+        self.assertTrue(overview["pool"]["queue_model_fallback"])
+        saved = await self.client.patch("/admin/api/pool/settings", json={
+            "queue_failover": True, "queue_retry": 4, "queue_cooldown": 90,
+            "queue_hold_ms": 1500, "queue_model_fallback": False,
+            "queue_fallback_model": "fast-model"})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        pool = saved.json()["pool"]
+        self.assertTrue(pool["queue_failover"])
+        self.assertEqual((pool["queue_retry"], pool["queue_cooldown"]), (4, 90))
+        self.assertEqual(pool["queue_hold_ms"], 1500)
+        self.assertFalse(pool["queue_model_fallback"])
+        # 非法值一律 400，不要把坏配置带到运行期。
+        for bad in ({"queue_retry": 0}, {"queue_retry": 99}, {"queue_cooldown": -1},
+                    {"queue_cooldown": 99999}, {"queue_hold_ms": -5},
+                    {"queue_hold_ms": 60000}, {"queue_failover": "yes"},
+                    {"queue_model_fallback": 1}, {"queue_fallback_model": ""}):
+            response = await self.client.patch("/admin/api/pool/settings", json=bad)
+            self.assertEqual(response.status_code, 400, f"{bad} 应被拒绝")
+        # 重启后设置仍在：重建整个应用（重新读库）也必须读回同一个值。
+        self.make_app()
+        await self.login()
+        again = (await self.client.get("/admin/api/overview")).json()["pool"]
+        self.assertTrue(again["queue_failover"])
+        self.assertEqual(again["queue_retry"], 4)
+        self.assertEqual(again["queue_hold_ms"], 1500)
+
     async def test_custom_model_add_hide_and_callable(self):
         """手动添加模型：能保存、不被拉取冲掉、来源区分上游与自定义。"""
         await self.login()

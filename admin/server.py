@@ -530,6 +530,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     pool = AccountPool(store)
     metrics = RequestMetrics()
     model_registry = ModelRegistry(get_credential=store.any_enabled_manager)
+    # 供账号池选降级模型用（池先建、注册表后建，这里回填）。
+    pool.model_registry = model_registry
     model_registry.load(store.db)
     model_registry.ensure_builtin()
     # 缓存里的描述是旧逻辑（中文+英文拼接、上游原始顺序）时重新拉取一次，
@@ -979,6 +981,44 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 0 <= spread <= 600:
                     raise HTTPException(400, "批量签到错峰需在 0-600 秒之间")
                 settings["batch_spread"] = spread
+            if "queue_failover" in body:
+                if type(body["queue_failover"]) is not bool:
+                    raise HTTPException(400, "排队自动切换开关无效")
+                settings["queue_failover"] = body["queue_failover"]
+            if "queue_model_fallback" in body:
+                if type(body["queue_model_fallback"]) is not bool:
+                    raise HTTPException(400, "模型降级开关无效")
+                settings["queue_model_fallback"] = body["queue_model_fallback"]
+            if "queue_retry" in body:
+                try:
+                    retry = int(body["queue_retry"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "排队重试次数需为整数")
+                if not 1 <= retry <= 10:
+                    raise HTTPException(400, "排队重试次数需在 1-10 之间")
+                settings["queue_retry"] = retry
+            if "queue_cooldown" in body:
+                try:
+                    cooldown = int(body["queue_cooldown"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "排队让位时长需为整数秒")
+                if not 0 <= cooldown <= 3600:
+                    raise HTTPException(400, "排队让位时长需在 0-3600 秒之间")
+                settings["queue_cooldown"] = cooldown
+            if "queue_hold_ms" in body:
+                try:
+                    hold = int(body["queue_hold_ms"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "排队判定窗口需为整数毫秒")
+                # 上界刻意收紧：这是「扣留响应头」的时长，越长越容易拖慢并发。
+                if not 0 <= hold <= 10000:
+                    raise HTTPException(400, "排队判定窗口需在 0-10000 毫秒之间")
+                settings["queue_hold_ms"] = hold
+            if "queue_fallback_model" in body:
+                fallback = body["queue_fallback_model"]
+                if not isinstance(fallback, str) or not fallback.strip() or len(fallback) > 100:
+                    raise HTTPException(400, "兜底模型名无效")
+                settings["queue_fallback_model"] = fallback.strip()
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}

@@ -45,7 +45,28 @@ def _v2_to_v3(db):
         "CREATE INDEX IF NOT EXISTS idx_key_usage_day ON key_usage_daily(day)")
 
 
-SCHEMA_VERSION = 3
+def _v3_to_v4(db):
+    """v3 → v4：加容量队列字段（accounts.queued_until、settings 的 queue_* 六项）。
+
+    同样只补结构不动数据。settings 是单行表，加列必须 ALTER 且带默认值，
+    否则已存在的行会读出 NULL，而 POOL_DEFAULTS 的合并发生在 Python 侧、
+    只补字典里**缺的键**——列存在但为 NULL 时它不认为是缺键。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
+    if "queued_until" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN queued_until INTEGER")
+    settings_columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    for name, ddl in (("queue_failover", "INTEGER NOT NULL DEFAULT 0"),
+                      ("queue_retry", "INTEGER NOT NULL DEFAULT 3"),
+                      ("queue_cooldown", "INTEGER NOT NULL DEFAULT 120"),
+                      ("queue_hold_ms", "INTEGER NOT NULL DEFAULT 3000"),
+                      ("queue_model_fallback", "INTEGER NOT NULL DEFAULT 1"),
+                      ("queue_fallback_model", "TEXT NOT NULL DEFAULT 'fast-model'")):
+        if name not in settings_columns:
+            db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
+
+
+SCHEMA_VERSION = 4
 
 MICRO = 1_000_000
 
@@ -64,7 +85,7 @@ ACCOUNT_STATUS_COLUMNS = (
     "checkin_when", "checkin_offset_date", "token_refreshed", "auth_invalid", "refresh_slot",
     "refresh_slot_date", "refresh_window_date", "consecutive_fails", "cooldown_until",
     "request_count", "last_request", "last_error", "usage_synced_at", "usage_sync_error",
-    "usage_manual_synced_at",
+    "usage_manual_synced_at", "queued_until",
 )
 
 ACCOUNT_STATUS_DEFAULTS = {
@@ -168,6 +189,7 @@ class Database:
         token_refreshed INTEGER, auth_invalid INTEGER NOT NULL DEFAULT 0,
         refresh_slot TEXT, refresh_slot_date TEXT, refresh_window_date TEXT,
         consecutive_fails INTEGER NOT NULL DEFAULT 0, cooldown_until INTEGER,
+        queued_until INTEGER,
         request_count INTEGER NOT NULL DEFAULT 0, last_request INTEGER, last_error TEXT,
         usage_synced_at INTEGER, usage_sync_error TEXT,
         usage_manual_synced_at INTEGER)"""
@@ -197,6 +219,12 @@ class Database:
             sync_end TEXT NOT NULL DEFAULT '20:00',
             batch_spread INTEGER NOT NULL DEFAULT 90,
             default_routing TEXT NOT NULL DEFAULT 'round_robin',
+            queue_failover INTEGER NOT NULL DEFAULT 0,
+            queue_retry INTEGER NOT NULL DEFAULT 3,
+            queue_cooldown INTEGER NOT NULL DEFAULT 120,
+            queue_hold_ms INTEGER NOT NULL DEFAULT 3000,
+            queue_model_fallback INTEGER NOT NULL DEFAULT 1,
+            queue_fallback_model TEXT NOT NULL DEFAULT 'fast-model',
             models_updated INTEGER NOT NULL DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS session_bindings (
             affinity_key TEXT PRIMARY KEY, account_id TEXT NOT NULL,
@@ -364,7 +392,7 @@ class Database:
 
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
-    MIGRATIONS = ((3, _v2_to_v3),)
+    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -395,7 +423,9 @@ class Database:
     # -- settings -----------------------------------------------------------
     SETTINGS_COLUMNS = (
         "auto_checkin", "checkin_time", "affinity_expiry_days", "credit_min_interval",
-        "sync_start", "sync_end", "batch_spread", "default_routing", "models_updated",
+        "sync_start", "sync_end", "batch_spread", "default_routing",
+        "queue_failover", "queue_retry", "queue_cooldown", "queue_hold_ms",
+        "queue_model_fallback", "queue_fallback_model", "models_updated",
     )
 
     def get_settings(self, defaults=None):

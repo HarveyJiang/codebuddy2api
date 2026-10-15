@@ -20,9 +20,11 @@
 
 ## 文件
 
-- `admin/server.py`：后台 API、持久化存储、客户端鉴权及转换器适配。
+- `admin/server.py`：后台 API、会话与客户端鉴权、深度 `/health` 及转换器适配。
 - `admin/browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
-- `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到。`tests/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
+- `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到，以及容量队列自动切换（换号 / 降级模型）。`tests/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
+- `admin/db.py`：SQLite 持久层，全部结构化表（无 kv 表），版本化迁移单事务执行。金额落库 `*_micro`，内存保持 float。
+- `admin/models.py`：模型注册表，`/v3/config` 动态发现 + 内置兜底快照 + 上游/内置/自定义三档来源。
 - `admin/metrics.py`：进程内的在途请求数等实时指标；累计计数以 `request_logs` 为准。不存储请求正文、回复或密钥。
 - `admin/static/`：无外部 CDN 依赖的中文界面。
 - `tests/test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
@@ -34,10 +36,14 @@
 
 | 变量 | 用途 |
 |---|---|
-| `ADMIN_KEY` | 独立管理密钥，至少 20 字符，建议随机生成 |
-| `CODEBUDDY2OPENAI_KEY` | 首次迁入的客户端 Key；初始化后从持久化状态读取密钥列表 |
-| `CODEBUDDY_AUTH_DIR` | 登录凭据目录，线上 `/data/auth` |
-| `MANAGEMENT_DATA_DIR` | 账号索引与密钥摘要目录，线上 `/data/management` |
+| `WORKBUDDY_ADMIN_KEY`（旧名 `ADMIN_KEY`） | 独立管理密钥，至少 20 字符，建议随机生成 |
+| `WORKBUDDY_API_KEY`（旧名 `CODEBUDDY2OPENAI_KEY`） | 首次迁入的客户端 Key；初始化后从持久化状态读取密钥列表 |
+| `WORKBUDDY_AUTH_DIR`（旧名 `CODEBUDDY_AUTH_DIR`） | 登录凭据目录，线上 `/data/auth` |
+| `WORKBUDDY_DATA_DIR`（旧名 `MANAGEMENT_DATA_DIR`） | 账号索引与密钥摘要目录，线上 `/data/management` |
+| `WORKBUDDY_LOG_LEVEL` | 日志级别，默认 `INFO` |
+| `WORKBUDDY_STREAM_IDLE_TIMEOUT` | 流式逐分片空闲超时秒数，默认 `120` |
+
+旧变量名全部继续生效（旧名可能已写进你的 compose，改名会静默失效），启动日志会用一行汇总提示改用新名。完整配置见 [README.md](README.md#配置) 与 `specs/config.md`。
 
 生产使用一个 Uvicorn 进程。会话和账号选择缓存在进程内，不适用于直接增加多 worker。Nginx 终止 HTTPS，后端端口仅绑定服务器回环地址。管理会话重启后需重新登录。
 
@@ -69,13 +75,13 @@ GET https://www.workbuddy.cn/v3/config
 User-Agent: CLI/2.63.2 CodeBuddy/2.63.2
 ```
 
-该接口免鉴权（仅校验 CLI User-Agent），返回内容与官方客户端缓存的 `acc-product-config-v3.json` 完全一致，包含 cli agent 的模型菜单、`credits` 倍率、`maxInputTokens` 以及 `modelPromotions` 折扣活动。拉取成功写入 `management/state.db`（SQLite）的 `model_registry` 段；失败则保留上次缓存，从未成功过则回落内置官方列表（`BUILTIN_MODELS`）。
+该接口免鉴权（仅校验 CLI User-Agent），返回内容与官方客户端缓存的 `acc-product-config-v3.json` 完全一致，包含 cli agent 的模型菜单、`credits` 倍率、`maxInputTokens` 以及 `modelPromotions` 折扣活动。拉取成功写入 `management/state.db`（SQLite）的 `models` 表；失败则保留上次缓存，从未成功过则回落内置官方列表（`BUILTIN_MODELS`）。
 
 `fast-model`/`balanced-model`/`deep-model` 三档智能路由模型不在 cli 菜单中，由官方固定提供，注册表无条件附加（倍率 ×0.21 / ×0.65 / ×1.20）。
 
 ### 启用 / 禁用
 
-管理后台「模型管理」页列出所有模型（来源、官方描述、倍率含当前折扣小字、上下文长度、启用开关），可逐个启用或禁用。禁用状态持久化在 `model_registry.disabled` 中，重启保留。禁用后：
+管理后台「模型管理」页列出所有模型（来源、官方描述、倍率含当前折扣小字、上下文长度、启用开关），可逐个启用或禁用。禁用状态持久化在 `models.enabled` 中，重启保留。禁用后：
 
 - `GET /v1/models` 不再返回该模型；
 - 客户端以该模型发起 `chat/completions` 时，网关中间件直接返回 400。
@@ -93,9 +99,7 @@ User-Agent: CLI/2.63.2 CodeBuddy/2.63.2
 
 ### 内置兜底列表
 
-### 内置兜底列表
-
-`BUILTIN_MODELS` 为最近一次已知官方快照（含 `minimax-m2.7` ×0.19 等），仅在接口从未成功拉取过时作为最后兜底，正常情况下以接口实时数据为准。
+`BUILTIN_MODELS` 为最近一次已知官方快照（含 `minimax-m2.7` ×0.19 等），仅在接口从未成功拉取过时作为最后兜底，正常情况下以接口实时数据为准。上游目录每 6 小时刷新一次（`admin/models.py` 的 `REFRESH_INTERVAL`）。
 
 ### 测试
 
@@ -104,15 +108,11 @@ User-Agent: CLI/2.63.2 CodeBuddy/2.63.2
 ## 验证
 
 ```bash
-python -m unittest tests.test_admin_server -v
-python -m unittest tests.test_browser_login -v
-python -m unittest tests.test_account_pool -v
-python -m unittest tests.test_request_metrics -v
-python -m unittest tests.test_model_registry -v
+python -m pytest tests/
 node --check admin/static/app.js
 ```
 
-5 组后台测试在本机和生产镜像内均通过。浏览器验证本地登录、账号列表和 JSON 导入；公网验证登录页、管理会话、现有客户端 Key、新 Key 创建与撤销。后台通过 deepseek-v4-flash 发起真实调用，返回 HTTP 200 / OK。
+`tests/` 覆盖鉴权与 CSRF、账号生命周期、密钥撤销与重启持久化、上传限制与限流、账号池并发隔离与轮转、签到防重复、模型注册表、SQLite 迁移与用量同步、流式空闲超时与截断、深度 health 与日志分级。
 
 ## 数据与恢复
 
@@ -132,13 +132,26 @@ node --check admin/static/app.js
 
 ## 账号池
 
-首次升级后默认启用轮转和北京时间 09:00 自动签到，可在页面底部修改。积分不在后台定时轮询：打开或刷新管理页面时才向 CodeBuddy 拉取最新余额，且同一账号在配置的拉取间隔（默认 60 秒）内不重复请求，避免触发风控。暂停账号不参与请求分配，但签到与积分查询照常执行。
-
-积分优先使用上游 Precise 小数字段和当前周期剩余额度，分页汇总所有未过期积分包，并单独统计 3 天内即将到期的积分，用于提示过期浪费。查询失败保留历史数值，10 分钟以上的快照标为待刷新；无数据不等于零积分。额度耗尽只影响分配，不删除账号。自动签到按上游当日状态避免重复，每个账号在上午/中午/下午/晚间随机选一个时段，错过时间可补查，失败最多每 30 分钟再次尝试，成功日期持久化。
+首次升级后默认启用轮转和北京时间 09:00 自动签到，可在页面底部修改。积分不在后台定时轮询：打开或刷新管理页面时才向 CodeBuddy 拉取最新余额，且同一账号在配置的拉取间隔（默认 60 秒）内不重复请求，避免触发风控。暂停账号不参与请求分配，但签到与积分查询照常执行。积分优先使用上游 Precise 小数字段和当前周期剩余额度，分页汇总所有未过期积分包，并单独统计 3 天内即将到期的积分，用于提示过期浪费。查询失败保留历史数值，10 分钟以上的快照标为待刷新；无数据不等于零积分。额度耗尽只影响分配，不删除账号。自动签到按上游当日状态避免重复，每个账号在上午/中午/下午/晚间随机选一个时段，错过时间可补查，失败最多每 30 分钟再次尝试，成功日期持久化。
 
 请求通过 ContextVar 绑定独立凭据，各账号 CredentialManager 缓存和刷新锁共享。上游 401/403 触发 5 分钟冷却，402/429 触发 30 分钟冷却。后续请求跳过冷却账号；已发送的流式请求不会重放，避免重复消费或重复工具输出。凭据准备失败时尝试另一个可用账号。没有可用账号返回 503。管理页连接测试使用手动指定的测试账号。
 
 原始转换器直接启动（`python3 -m core.converter`）仍采用单账号行为；账号池运行入口是 `admin/server.py`，要求单进程部署。
+
+### 容量队列自动切换
+
+免费模型高峰期会被上游放进容量队列（返回 `code: "WAITING"` 与排队人数），此时请求根本不会被处理。开启「排队自动切换账号」后，网关在**尚未向客户端输出任何字节**前换号重试，对客户端完全透明：
+
+1. 先换账号（同模型换个号可能就不排队了）；
+2. 账号试尽后降级到**同价位免费/低价模型**（免费档与低价档合并，按倍率升序）；
+3. 再退到「快速」智能路由兜底；
+4. 全试完仍排队，就把上游原始响应原样返回，客户端可按 `data.retry_after` 自行轮询。
+
+设置项在「账号池设置」页：总开关（**默认关闭**）、重试次数、让位时长、判定窗口、模型降级开关与兜底模型。命中的账号会在列表里显示「排队让位至 …」，期间被优先跳过；但**所有账号都在让位期内时会忽略该标记**，不会把池子锁死成 503。
+
+两条安全保证：判定窗口（默认 3000ms）是**硬上界**，超时按「上游慢」原样放行——上一版实现因为无上界扣留把 `/health` 一起拖死而被回滚；响应一旦出现真实内容（`choices`/`delta` 等）就不再换号重放，避免重复输出。`USER_LIMIT`（个人额度到顶）与 `11101` 不算排队，直接返回给客户端。
+
+详见 `specs/queue-failover.md`。
 
 ## 概览统计口径
 
@@ -146,7 +159,7 @@ node --check admin/static/app.js
 
 对话请求数是已结束请求总数，进行中的请求单独显示；未鉴权请求及无可用账号导致的失败也会计数。HTTP 成功率为 2xx 响应占比；完成成功率另外排除流式 error / failed / incomplete 事件、断开、异常和缺少结束标记的流。平均耗时为已结束请求的总耗时均值，包含失败请求。完成成功率不代表语义质量或回复正确率。
 
-统计取自 SQLite 的 `request_logs` 表，服务重启不清零，可回填的历史为保留窗口内的全部记录（保留 3 个月，上限 200 万行）。概览页的「最近请求」读取同表并支持翻页（每页 50/100/200 条），翻页顺序为最新在前。页面上的统计每 2 分钟自动刷新。
+统计取自 SQLite 的 `request_logs` 表，服务重启不清零，可回填的历史为保留窗口内的全部记录（保留 93 天）。概览页的「最近请求」读取同表并支持翻页（每页 50/100/200 条），翻页顺序为最新在前。页面上的统计每 2 分钟自动刷新。
 
 ## 密钥用量与积分消耗
 

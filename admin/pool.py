@@ -107,6 +107,11 @@ class BillingError(Exception):
         self.status, self.code = status, code
 
 
+# 免费模型降级时的「同价位」上界（倍率）。0 倍率模型（如 Step-5-Preview）
+# 排队的概率最高，此时把免费与低价档合并成一档，才换得到旁边那些便宜模型。
+FREE_TIER_CEILING = 0.10
+
+
 class AccountPool:
     # 池设置默认值。Store._load 用它们补齐旧数据缺失的字段，
     # 这里保留 setdefault 兼容直接构造 Store 的老用法。
@@ -114,10 +119,22 @@ class AccountPool:
     POOL_DEFAULTS = {"auto_checkin": True, "checkin_time": "09:00",
                      "affinity_expiry_days": 3, "credit_min_interval": 60,
                      "sync_start": "10:00", "sync_end": "20:00", "batch_spread": 90,
-                     "default_routing": "round_robin"}
+                     "default_routing": "round_robin",
+                     # 容量队列自动切换（specs/queue-failover.md）。默认关闭：这是
+                     # 唯一会「重放整个请求」的功能，出问题的影响面比其它设置大，
+                     # 让用户在管理页显式打开。
+                     "queue_failover": False,
+                     "queue_retry": 3,
+                     "queue_cooldown": 120,
+                     "queue_hold_ms": 3000,
+                     "queue_model_fallback": True,
+                     "queue_fallback_model": "fast-model"}
 
-    def __init__(self, store, clock=time.time, client_factory=None):
+    def __init__(self, store, clock=time.time, client_factory=None, model_registry=None):
         self.store, self.clock = store, clock
+        # 模型注册表由外部注入（server.py 里先建池后建注册表，建好后回填）。
+        # 降级模型要用它读倍率；核心账号池不该反向依赖 admin.models。
+        self.model_registry = model_registry
         self.client_factory = client_factory or (lambda: httpx.Client(timeout=20, follow_redirects=False))
         self.locks = {}
         self.cursor = 0
@@ -203,6 +220,7 @@ class AccountPool:
                         "checkin_slot": status.get("checkin_slot"), "checkin_when": status.get("checkin_when"),
                         "today_checked_in": status.get("checkin_date") == today,
                         "cooldown_until": status.get("cooldown_until", 0),
+                        "queued_until": status.get("queued_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
                         "request_count": status.get("request_count", 0),
                         # 上游用量同步留痕：不吐给 overview 的话「留痕」没人看得到，
@@ -210,6 +228,106 @@ class AccountPool:
                         "usage_synced_at": status.get("usage_synced_at"),
                         "usage_sync_error": status.get("usage_sync_error")})
         return rows
+
+    # -- 容量队列（specs/queue-failover.md） --------------------------------
+
+    # 明确**不**算排队的码：11101 是「非流式请求不支持」的本地/上游语义错误，
+    # USER_LIMIT 是个人额度到顶——两者换号换模型都救不了，必须让用户看到。
+    QUEUE_EXCLUDED_CODES = {"11101", "USER_LIMIT"}
+    # 视为排队的错误码：前缀匹配上游繁忙码，后缀匹配 HTTP 限流码。
+    QUEUE_CODES = {"WAITING", "FULL", "QUEUE", "QUEUED", "BUSY", "OVERLOAD",
+                   "11102", "11103", "11001", "50001", "429", "503"}
+    # 文案兜底。**只作兜底**：主判据是结构化 code，上游改文案不该让功能失效，
+    # 但反过来，只靠文案会在上游换措辞时静默失灵，所以两者都要有。
+    QUEUE_PATTERNS = ("当前模型资源紧张", "资源紧张", "前方约", "位用户排队", "用户排队",
+                      "优先通道", "排队", "繁忙", "拥堵", "稍后重试", "限流",
+                      "busy", "overload", "too many", "queue", "rate limit")
+
+    def _pool_cfg(self):
+        return self.store.data.get("pool", {})
+
+    def is_queue_error(self, status=None, text="", code=None):
+        """判断上游响应是否属于容量队列（可换号/降级重试）。
+
+        形态全兼容：上游可能以非 200 返回，也可能 200 + SSE 帧里带 code，
+        见 spec 4.3。返回 True 只代表「可以安全地重放」，不代表重放一定成功。
+        """
+        code_text = "" if code is None else str(code).strip()
+        if code_text and code_text.upper() in self.QUEUE_EXCLUDED_CODES:
+            return False
+        if status in (429, 503):
+            return True
+        if code_text and code_text.upper() in self.QUEUE_CODES:
+            return True
+        if text:
+            lowered = str(text).lower()
+            for pattern in self.QUEUE_PATTERNS:
+                if pattern.lower() in lowered:
+                    return True
+        return False
+
+    def mark_queued(self, aid, seconds=None):
+        """账号命中容量队列：让位 N 秒（不是硬冷却）。
+
+        刻意不写 cooldown_until：那是认证/限流失败的硬冷却，会让账号从候选集里
+        整个消失；让位只是「优先跳过」，队列消化完就该继续用。
+        """
+        cfg = self._pool_cfg()
+        seconds = int(seconds or cfg.get("queue_cooldown", 120))
+        with self.store.lock:
+            if aid not in self.store.data["accounts"]:
+                return
+            data = self.store.data["account_status"].setdefault(aid, {})
+            data["queued_until"] = self.clock() + max(1, seconds)
+            data["last_error"] = f"上游排队，已让位 {seconds} 秒"
+            self.dirty = True
+
+    def queued(self, aid):
+        return self.store.data["account_status"].get(aid, {}).get("queued_until", 0) > self.clock()
+
+    def fallback_models(self, current_model, tried=()):
+        """按「同价位免费模型 → 快速路由兜底」给出降级候选（spec 4.5）。
+
+        返回 id 列表，已试过的排除。管理后台未加载注册表时返回空列表——
+        此时降级模型无从判断，退回纯换号行为比瞎猜模型名安全。
+        """
+        registry = self.model_registry
+        if registry is None or not self._pool_cfg().get("queue_model_fallback", True):
+            return []
+        tried = {m for m in (tried or ()) if m}
+        if current_model:
+            tried.add(current_model)
+        snapshot = {entry["id"]: entry for entry in registry.snapshot()["models"]}
+        base = snapshot.get(current_model) or {}
+        base_credits = base.get("credits") if isinstance(base.get("credits"), (int, float)) else None
+
+        def billable(entry):
+            """免费模型优先；倍率缺失时按标准计费，与 snapshot 的排序口径一致。"""
+            credits = entry.get("credits")
+            return credits if isinstance(credits, (int, float)) else 0.0
+
+        candidates = [entry for entry in snapshot.values()
+                      if entry.get("enabled") and entry["id"] not in tried]
+        if base_credits is not None and base_credits > 0:
+            # ±50% 视为同档：上游倍率是离散小数，精确相等会几乎选不中。
+            low, high = base_credits * 0.5, base_credits * 1.5
+            same_tier = [entry for entry in candidates if low <= billable(entry) <= high]
+        elif base_credits == 0:
+            # 免费模型（倍率 0）的同档 = 免费 + 低价档。0 的 ±50% 还是 0，
+            # 只认 0 会退化成「只有自己」，而用户排队时恰恰需要换到便宜的邻居模型。
+            same_tier = [entry for entry in candidates if billable(entry) <= FREE_TIER_CEILING]
+        else:
+            # 当前模型不在注册表里（上游没返回、也没手工加）：无法判档，
+            # 给全部候选按价格升序，让最省的先试。
+            same_tier = candidates
+        same_tier.sort(key=lambda entry: (billable(entry), entry["id"]))
+
+        ordered = [entry["id"] for entry in same_tier]
+        # 兜底模型不参与上面的排序：它只在同档都排过队后才用一次。
+        fallback = self._pool_cfg().get("queue_fallback_model") or "fast-model"
+        if fallback not in tried and fallback in snapshot and fallback not in ordered:
+            ordered.append(fallback)
+        return ordered
 
     def order_candidates(self, candidates, routing="round_robin"):
         """round_robin：权重降序 + 最早过期升序；expiry_first：只看最早过期。
@@ -233,14 +351,18 @@ class AccountPool:
         policy = item.get("routing") or self.store.data["pool"].get("default_routing", "round_robin")
         return policy if policy in ROUTING_POLICIES else "round_robin"
 
-    def select(self, affinity_key=None, kid=None):
+    def select(self, affinity_key=None, kid=None, exclude=None):
         """按 key 选账号：候选集 = key 的 accounts 白名单 ∩ 可用账号。
 
         kid=None 表示无 key 路径（管理页测试请求），此时不施加白名单。凭据失败后
         重试也必须传同一个 kid，否则会选到白名单外的账号。
+
+        exclude：本次请求已经试过的账号（排队切号时传入），从候选里剔除。
         """
+        exclude = set(exclude or ())
         with self.store.lock:
-            candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
+            candidates = [row for row in self.store.account_rows()
+                          if self.state(row) == "available" and row["id"] not in exclude]
             if kid is not None:
                 # 空白名单 = 不限制；只有显式列了账号才收窄候选集。
                 whitelist = self.store.key_bindings(kid)[1]
@@ -250,6 +372,11 @@ class AccountPool:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             routing = self._routing_for(kid)
             now = self.clock()
+            # 优先跳过刚排过队的账号。但**全部**都在让位期内时必须忽略该标记——
+            # 否则排队会把整个池子自我封锁成 503，比排队本身更糟。
+            fresh = [row for row in candidates if not self.queued(row["id"])]
+            if fresh:
+                candidates = fresh
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
                 if bindings[key].get("expires", 0) <= now:
@@ -283,6 +410,19 @@ class AccountPool:
                 bindings[affinity_key] = {"account_id": aid, "expires": now + 86400}
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
+
+    def try_select(self, affinity_key, kid, exclude):
+        """尝试选一个没试过的账号；没有候选时返回 None，不抛异常。
+
+        排队切号专用：候选耗尽时我们要把上游的排队响应**原样**返回给客户端，
+        而不是抛 503——那样客户端会看到一个与真实原因（排队）无关的错误。
+        把「有没有候选」和「选到谁」合成一次调用，也顺带消掉了原先
+        「先探测候选集、再选号」两步之间的竞态窗口。
+        """
+        try:
+            return self.select(affinity_key, kid, exclude=exclude)
+        except HTTPException:
+            return None
 
     def record(self, aid, status=200):
         cooldown = 0
@@ -798,15 +938,6 @@ class PoolMiddleware:
                 if allowed_models and isinstance(model, str) and model and model not in allowed_models:
                     raise HTTPException(403, f"该密钥无权使用模型 {model}")
             affinity_key = request_affinity(headers, body)
-            original_receive = receive
-            delivered = False
-            async def replay_receive():
-                nonlocal delivered
-                if not delivered:
-                    delivered = True
-                    return {"type": "http.request", "body": raw, "more_body": False}
-                return await original_receive()
-            receive = replay_receive
             model_name = None
             if isinstance(body, dict) and isinstance(body.get("model"), str):
                 model_name = body["model"]
@@ -830,16 +961,267 @@ class PoolMiddleware:
                        "error_code": None}
         # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
         scope[REQUEST_LOG_CONTEXT] = log_context
+        pool_cfg = self.pool.store.data.get("pool", {})
+        failover_on = bool(pool_cfg.get("queue_failover"))
+        max_tries = max(1, int(pool_cfg.get("queue_retry", 3))) if failover_on else 1
+        if not failover_on:
+            # 开关关闭时走原路径：必须仍然用重放闭包包一层 receive，
+            # 否则下游应用第二次 await receive() 会阻塞在 ASGI 上。
+            return await self._serve_once(scope, _replay_receive(raw, receive), send,
+                                          aid, manager, kid, log_context)
+
+        # -- 容量队列自动切换（specs/queue-failover.md） ------------------------
+        # 只有在「尚未向客户端发出任何字节」时才能重放；一旦开始输出内容就必须
+        # 放弃切换，否则客户端会收到重复输出。
+        tried_accounts = []
+        computed_models = set()   # 已经**算过候选**的模型（不等于试过该模型）
+        attempt_body = body
+        attempt_model = model_name
+        last_outcome = None
+        for attempt in range(max_tries):
+            # 第一次尝试用调用方已选好的账号；之后每次重新选号。
+            if attempt:
+                picked = self.pool.try_select(affinity_key, kid, tried_accounts)
+                if picked is None:
+                    # 候选账号已试尽。先看能不能换个模型再继续，否则收工，
+                    # 把上游最后一次的排队响应原样返回。
+                    next_model = self._next_model(pool_cfg, attempt_model, computed_models)
+                    if next_model is None:
+                        break
+                    computed_models.add(attempt_model)
+                    attempt_model = next_model
+                    attempt_body = dict(body, model=next_model) if isinstance(body, dict) else body
+                    # 换模型后账号可以重新从头试：新模型面对的是另一个上游队列。
+                    tried_accounts = []
+                    _logger.info("可用账号已试尽，降级到 %s 重试", next_model)
+                    picked = self.pool.try_select(affinity_key, kid, tried_accounts)
+                    if picked is None:
+                        break
+                aid, manager = picked
+                try:
+                    await asyncio.to_thread(manager.get_headers)
+                except Exception:
+                    self.pool.update(aid, cooldown_until=self.pool.clock() + 300,
+                                     last_error="凭据暂不可用，已冷却 5 分钟")
+                    tried_accounts.append(aid)
+                    continue
+                log_context["account_id"] = aid
+                log_context["account_name"] = self.pool.store.data["accounts"].get(aid, {}).get("name")
+                log_context["model_id"] = attempt_model
+                log_context["model_name"] = attempt_model
+            # 每次尝试都要用新的 receive 闭包与新的 attempt_body（换模型时 body 变了）。
+            attempt_receive = _replay_receive(attempt_body, receive)
+            outcome = await self._attempt(scope, attempt_receive, send, manager)
+            if outcome["kind"] == "done":
+                # 已放行并完整结束：记录本次生效的账号与用量，收工。
+                self.pool.record(aid, outcome["status"])
+                if kid is not None:
+                    self.pool.store.record_key_usage(kid, tokens=outcome["tokens"] or None)
+                self.pool.flush()
+                return
+            # 命中排队：标记让位。决策顺序见 spec 4.4——先换号，候选耗尽再降级模型。
+            last_outcome = outcome
+            self.pool.mark_queued(aid)
+            tried_accounts.append(aid)
+            _logger.info("账号 %s 命中容量队列（%s），让位 %s 秒", aid,
+                         outcome.get("code") or "WAITING",
+                         pool_cfg.get("queue_cooldown", 120))
+            self.pool.flush()
+        # 尝试用尽：把最后一次的原始上游响应**原样**返回给客户端，让它按
+        # data.retry_after 自行轮询（spec 4.4 第 4 条）。**不是** 503——
+        # 503 会掩盖真实原因。last_outcome 为 None 说明连一次上游都没打到。
+        if last_outcome is not None:
+            await send({"type": "http.response.start", "status": last_outcome["status"],
+                        "headers": last_outcome["headers"]})
+            await send({"type": "http.response.body", "body": last_outcome["body"]})
+            self.pool.record(aid, last_outcome["status"])
+            if kid is not None:
+                self.pool.store.record_key_usage(kid, tokens=None)
+        else:
+            return await JSONResponse(
+                {"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
+        self.pool.flush()
+
+    def _next_model(self, pool_cfg, current_model, computed_models):
+        """挑下一个该试的模型；没有则返回 None（表示该收工了）。
+
+        ``computed_models`` 是「已经取过候选的当前模型」集合——每换一次模型就
+        把上一个记进来，保证同一个模型不会被反复取到同一个候选。
+        """
+        if not pool_cfg.get("queue_model_fallback", True):
+            return None
+        tried = set(computed_models) | {current_model}
+        for candidate in self.pool.fallback_models(current_model, tried=tried):
+            return candidate
+        return None
+
+    async def _attempt(self, scope, receive, send, manager):
+        """跑一次下游应用，扣留首包以判定是否排队。
+
+        返回 dict：
+          kind="queue" → 命中容量队列。此时**未向客户端发出任何字节**，可安全重放；
+                         同时带回被丢弃响应的 ``status`` / ``headers`` / ``body``，
+                         重试耗尽时用它把上游原始响应原样还给客户端。
+          kind="done"  → 已决定放行，响应已经（经 observe）转发给客户端，不可重放。
+
+        扣留**必须有硬上界**（``queue_hold_ms``）：历史上这功能被回滚就是因为
+        无上界扣留把 /health 一起拖死。窗口内没有首包 = 上游慢，不是排队，
+        立刻原样放行，绝不等待。
+        """
+        hold_ms = max(0, int(self.pool.store.data.get("pool", {}).get("queue_hold_ms", 3000)))
+        state = {"status": 200, "headers": [], "held": False, "first_body": None,
+                 "queue": False, "started": False, "tokens": 0}
+        body_ready = asyncio.Event()
+
+        def sniff(payload):
+            """从首包嗅出排队特征。返回 (is_queue, code, has_content)。"""
+            code, texts, has_content = None, [], False
+            for line in payload.split(b"\n"):
+                stripped = line.strip()
+                for prefix in (b"data:", b"event:"):
+                    if stripped.startswith(prefix):
+                        stripped = stripped[len(prefix):].strip()
+                        break
+                if not stripped or stripped in (b"[DONE]",):
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except (ValueError, AttributeError, TypeError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                # 真实内容：choices / delta / content / output 任一出现就说明
+                # 这不是排队响应，必须放行（重放会重复输出）。
+                if obj.get("choices") or obj.get("delta") or obj.get("content") \
+                        or obj.get("output") or obj.get("output_text"):
+                    has_content = True
+                resp = obj.get("response") if isinstance(obj.get("response"), dict) else {}
+                err = obj.get("error") or resp.get("error") or {}
+                c = obj.get("code")
+                if c is None and isinstance(err, dict):
+                    c = err.get("code")
+                if c is not None:
+                    code = c
+                for holder in (err, resp, obj):
+                    if isinstance(holder, dict) and holder.get("message"):
+                        texts.append(str(holder["message"]))
+            return self.pool.is_queue_error(None, " ".join(texts), code), code, has_content
+
+        async def observe(message):
+            if message["type"] == "http.response.start":
+                state["status"] = message["status"]
+                state["headers"] = message.get("headers", [])
+                if not state["started"]:
+                    # 扣留响应头，等首包判定是否排队。绝不能无上界地等下去。
+                    state["held"] = True
+                    return
+                return
+            if message["type"] != "http.response.body":
+                await send(message)
+                return
+            payload = message.get("body", b"")
+            more = message.get("more_body", False)
+            if state["held"] and state["first_body"] is None:
+                state["first_body"] = payload
+                is_queue, code, has_content = sniff(payload)
+                if is_queue and not has_content:
+                    state["queue"] = True
+                    state["code"] = code
+                    # 记下被丢弃的原始分片，并继续收集后续分片：全部重试都用尽时
+                    # 要把这份响应**原样**还给客户端（让它按 retry_after 轮询），
+                    # 所以丢弃的内容必须留得住，不能只留个 code。
+                    state["raw"] = [payload]
+                    body_ready.set()
+                    return
+                # 放行：补发 start + 首个分片，之后走普通透传。
+                state["held"] = False
+                state["started"] = True
+                body_ready.set()
+                await send({"type": "http.response.start", "status": state["status"],
+                            "headers": state["headers"]})
+                await send({"type": "http.response.body", "body": payload, "more_body": more})
+                return
+            if state["queue"]:
+                # 已判定排队、正在收集被丢弃的原始分片：继续累积，最终原样回放。
+                state["raw"].append(payload)
+                return
+            if not state["started"]:
+                # 兜底：没见过 start 就来了 body（不应发生），补发 start。
+                state["started"] = True
+                await send({"type": "http.response.start", "status": state["status"],
+                            "headers": state["headers"]})
+            self._track_usage(payload, state)
+            await send(message)
+
+        token = REQUEST_CREDENTIAL.set(manager)
+        app_task = asyncio.ensure_future(self.app(scope, receive, observe))
+        try:
+            # 要么首包到达、要么硬上界到点——两者取先到者，绝不无限等待。
+            done, _ = await asyncio.wait({app_task, asyncio.ensure_future(body_ready.wait())},
+                                         timeout=hold_ms / 1000.0,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if state["queue"]:
+                # 命中排队：下游应用已经结束（排队是完整小响应），回收它。
+                if app_task.done():
+                    app_task.exception()  # 吞掉异常：这次响应本来就要丢弃
+                return {"kind": "queue", "code": state.get("code"),
+                        "status": state["status"], "headers": state["headers"],
+                        "body": b"".join(state.get("raw") or [])}
+            if state["held"] and not state["started"]:
+                # 窗口内没有首包：不是排队，是上游慢。原样放行，本次不切号。
+                state["held"] = False
+                state["started"] = True
+                await send({"type": "http.response.start", "status": state["status"],
+                            "headers": state["headers"]})
+            await self._await_app(app_task)
+        except asyncio.CancelledError:
+            app_task.cancel()
+            raise
+        finally:
+            REQUEST_CREDENTIAL.reset(token)
+        return {"kind": "done", "status": state["status"], "tokens": state["tokens"]}
+
+    @staticmethod
+    async def _await_app(task):
+        """等下游应用结束；它抛错时按「已放行」处理，不再尝试切号。"""
+        try:
+            await task
+        except Exception:
+            _logger.exception("下游应用在扣留期间异常结束")
+
+    @staticmethod
+    def _track_usage(payload, state):
+        """从流里提取 usage.total_tokens（与旧 observe 的行为一致）。"""
+        text = payload.decode("utf-8", "replace")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                obj = json.loads(line[5:].strip())
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            usage = obj.get("usage") or (obj.get("response") or {}).get("usage")
+            total = usage.get("total_tokens") if isinstance(usage, dict) else None
+            if isinstance(total, (int, float)):
+                state["tokens"] = max(state["tokens"], int(total))
+
+    async def _serve_once(self, scope, receive, send, aid, manager, kid, log_context):
+        """开关关闭时的原路径：完全保持改动前的行为。"""
         token = REQUEST_CREDENTIAL.set(manager)
         status = 200
         buffer = b""
         usage_tokens = 0
+
         def extract_usage(obj):
             nonlocal usage_tokens
             usage = obj.get("usage") if isinstance(obj, dict) else None
             total = usage.get("total_tokens") if isinstance(usage, dict) else None
             if isinstance(total, (int, float)):
-                usage_tokens = max(usage_tokens, int(total))  # 流式里 usage 块通常在最后，取最大值即总量
+                usage_tokens = max(usage_tokens, int(total))
+
         async def observe(message):
             nonlocal status, buffer
             if message["type"] == "http.response.start":
@@ -858,13 +1240,13 @@ class PoolMiddleware:
                                 code = int(code)
                             if code in (401, 402, 403, 429):
                                 status = code
-                                # 交由外层 MetricsMiddleware 统一决定生效状态码，这里只留痕。
                                 log_context["error_code"] = code
                         except (ValueError, AttributeError):
                             pass
                 if len(buffer) > 65536:
                     buffer = b""
             await send(message)
+
         try:
             await self.app(scope, receive, observe)
         finally:
@@ -873,3 +1255,17 @@ class PoolMiddleware:
             if kid is not None:
                 self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
             self.pool.flush()
+
+
+def _replay_receive(raw, original_receive):
+    """把已读进内存的请求体重放给下游应用（下游可能读多次）。"""
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+        return await original_receive()
+    return receive
+

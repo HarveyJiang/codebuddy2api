@@ -126,6 +126,8 @@ curl http://127.0.0.1:8787/v1/models
 
 如果这两条能通，说明本地服务、登录态、基本路由都没问题。
 
+> `/health` 的深度判据（`ok` / `degraded` / `down`）只在管理后台 `python3 -m admin.server` 下生效；独立的 `core.converter` 返回的是带平台、Python 版本和 auth 文件路径的进程信息。
+
 ---
 
 ## 客户端接入
@@ -238,8 +240,8 @@ python3 -m core.converter --port 9000
 |------|------|------|
 | `--host` | `127.0.0.1` | 监听地址 |
 | `--port` | `8787` | 监听端口 |
-| `--api-key` | 无 | 给本地客户端加一层鉴权 |
-| `--log` | 无 | 记录请求与响应日志 |
+| `--api-key` | `WORKBUDDY_API_KEY` | 给本地客户端加一层鉴权 |
+| `--log` | `WORKBUDDY_LOG` | 额外把日志写到该文件；不传则只输出到 stderr |
 | `--desensitize` | 关 | 压缩运行时提示、去掉 tool description、零宽脱敏高风险关键词 |
 | `--no-compact` | 关 | 配合 `--desensitize` 使用，保留更完整的原始 system prompt |
 | `--skip-check` | 否 | 跳过启动预检 |
@@ -269,6 +271,8 @@ uv run python -m core.converter --desensitize --log converter.log
 ```
 
 ### 日志里能看到什么
+
+日志默认输出到 **stderr**（容器运行时直接收集），`--log` 只是额外落一份文件，不需要它也能排障；级别用 `WORKBUDDY_LOG_LEVEL` 调（默认 `INFO`，第三方库连接细节已降噪，`DEBUG` 也不会刷满 httpx）。
 
 每次请求都会带一个唯一 ID，常见日志包括：
 
@@ -331,15 +335,17 @@ uv run python -m core.converter --desensitize --log converter.log
 除原转换器外，项目附带一个中文 Web 管理后台（`admin/`），适合服务器长期运行：
 
 - 浏览器授权添加国内 CodeBuddy / WorkBuddy 账号，无需桌面端；多账号自动轮转、冷却与积分耗尽避让
-- 凭据刷新、积分余额查询、每日自动签到（默认北京时间 09:00，可配置）
+- 凭据刷新、积分余额查询、每日自动签到（默认北京时间 09:00，可配置）、积分消耗速率与过期浪费预估
 - 客户端 API Key 创建与撤销，可逐枚限定可用模型 / 可用账号与分配策略
 - 概览页：请求量、完成成功率、HTTP 成功率、平均耗时与最近请求（读取 SQLite，支持翻页，重启不清零）
+- 用量明细页：上游账单级积分消耗报表，**默认只读本地库，点「拉取上游」才打上游**
+- 模型管理：动态目录、逐个启停、手动添加上游没返回的模型
 
 本地启动（需先安装依赖并设置至少 20 位的管理密钥）：
 
 ```bash
-export ADMIN_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(36))")
-export CODEBUDDY2OPENAI_KEY=sk-wb-$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+export WORKBUDDY_ADMIN_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(36))")
+export WORKBUDDY_API_KEY=sk-wb-$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 python3 -m admin.server
 ```
 
@@ -380,27 +386,33 @@ docker build -t workbuddy2api -f deploy/standalone/Dockerfile .
 
 docker run -d --name workbuddy2api -p 8787:8787 \
   -v ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro \
-  -e CODEBUDDY_AUTH_DIR=/data/auth \
+  -e WORKBUDDY_AUTH_DIR=/data/auth \
   workbuddy2api
 ```
 
 ### 相关环境变量
 
+完整列表见下方「配置」一节（旧名全部继续生效）。这里只列 compose 里最常改的：
+
 | 变量 | 说明 |
 |------|------|
-| `CODEBUDDY_AUTH_DIR` | 指定登录态目录 |
-| `CODEBUDDY2OPENAI_KEY` | 本地 API Key |
-| `CODEBUDDY2OPENAI_LOG` | 日志路径 |
+| `WORKBUDDY_AUTH_DIR`（旧 `CODEBUDDY_AUTH_DIR`） | 指定登录态目录 |
+| `WORKBUDDY_API_KEY`（旧 `CODEBUDDY2OPENAI_KEY`） | 本地 API Key |
+| `WORKBUDDY_LOG`（旧 `CODEBUDDY2OPENAI_LOG`） | 日志路径 |
 
 ---
 
 ## 模型列表
 
-当前内置默认模型列表：
+模型目录由管理后台的**模型注册表**维护（`admin/models.py`），不再以 `core/converter.py` 里的静态列表为准：
 
-`hy3`、`hy4-preview`、`kimi-k3`、`kimi-k2.8-preview`、`glm-5.3`、`glm-5.3-flash`、`glm-5.2`、`glm-5.1`、`glm-5v-turbo`、`kimi-k2.7`、`kimi-k2.6`、`kimi-k2.5`、`deepseek-v4-pro`、`deepseek-v4.1-flash`、`deepseek-v4-flash`、`minimax-m3-pay`、`hy3-preview-agent`、`auto`
+- 启动时无本地缓存、以及之后每 6 小时，拉取官方 `GET https://www.workbuddy.cn/v3/config` 动态发现，拿到模型菜单、`credits` 倍率、`maxInputTokens` 和折扣活动；失败保留上次缓存。
+- 三档智能路由 `fast-model` / `balanced-model` / `deep-model` 由官方固定提供，注册表无条件附加。
+- 从未成功拉取过时，回落内置官方快照（`BUILTIN_MODELS`）：`hy4-preview`、`hy3`、`hy3-x`、`step-5-preview`、`space-bunny`、`deepseek-v4.1-flash`、`glm-5.3`、`glm-5.3-flash`、`glm-5.2`、`glm-5.1`、`glm-5v-turbo`、`minimax-m3`、`minimax-m2.7`、`kimi-k3-1`、`kimi-k2.8-preview`、`kimi-k2.7`、`kimi-k2.6`、`deepseek-v4-pro`，加三档智能路由。
+- 上游 `/v3/config` 的菜单**不一定列全**：有些 id 没返回但实际仍可调用，可以在后台「模型管理」手工补上（记为 `custom`，自动拉取时**合并**而非替换，不会被冲掉），可调用性只由「启用」决定。
+- 禁用某模型后：`/v1/models` 不再返回它，用它发起对话直接 400。
 
-> 本机装有 WorkBuddy 时优先使用其动态模型目录，上表为兜底列表。具体能不能用，取决于你的 WorkBuddy / CodeBuddy 订阅与上游状态。
+具体能不能用，仍取决于你的订阅与上游状态。详见 [ADMIN_README.md](ADMIN_README.md)。
 
 ---
 
@@ -458,53 +470,154 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ---
 
-## 排队自动切号（免费模型）
+## 容量队列自动切换（免费模型高峰期）
 
-免费模型在高峰期常遇上游「排队中 / 繁忙 / 限流」。本网关支持在**尚未向客户端输出任何内容时**，自动换下一个账号重试，对客户端透明（不会看到半截输出）。
+免费模型（如 `Step-5-Preview`）在高峰期会被上游放进**容量队列**，不立即处理，而是返回：
+
+```json
+{"code": "WAITING", "message": "当前模型资源紧张，请等候。Step-5-Preview 前方约 7859 位用户排队…",
+ "data": {"queue_position": 7859, "retry_after": 5}}
+```
+
+这段文案是**上游下发的**，不是客户端写死的。开启后，网关会在**尚未向客户端发出任何字节**前自动换号重试，并对客户端透明（不会看到半截输出或排队提示）：
+
+1. **先换账号**：同模型换个号可能就不排队了。
+2. **账号试尽后降级模型**：换到**同价位的免费/低价模型**（免费档与低价档合并，按倍率升序，越省越好）。
+3. **最后兜底**：退到 `fast-model` 智能路由。
+4. **全部用尽**：把上游原始排队响应原样返回，客户端可按 `data.retry_after` 自行轮询。
 
 ### 开关与配置（管理后台 → 账号池设置）
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `queue_failover` | `false` | **总开关**，默认关闭。开启后启用排队切号 |
-| `queue_retry` | `3` | 最多尝试几个账号（含首次），1 表示不重试 |
-| `queue_cooldown` | `60` | 命中排队的账号在该秒数内被优先跳过（让位） |
-| `queue_patterns` | 见下 | 上游错误文案命中任一关键词即视为排队 |
-
-默认关键词：`排队`、`繁忙`、`拥堵`、`稍后重试`、`限流`、`busy`、`overload`、`too many`、`queue`、`rate limit`
+| `queue_failover` | `false` | **总开关。默认关闭**，需在管理页显式打开 |
+| `queue_retry` | `3` | 单次请求最多尝试几次（含首次），1 = 不重试 |
+| `queue_cooldown` | `120` | 命中排队的账号让位秒数（优先跳过，**不**计入失败退避） |
+| `queue_hold_ms` | `3000` | 扣留首包的**硬上限**（毫秒），也是事故防线 |
+| `queue_model_fallback` | `true` | 换号用尽后是否降级模型 |
+| `queue_fallback_model` | `fast-model` | 最后的兜底模型 |
 
 ### 行为边界（安全保证）
 
-- **只在首字节前切换**：一旦上游已经开始返回内容，绝不再换号重放（避免重复输出破坏流）。
-- **预置错误码**：HTTP `429` / `503`，以及上游繁忙码（`11102`、`11103`、`11001`、`50001`）视为排队；`11101`（非流式不支持）**不**视为排队。
-- **让位而非硬冷却**：命中排队的账号仅短期跳过（可配 `queue_cooldown`），不计入连续失败退避。
-- **重试上限**：`queue_retry` 次内找不到可用账号，才把上游错误原样返回客户端。
+- **扣留有硬上界**：超过 `queue_hold_ms` 没有首包，就判定为「上游慢」并原样放行，**绝不无限等待**。上一版实现因为无上界扣留把 `/health` 一起拖死而被回滚，这条是那次事故的防线。
+- **只在首字节前切换**：一旦响应里出现真实内容（`choices`/`delta`/`content` 等），即使命中排队关键词也立刻放行，绝不重放——否则客户端会收到重复输出。
+- **形态全兼容**：非 200 的 `429`/`503`、body 里的字符串码 `WAITING`/`FULL`、上游繁忙码 `11102`/`11103`/`11001`/`50001`，以及文案兜底关键词，都识别为排队。
+- **不切不该切的**：`USER_LIMIT`（个人额度到顶）与 `11101`（非流式不支持）**不**算排队——换号换模型都救不了，直接让用户看到。
+- **让位不是冷却**：命中的账号只是短期优先跳过；**全部账号都在让位期内时会忽略该标记**，不会把池子自我封锁成 503。
+- **默认关闭**：这是唯一会重放整个请求的功能，影响面比其它设置大，所以默认不开。
 
-> 提示：若你的上游排队报错文案不在默认关键词里，在后台「排队关键词」里补上实际文案即可，无需改代码。
+> 上游改文案不会让功能失效（主判据是结构化 code），但如果你遇到了新的排队报错形态，可以在 `admin/pool.py` 的 `QUEUE_PATTERNS` 里补关键词。
 
 ---
 
+## 配置
+
+配置有**唯一读取入口** `core/runtime_config.py`，优先级：
+
+```
+命令行参数 > 真实环境变量 > .env 文件 > 代码默认值
+```
+
+`.env` 用 `setdefault` 语义写入 `os.environ`，所以 docker/compose 里显式传的变量始终赢过文件。启动时若检测到你在用旧变量名（如 `CODEBUDDY_AUTH_DIR`、`ADMIN_KEY`），日志里会**汇总成一行**提示改用新名，新旧名同时有效。
+
+### 环境变量
+
+| 变量（旧名 → 新名） | 默认值 | 说明 |
+|---|---|---|
+| `WORKBUDDY_DATA_DIR`（`MANAGEMENT_DATA_DIR`） | `/data/management` | SQLite 数据目录（`state.db`） |
+| `WORKBUDDY_AUTH_DIR`（`CODEBUDDY_AUTH_DIR`） | `/data/auth` | 桌面端登录态目录 |
+| `WORKBUDDY_HOST` / `WORKBUDDY_PORT`（`PORT`） | `127.0.0.1` / `8787` | 监听地址与端口 |
+| `WORKBUDDY_ADMIN_KEY`（`ADMIN_KEY`） | 空 | 管理后台密钥，至少 20 字符 |
+| `WORKBUDDY_API_KEY`（`CODEBUDDY2OPENAI_KEY`） | 空 | 客户端 API Key |
+| `WORKBUDDY_LOG`（`CODEBUDDY2OPENAI_LOG`） | 无 | 额外写日志文件 |
+| `WORKBUDDY_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `WORKBUDDY_STREAM_IDLE_TIMEOUT` | `120` | 流式请求的**逐分片**空闲超时（秒） |
+| `WORKBUDDY_DESENSITIZE`（`CODEBUDDY_RESPONSES_DESENSITIZE`） | 关 | 等价 `--desensitize` |
+| `WORKBUDDY_NO_COMPACT` | 关 | 等价 `--no-compact` |
+| `WORKBUDDY_LOSSY_PROJECTION` | 关 | 有损投影 |
+| `WORKBUDDY_ENV_FILE` | `.env` | 指定 env 文件路径 |
+
+容器部署通常用旧名最省事——旧名全部继续生效，只是启动时会给一行提示。
+
+### 流式空闲超时与截断可观测
+
+流式请求**不设总超时**（LLM 输出天然可能几分钟），改为逐分片判空闲：相邻两个分片间隔超过 `WORKBUDDY_STREAM_IDLE_TIMEOUT`（默认 120 秒）就中止并向客户端返回明确错误。这样上游「连接还活着但不再发数据」的卡死场景不会一直占着账号的 in-flight 名额。
+
+若上游在**没有终止事件**的情况下断开，网关会在流末尾补一个可识别的截断错误事件，而不是让客户端把半截输出当成正常结束。
+
+---
+
+## 可观测性
+
+- **默认即有日志**：日志恒输出到 stderr（由容器运行时收集），`--log` 只是额外落一份文件；重复初始化不叠加 handler。
+- **`/health` 是深度检查**，不再恒返回 ok：
+  - `ok` —— 有可用账号且库可读
+  - `degraded` —— 库可读但**一个可用账号都没有**（凭据全失效/全暂停），仍返回 200（重启修不好凭据失效，标 unhealthy 只会触发重启循环）
+  - `down` —— 状态无法判定，HTTP 503
+  - `?verbose=1` 附带逐账号明细（默认不返回，避免未鉴权端点泄露账号名）
+- 「可用账号」判据（启用 + 凭据可解析 + 未标认证失效）与账号池内部判据保持一致，避免漂移。
+
+---
+
+## 数据库
+
+管理数据全部落 SQLite（`management/state.db`），**没有通用 kv 表**，全部结构化：
+
+| 表 | 用途 |
+|---|---|
+| `accounts` / `keys` | 账号与客户端密钥（含模型/账号白名单、限额） |
+| `settings` | 账号池单行配置（签到时间、积分拉取时段、亲和天数等） |
+| `models` | 模型目录（来源、可用性、启用状态、倍率、上下文） |
+| `request_logs` | 请求明细与概览统计，保留 93 天 |
+| `upstream_request_usage` | 上游账单级积分消耗，按需拉取 |
+| `key_usage_daily` | 密钥每日用量趋势 |
+| `session_bindings` | 会话亲和绑定，带过期清理 |
+| `schema_meta` | schema 版本号 |
+
+约定：金额落库 `*_micro`（×1e6 整数），内存与接口输出保持 float；时间一律 `INTEGER` 秒级 unix；日历分桶按**北京时间**；不存请求/响应正文；迁移走版本化列表，所有待执行迁移合并在同一事务里，失败整体回滚且不写版本号。
+
+详见 `specs/db-redesign.md` 与 [ADMIN_README.md](ADMIN_README.md)。
+
+---
+
+## 项目结构
+
 ```text
 workbuddy2api/
-├── core/                      # 协议转换核心
+├── core/                      # 协议转换核心（不依赖 admin，可单独成镜像）
 │   ├── converter.py           # 主入口，FastAPI 服务（python3 -m core.converter）
+│   ├── runtime_config.py      # 配置唯一读取入口 + 旧名兼容
+│   ├── runtime_logging.py     # 日志分级与初始化
 │   ├── responses_adapter.py   # OpenAI Responses ↔ Chat 适配
 │   ├── responses_projection.py# Codex / agent 请求投影压缩
 │   ├── anthropic_adapter.py   # Anthropic Messages ↔ Chat 适配
-│   └── desensitize.py         # 运行时文本压缩与零宽脱敏
+│   ├── desensitize.py         # 运行时文本压缩与零宽脱敏
+│   ├── system_identity.py     # 剥离 system 里的身份声明
+│   └── workbuddy_atrest_crypto.py # $wbEncrypted 登录态解密（WorkBuddy 5.6+）
 ├── admin/                     # 中文管理后台（可选，python3 -m admin.server）
 │   ├── server.py              # 管理 API、会话与静态页面
+│   ├── db.py                  # SQLite 持久层与版本化迁移
+│   ├── models.py              # 模型注册表（/v3/config 动态发现 + 内置兜底）
 │   ├── pool.py                # 账号池轮转、冷却、积分与签到
 │   ├── browser_login.py       # 浏览器授权登录
 │   ├── metrics.py             # 请求统计
 │   └── static/                # 前端资源
+├── specs/                     # 设计文档（改动先写 spec，再实现）
+│   ├── db-redesign.md         # SQLite 结构定稿
+│   ├── queue-failover.md      # 容量队列自动切换（换号 / 降级模型）
+│   ├── config.md              # 统一配置入口
+│   ├── observability.md       # 日志分级 + 深度 health
+│   ├── stream-robustness.md   # 流式空闲超时与截断可观测
+│   ├── usage-stats.md         # 用量明细与报表
+│   └── custom-models.md       # 手动添加模型
 ├── deploy/                    # 部署
 │   ├── standalone/            # 独立转换器（Dockerfile + compose）
 │   ├── admin/                 # 管理后台（Dockerfile + compose + nginx 示例）
 │   └── one-click/             # 一键式部署（deploy.sh 自动生成密钥并启动）
 ├── tests/                     # 单元测试（pytest）
 ├── codex-codebuddy.example.toml
-├── README.md
+├── README.md                  # 本文件
+├── ADMIN_README.md            # 管理后台详细说明
 └── LICENSE
 ```
 
@@ -612,7 +725,47 @@ Use `/v1/messages`:
 - `/v1/responses` already applies backend-facing projection by default
 - `--desensitize --no-compact` preserves more of the original system prompt
 - if that still gets review-blocked, `/v1/responses` will retry once in compact mode
-- an optional Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `bash deploy/one-click/deploy.sh`
+- an optional Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) adds browser-based account authorization, multi-account rotation, client API keys, daily check-in, usage reports and a model registry; one-command Docker setup: `bash deploy/one-click/deploy.sh`
+
+### Configuration
+
+Single entry point: `core/runtime_config.py`. Precedence is
+`CLI flags > real env vars > .env file > code defaults`. Legacy variable names
+(`CODEBUDDY_AUTH_DIR`, `ADMIN_KEY`, `CODEBUDDY2OPENAI_KEY`, …) keep working — the
+startup log prints one aggregated line telling you the new name.
+
+| Variable (legacy → current) | Default | Purpose |
+|---|---|---|
+| `WORKBUDDY_DATA_DIR` (`MANAGEMENT_DATA_DIR`) | `/data/management` | SQLite data dir |
+| `WORKBUDDY_AUTH_DIR` (`CODEBUDDY_AUTH_DIR`) | `/data/auth` | Desktop auth dir |
+| `WORKBUDDY_HOST` / `WORKBUDDY_PORT` (`PORT`) | `127.0.0.1` / `8787` | Listen address |
+| `WORKBUDDY_ADMIN_KEY` (`ADMIN_KEY`) | — | Admin console key (≥20 chars) |
+| `WORKBUDDY_API_KEY` (`CODEBUDDY2OPENAI_KEY`) | — | Client API key |
+| `WORKBUDDY_LOG` (`CODEBUDDY2OPENAI_LOG`) | — | Extra log file |
+| `WORKBUDDY_LOG_LEVEL` | `INFO` | Log level |
+| `WORKBUDDY_STREAM_IDLE_TIMEOUT` | `120` | Per-chunk stream idle timeout (s) |
+| `WORKBUDDY_DESENSITIZE` (`CODEBUDDY_RESPONSES_DESENSITIZE`) | off | Same as `--desensitize` |
+| `WORKBUDDY_NO_COMPACT` | off | Same as `--no-compact` |
+
+### Observability
+
+- Logging always writes to stderr (collected by the container runtime); `--log` only adds a file. Level via `WORKBUDDY_LOG_LEVEL`.
+- Streaming requests have **no total timeout** (LLM output can legitimately run for minutes) but a per-chunk idle timeout, so a dead-but-open upstream connection can't hold an account slot forever. A stream that ends without a terminal event gets an explicit truncation error event instead of silently ending.
+- `/health` is a deep check: `ok` / `degraded` (DB readable but zero usable accounts, still HTTP 200) / `down` (HTTP 503). `?verbose=1` adds per-account detail.
+
+### Database
+
+All admin state lives in SQLite (`management/state.db`), fully structured — no generic kv table: `accounts`, `keys`, `settings`, `models`, `request_logs` (93-day retention), `upstream_request_usage`, `key_usage_daily`, `session_bindings`, `schema_meta`. Money is stored as `*_micro` integers (×1e6) and exposed as float; timestamps are integer unix seconds; calendar bucketing is Beijing time. Migrations are versioned and applied in a single transaction, so a failure rolls back and leaves the version number untouched. See `specs/db-redesign.md`.
+
+### Capacity Queue Failover (optional, off by default)
+
+Free models get placed into an upstream **capacity queue** during peak hours and return
+`{"code":"WAITING","data":{"queue_position":…,"retry_after":…}}`. When enabled, the gateway
+switches accounts (and then downgrades to a same-tier cheap model, falling back to `fast-model`)
+**before emitting any byte to the client**, so the caller never sees the queue notice. The hold
+window is hard-bounded by `queue_hold_ms` (default 3000ms) — if no first chunk arrives in time it
+is treated as a slow upstream and passed through, never waited on indefinitely. A response that
+already contains real content is never replayed. See `specs/queue-failover.md`.
 
 ### Capability Notes (Measured)
 
@@ -644,7 +797,7 @@ Upstream accepted roughly **820K tokens** without rejecting the request; the rea
 ### CLI Options
 
 ```bash
-python3 -m core.converter [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--desensitize] [--skip-check]
+python3 -m core.converter [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--desensitize] [--no-compact] [--skip-check]
 ```
 
 ### Disclaimer

@@ -1,7 +1,7 @@
 # 可观测性 Spec：日志分级 + 深度健康检查
 
-> 状态：设计中。范围是**日志**与 **`/health`**，不含 `/metrics`（Prometheus 导出留待后续，
-> 当前用「深度 health + 结构化日志」已能覆盖自建服务的排障需求）。
+> 状态：已实现（2026-10-15）。实现见 `core/runtime_logging.py` 与 `admin/server.py` 的 `/health`。
+> 范围是**日志**与 **`/health`**，不含 `/metrics`（Prometheus 导出留待后续，当前用「深度 health + 结构化日志」已能覆盖自建服务的排障需求）。
 
 ## 背景
 
