@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from core.backends.registry import backend_name_for
-from core.backends.trae import TraeAPIError
+from core.backends.trae import TraeAPIError, interpret_checkin_claim
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
@@ -421,19 +421,26 @@ class AccountPool:
                     elif not ci["enable"]:
                         message = "当前没有可参与的签到活动"
                     else:
-                        manager.checkin_claim(client)
-                        # 上游签到为异步生效：claim 返回 200 后，status 接口的 checked_in
-                        # 可能仍未刷新。做有界重试（短退避）确认，避免把"刚生效"误判成"尚未确认"。
+                        # 上游对签到失败也返回 HTTP 200，真实结果看 claim 的 code。
+                        # 9074 等＝"人多稍后再试"（容量限制），对 claim 本身做有界重试；
+                        # 其余非 0＝明确失败，透出上游 message（而非误报"尚未确认"）。
                         confirmed = False
+                        last_msg = "签到失败，请稍后再试"
                         for attempt in range(4):
-                            ci = manager.checkin_status(client)
-                            if ci["checked"]:
+                            ok, msg, retryable = interpret_checkin_claim(manager.checkin_claim(client))
+                            if ok:
                                 confirmed = True
                                 break
-                            if attempt < 3:
-                                time.sleep(1.5)
+                            last_msg = msg or last_msg
+                            if retryable and attempt < 3:
+                                time.sleep(2.5)
+                                continue
+                            # 明确失败：可能是"今日已签到"之类，查一次 status 兜底
+                            if manager.checkin_status(client)["checked"]:
+                                confirmed = True
+                            break
                         if not confirmed:
-                            raise BillingError("签到已提交，但上游尚未确认；请刷新状态")
+                            raise BillingError(last_msg)
                         self.update(aid, checkin_date=today)
                         message = "签到成功"
             except (BillingError, httpx.HTTPError):

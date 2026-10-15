@@ -8,6 +8,7 @@ import json
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -831,24 +832,22 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert status["checkin_date"] == today
         assert "/trae/api/v2/ug/checkin_credits/claim" in calls
 
-    async def test_trae_checkin_retries_until_upstream_confirms(self):
-        # 回归：claim 返回 200 后 status 未立即刷新（上游异步生效），
-        # 应有界重试确认而非误报"签到已提交，但上游尚未确认"。
+    async def test_trae_checkin_retries_on_capacity_code(self):
+        # 回归：claim 返回可重试业务码 9074（"人多稍后再试"，HTTP 200）时应重试 claim 本身，
+        # 成功即判"签到成功"；旧代码只认 HTTP 200，会把 9074 当成功、随后 status 不确认而误报"尚未确认"。
+        import admin.pool as admin_pool
         headers = await self.login_admin()
         aid = self.trae_aid()
-        state = {"claimed": False, "status_after_claim": 0}
+        state = {"claims": 0}
 
         def handler(req):
             if req.url.path.endswith("/checkin_credits/status"):
-                if not state["claimed"]:
-                    return httpx.Response(200, json={"checked_in": False, "credits": 0, "enable": True})
-                # claim 后第 1 次仍未确认，第 2 次才确认（模拟异步生效）
-                state["status_after_claim"] += 1
-                confirmed = state["status_after_claim"] >= 2
-                return httpx.Response(200, json={"checked_in": confirmed, "credits": 50, "enable": True})
+                return httpx.Response(200, json={"checked_in": False, "credits": 0, "enable": True})
             if req.url.path.endswith("/checkin_credits/claim"):
-                state["claimed"] = True
-                return httpx.Response(200, json={})
+                state["claims"] += 1
+                if state["claims"] < 3:
+                    return httpx.Response(200, json={"code": 9074, "message": "当前参与用户太多，请稍后再试"})
+                return httpx.Response(200, json={"code": 0, "message": "success"})
             if req.url.path.endswith("/ide_user_ent_usage"):
                 return httpx.Response(200, json={"user_entitlement_pack_list": [{"entitlement_base_info": {"quota": {"credits_limit": 120}}}]})
             return httpx.Response(404)
@@ -856,14 +855,45 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         real = _REAL_SYNC_CLIENT
         self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
         try:
-            r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
+            with unittest.mock.patch.object(admin_pool.time, "sleep", lambda *_: None):
+                r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
         finally:
             self.admin_server.httpx.Client = real
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["ok"] is True, body
         assert body["message"] == "签到成功"
-        assert state["status_after_claim"] >= 2  # 确实重试了
+        assert state["claims"] == 3  # 前两次 9074 重试，第三次成功
+
+    async def test_trae_checkin_surfaces_upstream_capacity_message(self):
+        # 持续 9074（容量限制）重试后仍失败：透出上游真实消息，而非误报"尚未确认"。
+        import admin.pool as admin_pool
+        headers = await self.login_admin()
+        aid = self.trae_aid()
+        state = {"claims": 0}
+
+        def handler(req):
+            if req.url.path.endswith("/checkin_credits/status"):
+                return httpx.Response(200, json={"checked_in": False, "credits": 0, "enable": True})
+            if req.url.path.endswith("/checkin_credits/claim"):
+                state["claims"] += 1
+                return httpx.Response(200, json={"code": 9074, "message": "当前参与用户太多，请稍后再试"})
+            if req.url.path.endswith("/ide_user_ent_usage"):
+                return httpx.Response(200, json={"user_entitlement_pack_list": []})
+            return httpx.Response(404)
+
+        real = _REAL_SYNC_CLIENT
+        self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        try:
+            with unittest.mock.patch.object(admin_pool.time, "sleep", lambda *_: None):
+                r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
+        finally:
+            self.admin_server.httpx.Client = real
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is False, body
+        assert "太多" in body["message"] or "稍后" in body["message"]
+        assert state["claims"] == 4  # 有界重试 4 次后放弃，透出上游消息
 
     async def test_trae_account_status_pulls_credits_without_checkin(self):
         # action=status：只查状态 + 积分，不执行签到。

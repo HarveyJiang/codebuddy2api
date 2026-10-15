@@ -653,12 +653,38 @@ def checkin_status(client: httpx.Client, headers: dict, ug_host: str | None = No
     return {"checked": bool(_pick(data, "checked_in")), "credits": credits, "enable": bool(_pick(data, "enable"))}
 
 
-def checkin_claim(client: httpx.Client, headers: dict, ug_host: str | None = None) -> None:
-    """执行签到。失败抛 TraeAPIError。"""
+def checkin_claim(client: httpx.Client, headers: dict, ug_host: str | None = None) -> dict:
+    """执行签到，返回上游原始 JSON（含 code/message）。HTTP 非 200 或非 JSON 抛 TraeAPIError。
+
+    注意上游对"失败"也返回 HTTP 200，真实结果看 body 的 code（见 interpret_checkin_claim）。
+    """
     host = ug_host or UG_HOST
     r = client.post(host + EP_CHECKIN_CLAIM, headers=headers, json={})
     if r.status_code != 200:
         raise TraeAPIError(f"签到接口返回 HTTP {r.status_code}", status=r.status_code)
+    try:
+        data = r.json()
+    except ValueError:
+        raise TraeAPIError("签到接口返回非 JSON")
+    return data if isinstance(data, dict) else {}
+
+
+# 签到 claim 可重试的业务码：上游容量限制（"当前参与用户太多，请稍后再试"）。
+CHECKIN_RETRYABLE_CODES = {9074}
+
+
+def interpret_checkin_claim(data: dict) -> tuple[bool, str, bool]:
+    """签到 claim 响应 → (成功?, 消息, 可重试?)。
+
+    上游 HTTP 恒 200，用业务码判定：code 0/缺失＝成功；9074 等＝人多可重试；
+    其余非 0＝明确失败，透出上游 message（避免把容量限制误报成"尚未确认"）。
+    """
+    code = data.get("code")
+    message = str(data.get("message") or "").strip()
+    if code in (0, None):
+        return True, message, False
+    retryable = code in CHECKIN_RETRYABLE_CODES or any(k in message for k in ("稍后", "太多", "重试", "频繁", "请稍"))
+    return False, message or f"签到失败（code={code}）", retryable
 
 
 def _num(value) -> float:
@@ -876,7 +902,7 @@ class TraeCredentialManager:
     def checkin_status(self, client) -> dict:
         return checkin_status(client, self.ug_headers())
 
-    def checkin_claim(self, client) -> None:
+    def checkin_claim(self, client) -> dict:
         return checkin_claim(client, self.ug_headers())
 
     def user_ent_usage(self, client) -> float:
