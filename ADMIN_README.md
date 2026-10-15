@@ -42,8 +42,12 @@
 | `WORKBUDDY_DATA_DIR`（旧名 `MANAGEMENT_DATA_DIR`） | 账号索引与密钥摘要目录，线上 `/data/management` |
 | `WORKBUDDY_LOG_LEVEL` | 日志级别，默认 `INFO` |
 | `WORKBUDDY_STREAM_IDLE_TIMEOUT` | 流式逐分片空闲超时秒数，默认 `120` |
+| `WORKBUDDY_IMAGE_TAG` | 界面上显示的版本标识，一般填本次部署的镜像 tag（如 `main-62291f0`）；留空显示 `unknown` |
+| `WORKBUDDY_VERSION` | 可选的语义版本（如 `1.2.0`），设了就优先于镜像 tag 显示 |
 
 旧变量名全部继续生效（旧名可能已写进你的 compose，改名会静默失效），启动日志会用一行汇总提示改用新名。完整配置见 [README.md](README.md#配置) 与 `specs/config.md`。
+
+界面上的版本标识来自 `WORKBUDDY_IMAGE_TAG`：登录页页脚和控制台侧边栏底部会显示它，便于核对线上跑的是哪一次发布。容器里没有 `.git`（镜像只拷 `core/` 与 `admin/`），所以版本只能由部署侧注入——记得 `docker compose pull` 换 tag 时同步更新这个变量。
 
 生产使用一个 Uvicorn 进程。会话和账号选择缓存在进程内，不适用于直接增加多 worker。Nginx 终止 HTTPS，后端端口仅绑定服务器回环地址。管理会话重启后需重新登录。
 

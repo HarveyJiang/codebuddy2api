@@ -14,6 +14,8 @@ services:
       CODEBUDDY2OPENAI_KEY: ${CODEBUDDY2OPENAI_KEY:?Set an initial client API key in .env}
       CODEBUDDY_AUTH_DIR: /data/auth
       MANAGEMENT_DATA_DIR: /data/management
+      # 管理界面上的版本标识；留空显示 unknown。
+      WORKBUDDY_IMAGE_TAG: ${WORKBUDDY_IMAGE_TAG:-}
       TZ: Asia/Shanghai
     volumes:
       - ./auth:/data/auth

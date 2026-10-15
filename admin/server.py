@@ -30,6 +30,7 @@ from .db import UPSTREAM_GROUPS, Database
 from .pool import AccountPool, PoolMiddleware, ROUTING_POLICIES
 from .metrics import RequestMetrics, MetricsMiddleware
 from .models import CN, ModelRegistry
+from . import version as app_version
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -637,6 +638,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         status = "ok" if usable else "degraded"
         body = {
             "status": status,
+            "version": app_version.describe(),
             "uptime_s": int(time.time() - store.started),
             "accounts": {"total": detail["total"], "enabled": detail["enabled"],
                          "usable": usable, "auth_invalid": detail["auth_invalid"]},
@@ -741,7 +743,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             merged = {**live, **summary,
                       "in_flight": live["in_flight"], "started_at": summary["first_time"] or live["started_at"],
                       "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "version": app_version.snapshot(), "events": list(store.events)}
 
     @app.get("/admin/api/logs")
     async def logs(req: Request):

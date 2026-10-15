@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -52,9 +54,25 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["accounts"]["usable"], 1)
         # 默认响应不含账号名，避免未鉴权端点泄露信息。
         self.assertNotIn("detail", health["accounts"])
+        # 版本标识：未鉴权端点也带，登录页要靠它显示当前部署。
+        self.assertIn("version", health)
         await self.login()
         self.client.headers.pop("X-CSRF-Token")
         self.assertEqual((await self.client.post("/admin/api/keys", json={"name": "bad"})).status_code, 403)
+
+    async def test_version_reflects_injected_image_tag(self):
+        """注入镜像 tag 后，/health 与 overview 都要显示它。
+
+        首屏（登录页）只能读未鉴权的 /health，会话内读 overview；两处必须一致，
+        否则登录前后版本显示对不上。
+        """
+        with mock.patch.dict(os.environ, {"WORKBUDDY_IMAGE_TAG": "main-deadbeef"}, clear=True):
+            health = (await self.client.get("/health")).json()
+            self.assertEqual(health["version"], "main-deadbeef")
+            await self.login()
+            overview = (await self.client.get("/admin/api/overview")).json()
+            self.assertEqual(overview["version"]["label"], "main-deadbeef")
+            self.assertEqual(overview["version"]["image_tag"], "main-deadbeef")
 
     async def test_account_import_disable_delete_and_restart(self):
         await self.login()

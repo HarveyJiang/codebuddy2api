@@ -18,6 +18,17 @@ function showLogin() {
   csrf = ""; overview = null; $("workspace").hidden = true; $("login").hidden = false; $("boot").hidden = true;
   document.querySelectorAll("dialog[open]").forEach(d => d.close()); $("admin-key").value = "";
 }
+// 版本标识：登录页与会话内的侧边栏各一处，统一走 /health（未鉴权、开销极小，
+// 登录前也要能显示，所以不能只依赖 overview）。取不到就保持原样，不显示 null。
+function paintVersion(label) {
+  if (!label) return;
+  $("login-version").textContent = label;
+  $("sidebar-version").textContent = label;
+}
+async function loadVersion() {
+  try { const health = await (await fetch("/health", {credentials:"same-origin"})).json(); paintVersion(health.version); }
+  catch { /* 版本只是展示项，拿不到不影响使用 */ }
+}
 async function api(path, options = {}) {
   const method = options.method || "GET";
   const headers = {"Content-Type":"application/json", ...(method !== "GET" ? {"X-CSRF-Token":csrf} : {})};
@@ -44,6 +55,7 @@ function goPage(next) {
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
   const active = accounts.find(a => a.enabled && a.pool_state === "available") || accounts.find(a => a.enabled);
+  paintVersion(overview.version?.label);
   renderDashboard();
   $("account-count").textContent = accounts.length; $("account-badge").textContent = accounts.length;
   const routing = overview.pool?.default_routing || "round_robin";
@@ -624,4 +636,4 @@ $("keys-body").addEventListener("click", async e => {
   } catch (err) { $("usage-history-body").innerHTML = `<tr><td colspan="3" class="history-empty">${esc(err.message)}</td></tr>`; }
 });
 
-(async () => { try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();
+(async () => { loadVersion(); try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();
