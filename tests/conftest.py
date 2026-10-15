@@ -24,6 +24,7 @@ import 兄弟测试模块（``from test_admin_server import credential``），�
 标记是**叠加**的：一条测试可以同时是 core + e2e。
 """
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -72,6 +73,37 @@ def credential(uid="one", name="测试账号"):
                  "refreshToken": "private-refresh-token",
                  "expiresAt": int(time.time() * 1000) + 3600000},
     }
+
+
+def build_pool(tmp_path, infos, handler, *, clock=1800000000, api_key="api-test-key",
+               admin_key="admin-long-enough-test-key"):
+    """起一个装了指定凭据文件的账号池，上游由 ``handler`` 打桩。
+
+    几处容易踩的坑都在这里替你处理掉：
+
+    - 凭据文件必须落在 ``auth_dir`` 下（``Store.manager_for`` 会按路径取）。
+      前端/协议测试此前各写一遍，容易忘；
+    - ``create_app`` 的启动路径会真去拉上游模型目录 —— 这由 ``tests/conftest.py``
+      的 autouse 装置统一挡住，这里不必再管；
+    - ``client_factory`` 返回的 client 走 ``httpx.MockTransport(handler)``，
+      所以积分/签到这类**别人会真打上游**的代码路径在这里全部离线。
+
+    返回 ``AccountPool``。要注意的是本函数**不**构造 FastAPI app（多数用例只
+    需要池）；需要 HTTP 层的用例请用 ``admin.server.create_app``。
+    """
+    import httpx
+
+    from admin.pool import AccountPool
+    from admin.server import Store
+
+    tmp_path = Path(tmp_path)
+    (tmp_path / "auth").mkdir(parents=True, exist_ok=True)
+    store = Store(tmp_path / "management", tmp_path / "auth", api_key, admin_key)
+    for info in infos:
+        store.save_browser_account(json.loads(Path(info).read_text(encoding="utf-8")),
+                                   Path(info).stem)
+    return AccountPool(store, clock=lambda: clock,
+                       client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)))
 
 
 class recorded_no_sleep(list):

@@ -1145,6 +1145,15 @@ class TraeBackend(BackendSpec):
     # 积分/签到走 ug 接口，由 pool 分派到本后端的实现（_operate_nondefault）。
     account_ops_backend = "trae"
 
+    # 上游错误类型与签到报文解释规则都归本后端声明 —— pool 只读声明、不认名字。
+    # （见 base.BackendSpec.error_class_name 的说明：这里给的是**类名**，
+    # 因为直接写 TraeAPIError 就等于在 base 顶部 import 本模块，破坏懒构造。）
+    error_class_name = "TraeAPIError"
+
+    def interpret_checkin_claim(self, data: dict):
+        """签到 claim 响应的业务码 → (成功?, 消息, 可重试?)。实现见模块级同名函数。"""
+        return interpret_checkin_claim(data)
+
     # 404＝该 config_name 不存在/不可用：软冷却 10 分钟、不计连续失败
     # （账号本身通常是好的，不升级到 2h 硬冷却）。
     soft_cooldown = {404: 600}

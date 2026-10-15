@@ -13,6 +13,7 @@ astream 契约（所有后端必须遵守）：
 """
 from __future__ import annotations
 
+import sys
 from typing import AsyncIterator
 
 
@@ -182,6 +183,36 @@ class BackendSpec:
     def soft_cooldown_for(self, status: int) -> float | None:
         """该状态码是否触发软冷却；是则返回冷却秒数。"""
         return self.soft_cooldown.get(int(status))
+
+    # --- 上游错误的解释权 --------------------------------------------------
+
+    #: 本后端的账号操作会抛出的「上游调用失败」异常类型。pool 用它做类型化兜底
+    #: （401/403 → 凭据失效；其余原样透出）。
+    #:
+    #: 这里给的是**属性名**而不是异常类本身，也不是一个转发判定的方法 —— 因为
+    #: 那两个写法都必须在本模块顶部 import 各后端的模块才能拿到那个类，而
+    #: registry 的懒构造设计（见 registry._load）要求后端模块只在真用到时才
+    #: import。写成「类名 → 运行时按子类模块取」就既不急切 import，也不必为
+    #: 每个后端在基类里写一个转发方法（那正是 requirements 2 要消灭的形状）。
+    error_class_name: str = "BackendHTTPError"
+
+    def upstream_error_class(self):
+        """本后端上游错误的异常类（用于 pool 的 except 类型化兜底）。"""
+        if self.error_class_name == "BackendHTTPError":
+            return BackendHTTPError
+        module = type(self).__module__
+        return getattr(sys.modules[module], self.error_class_name)
+
+    def interpret_checkin_claim(self, data: dict):
+        """签到 claim 响应的业务码 → ``(成功?, 消息, 可重试?)``。
+
+        默认实现覆盖不了任何后端：签到报文的形状纯粹是各家的私有协议，
+        所以约定由**声明了 ``account_ops_backend`` 的后端**自己实现
+        （pool 只调 ``spec_for(backend).interpret_checkin_claim(...)``）。
+        之所以是 spec 上的方法而不是 pool 里的一个函数 + 类型判断，见
+        ``error_class_name`` 的说明：调用方不该知道是哪个后端在签到。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 未声明签到报文解释规则")
 
     def chat_url(self) -> str:
         raise NotImplementedError

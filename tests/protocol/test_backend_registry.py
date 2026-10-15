@@ -136,6 +136,58 @@ class _FakeBackend(BackendSpec):
         return None
 
 
+class _LazyFakeBackend(BackendSpec):
+    """一个**尚未被构造**的假后端：模拟 trae 那样「用到才 import/构造」。
+
+    必须与 _FakeBackend 分开：注册装置把它放进注册表的**名字表**，但不预先
+    构造实例 —— 这正是 make_credential 分派最容易出错的情形。
+    """
+
+    name = "lazyfake"
+    model_prefix = "lazy/"
+
+    def chat_url(self) -> str:
+        return "https://lazy.invalid/v1/chat"
+
+    def make_credential(self, path):
+        return None
+
+
+@pytest.fixture()
+def lazy_backend(monkeypatch):
+    """注册一个**懒构造**的假后端（模拟 trae 的按需 import）。
+
+    关键：只让 ``_load`` 能构造它、并让 ``known_names()`` 认这个名字，
+    **不**预先实例化 —— 调用方必须能只凭名字正确分派。
+
+    这里顺带暴露了「注册一个新后端要动哪几处」：``_load`` + ``known_names``
+    的已知名集合。这正是 `test_backend_arch_guard.py` 关注的「加后端零改动」
+    边界 —— 若将来注册面缩小成一处，这个 fixture 会先失败。
+    """
+    real_load = registry._load
+
+    def load(name):
+        if name == "lazyfake":
+            return _LazyFakeBackend()
+        return real_load(name)
+
+    monkeypatch.setattr(registry, "_load", load)
+    # 让 known_names() 认这个名字（生产里它是个封闭集合，见该函数的注释）。
+    monkeypatch.setattr(registry, "known_names",
+                        lambda: tuple(sorted(set(registry._BACKENDS) | {"workbuddy", "trae", "lazyfake"},
+                                             key=lambda n: ({"workbuddy": 0, "trae": 1}.get(n, 50), n))))
+    # spec_for 也必须能**按需构造**它 —— 这正是「懒后端」的定义：
+    # 名字可见、实例按需创建。生产里这一步由 spec_for 的 _load 分支承担。
+    real_spec_for = registry.spec_for
+
+    def spec_for(name):
+        if str(name) == "lazyfake":
+            return load("lazyfake")
+        return real_spec_for(name)
+
+    monkeypatch.setattr(registry, "spec_for", spec_for)
+
+
 @pytest.fixture()
 def fake_backend(monkeypatch):
     """把假后端塞进注册表，测试结束后还原。
@@ -202,6 +254,34 @@ def test_make_credential_dispatches_by_backend_field(fake_backend, tmp_path):
     assert isinstance(registry.make_credential(f), converter.CredentialManager)
 
 
+def test_make_credential_dispatches_lazy_backend_by_name(lazy_backend, tmp_path):
+    """回归：**懒构造**的后端也要能被凭据分派认出来。
+
+    曾经的判据是 ``name in _BACKENDS or name == "trae"`` —— 它漏掉「和 trae 一样
+    按需构造、但还没被触碰过」的后端：那份凭据会被**静默交给默认后端**解析，
+    类型不对却不报错。这正是「加后端零改动」最容易悄悄破掉的地方，而行为测试
+    全绿（当前只有两个后端时完全正常）。
+    """
+    import json
+
+    f = tmp_path / "a.info"
+    f.write_text(json.dumps({"backend": "lazyfake", "auth": {}, "account": {}}), encoding="utf-8")
+    # 分派到 _LazyFakeBackend.make_credential（返回 None），而不是默认后端的管理器。
+    assert registry.make_credential(f) is None
+    # 尚未构造也能被路由（不是靠「已经构造过」）。
+    assert registry.backend_name_for("lazy/x") == "lazyfake"
+
+
+def test_make_credential_does_not_eagerly_construct_lazy_backend(lazy_backend, tmp_path):
+    """分派**不得**顺带把懒后端构造出来（trae 的私有协议只有真用到才该 import）。"""
+    import json
+
+    f = tmp_path / "a.info"
+    f.write_text(json.dumps({"backend": "nope", "auth": {}, "account": {}}), encoding="utf-8")
+    registry.make_credential(f)   # 未知后端 → 走默认
+    assert registry._BACKENDS.get("lazyfake") is None, "未知后端的分派不该顺手构造懒后端"
+
+
 def test_unknown_prefix_is_not_mistaken_for_a_backend():
     """只有**声明过的**前缀才路由；别的名字照常走默认后端。"""
     assert registry.backend_name_for("notfake/x") == "workbuddy"
@@ -248,6 +328,47 @@ def test_auto_checkin_participation_is_declared():
     """参与自动签到的后端由声明决定（可关掉）。"""
     assert registry.spec_for("workbuddy").supports_auto_checkin is True
     assert registry.spec_for("trae").supports_auto_checkin is True
+
+
+# --------------------------------------------------------------------------
+# 6. 上游错误的解释权归后端声明（pool 不得 import 后端模块去挑异常类）
+# --------------------------------------------------------------------------
+
+def test_upstream_error_class_resolves_from_declaration():
+    """声明的是**类名**，运行时从后端自己的模块取类。
+
+    给类名而不是类对象，是为了让 base/registry 不在顶部 import 各后端模块 ——
+    那会把 Trae 的整套私有协议拖进所有部署形态。这个测试同时守住两件事：
+    声明确实能被解析，且解析出的确实是该后端自己的异常类。
+    """
+    from core.backends.base import BackendHTTPError
+
+    # 默认实现：基类既有的通用异常。
+    assert BackendSpec().upstream_error_class() is BackendHTTPError
+    # Trae 声明了自己的 ug 接口异常（401/403 会被 pool 判为凭据失效）。
+    trae = registry.spec_for("trae")
+    assert trae.error_class_name == "TraeAPIError"
+    from core.backends.trae import TraeAPIError
+
+    assert trae.upstream_error_class() is TraeAPIError
+
+
+def test_only_account_ops_backend_implements_checkin_claim():
+    """签到报文的解释规则由**声明了 account_ops_backend 的后端**实现。
+
+    各家签到报文的形状是私有协议，没有通用默认值 —— 所以默认实现必须显式
+    拒绝（否则第三个后端会静默套用别人的规则，把失败读成成功）。
+    """
+    with pytest.raises(NotImplementedError):
+        BackendSpec().interpret_checkin_claim({"code": 0})
+
+    trae = registry.spec_for("trae")
+    ok, msg, retryable = trae.interpret_checkin_claim({"code": 0})
+    assert ok is True and retryable is False
+
+    # 可重试的上游拒绝码（9074/9004）→ 判为可重试。
+    ok, msg, retryable = trae.interpret_checkin_claim({"code": 9074, "message": "高峰限流"})
+    assert ok is False and retryable is True and "高峰" in msg
 
 
 def test_base_spec_defaults_are_the_plainest_backend():

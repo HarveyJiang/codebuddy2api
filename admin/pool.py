@@ -27,10 +27,8 @@ from admin.rotation import WAF_IP_WINDOW, WafIpGate, backoff_after, is_waf_error
 from core.backends.registry import (
     backend_name_for,
     default_name as default_backend,
-    known_names as known_backends,
     spec_for,
 )
-from core.backends.trae import TraeAPIError, interpret_checkin_claim
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 # 池中间件观察到的路由信息，交由外层 MetricsMiddleware 合并成一行 request_logs。
@@ -758,6 +756,7 @@ class AccountPool:
             if not item["enabled"] and action not in ("checkin", "status"):
                 return {"id": aid, "ok": False, "message": "账号已暂停，未执行操作"}
             manager = self.store.manager_for(aid, item)
+            spec = spec_for(item.get("backend", default_backend()))
             try:
                 if action == "refresh":
                     with manager._lock:
@@ -766,7 +765,7 @@ class AccountPool:
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
                 # 非默认后端（如 Trae）：刷新（上方）走各自凭据的刷新；积分/签到
                 # 走各自的上游接口。分派依据是后端**声明**的支持情况，不是后端名。
-                only = spec_for(item.get("backend", default_backend())).account_ops_backend
+                only = spec.account_ops_backend
                 if only is not None:
                     return self._operate_nondefault(aid, manager, action, only)
                 headers = manager.get_headers()
@@ -807,12 +806,15 @@ class AccountPool:
                 if e.status in (401, 403):
                     self.update(aid, cooldown_until=self.clock()+300)
                 return {"id": aid, "ok": False, "message": str(e)}
-            except TraeAPIError as e:
-                # Trae ug 接口失败：401/403＝凭据失效（冷却 + 标记待重新授权），其余原样暴露。
-                if e.status in (401, 403):
+            except spec.upstream_error_class() as e:
+                # 本后端自己的上游调用失败（如 Trae 的 ug 接口）：401/403＝凭据失效
+                # （冷却 + 标记待重新授权），其余原样暴露。
+                # 异常类从**本账号的后端声明**取，不硬写 trae —— 见 base.error_class_name。
+                label = spec.label
+                if getattr(e, "status", None) in (401, 403):
                     self.update(aid, auth_invalid=True, cooldown_until=self.clock() + 300,
-                                last_error="Trae 登录凭据已失效，请重新授权")
-                    return {"id": aid, "ok": False, "message": "Trae 登录凭据已失效，请重新授权"}
+                                last_error=f"{label} 登录凭据已失效，请重新授权")
+                    return {"id": aid, "ok": False, "message": f"{label} 登录凭据已失效，请重新授权"}
                 self.update(aid, last_error=str(e))
                 return {"id": aid, "ok": False, "message": str(e)}
             except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError):
@@ -853,7 +855,7 @@ class AccountPool:
                         confirmed = False
                         last_msg = "签到失败，请稍后再试"
                         for attempt in range(4):
-                            ok, msg, retryable = interpret_checkin_claim(manager.checkin_claim(client))
+                            ok, msg, retryable = spec_for(backend).interpret_checkin_claim(manager.checkin_claim(client))
                             if ok:
                                 confirmed = True
                                 break
@@ -945,7 +947,7 @@ class AccountPool:
                     except HTTPException:
                         pass
                     except Exception:
-                        # 关键隔离点：operate 对 Trae 账号会抛 TraeAPIError / JSON /
+                        # 关键隔离点：operate 对非默认后端账号会抛各自的上游异常 / JSON /
                         # 网络错误等任意异常。若只 catch HTTPException，一个坏掉的
                         # 字节账号会把**整轮 tick 打断**，排在其后的腾讯账号这轮既不
                         # 签到也不刷新——「加了字节不该影响腾讯」在这里被打破。

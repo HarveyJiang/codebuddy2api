@@ -75,6 +75,8 @@ pytest --durations=10         # 看谁最慢
    `@pytest.mark.real_catalog_check`。
    另外 `admin/pool.py` 的积分刷新/签到会真的打上游：写这类测试时用
    `client_factory` 注入 `httpx.MockTransport`（见 `tests/pool/test_account_pool.py`）。
+   要起一个「装了指定凭据、上游全打桩」的池，直接用 `tests/conftest.py` 的
+   `build_pool(tmp_path, [info 文件路径], handler)`，不必各自拼 Store + AccountPool。
 5. **同步等待要有明确的上界与放行点。** 测「A 必须等 B」时，先让 B 挂住、再启
    A，并断言「A 在 B 放行前**没有**返回」——只断言最终结果的话，A 在 B 开始前就
    返回（测试空跑）也照样通过。范例见

@@ -65,10 +65,6 @@ def strip_model_prefix(mid):
     return strip_prefix(mid)
 
 
-# 兼容旧名（models 表里存的就是带前缀的对外 id，历史上叫 TRAE_PREFIX）。
-TRAE_PREFIX = spec_for("trae").model_prefix
-
-
 def normalize_source(value):
     """收敛到三种来源之一；不认识的历史值当作上游。"""
     return value if value in (SOURCE_UPSTREAM, SOURCE_BUILTIN, SOURCE_CUSTOM) else SOURCE_UPSTREAM

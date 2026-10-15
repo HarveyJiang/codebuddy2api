@@ -171,6 +171,25 @@ def _uses_backend_identifier(line: str) -> str | None:
     return m.group(0) if m else None
 
 
+#: 调用方直接 import / __import__ 某一个后端的模块 —— 这也是按名字分派，
+#: 只是形态更隐蔽：它不一定出现 ``== "trae"``，但一样是「加第三个后端就要再改这里」，
+#: 而且更糟：它在 import 期就把那个后端的整套私有协议拖进来，破坏懒构造。
+#:
+#: 实例（真实踩过）：``from core.backends.trae import TraeAPIError`` 只为了给
+#: ``except`` 挑异常类。改成 ``spec.upstream_error_class()`` 后顶部 import 消失，
+#: 后端模块可以保持按需 import。
+_IMPORTS_BACKEND = re.compile(
+    r"\bfrom\s+core\.backends\.(?P<mod1>" + "|".join(BACKEND_NAMES) + r")\b"
+    r"|\bimport\s+core\.backends\.(?P<mod2>" + "|".join(BACKEND_NAMES) + r")\b"
+    r"|\bfrom\s+\.\s*import\s+(?P<mod3>" + "|".join(BACKEND_NAMES) + r")\b"
+)
+
+
+def _imports_backend_module(line: str) -> str | None:
+    m = _IMPORTS_BACKEND.search(line)
+    return m.group(0) if m else None
+
+
 def test_callers_do_not_branch_on_backend_name():
     """调用方不得用 ``== "trae"`` / ``in ("workbuddy", "trae")`` 判断后端。
 
@@ -216,6 +235,38 @@ def test_callers_do_not_use_backend_specific_names():
         + "\n  ".join(offenders)
         + "\n\n请改成通用名字（如 any_manager(backend) / _operate_nondefault(...)），"
           "确有例外时在该行加 `# arch-guard: ok`。"
+    )
+
+
+def test_callers_do_not_import_a_backend_module():
+    """调用方不得 import 某一个后端的模块 —— 那是「按名字分派」的隐藏形态。
+
+    它比 ``== "trae"`` 更难发现：代码里看不到后端名做判据，但「加第三个后端」
+    时仍然要回来改这里（再写一个 import）。而且它在 **import 期**就把那个后端的
+    整套私有协议（OAuth 流程、ExchangeToken 刷新、登录态解析）拖进了**所有**
+    部署形态，即便这个部署根本没用那个后端 —— registry 的懒构造设计（见
+    ``registry._load``）正是为了避免这件事。
+
+    正确做法：把「用这个后端的什么」声明成能力。
+    例如异常类 → ``BackendSpec.error_class_name`` / ``upstream_error_class()``。
+
+    注意 ``registry.py`` 自己**不在** CALLERS 里：它是唯一的注册与懒构造入口，
+    那里出现后端模块名是它的职责。
+    """
+    offenders = []
+    for rel, path in _caller_files():
+        if any(rel.startswith(a) for a in ALLOWED_FILES):
+            continue
+        for lineno, line, raw in _iter_code_lines(path):
+            if "arch-guard: ok" in raw:
+                continue
+            tok = _imports_backend_module(line)
+            if tok:
+                offenders.append(f"{rel}:{lineno}: {tok}   |   {line.strip()}")
+    assert not offenders, (
+        "调用方 import 了某一个后端的模块（加新后端时要改，且会破坏懒构造）：\n  "
+        + "\n  ".join(offenders)
+        + "\n\n请把差异声明成 BackendSpec 的能力；确实需要该模块时在 registry/后端内部取。"
     )
 
 

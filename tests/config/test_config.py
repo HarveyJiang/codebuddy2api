@@ -254,6 +254,42 @@ class DeploymentLayoutTests(unittest.TestCase):
             self.assertIn("ok", result.stdout)
 
 
+
+class LazyBackendImportTests(unittest.TestCase):
+    """导入 admin 侧模块**不得**顺带把 Trae 的私有协议拉进来。
+
+    这是 registry.py 顶部注释明写的设计约束：trae 那套（OAuth 流程、ExchangeToken
+    刷新、登录态解析）只在真用到时才 import。它极易被一行「顺手求值的模块级常量」
+    破坏 —— 例如 ``TRAE_PREFIX = spec_for("trae").model_prefix``，看着无害，
+    却让**所有部署形态**（含不启用 trae 的）在 import 时就构造 TraeBackend。
+
+    必须用子进程：本进程里 trae 早被其他用例 import 过了，测不出来。
+    """
+
+    def _run(self, imports):
+        code = ("import sys; " + "; ".join(f"import {m}" for m in imports) +
+                "; print('core.backends.trae' in sys.modules)")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("WORKBUDDY_")}
+        return subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                              capture_output=True, text=True)
+
+    def test_admin_models_import_does_not_pull_trae(self):
+        result = self._run(["admin.models"])
+        self.assertEqual(result.stdout.strip(), "False",
+                         "import admin.models 顺带构造了 TraeBackend —— "
+                         "检查有没有模块级 spec_for('trae')/trae_backend() 求值")
+
+    def test_admin_server_import_does_not_pull_trae(self):
+        result = self._run(["admin.server"])
+        self.assertEqual(result.stdout.strip(), "False",
+                         "import admin.server 顺带构造了 TraeBackend")
+
+    def test_registry_import_does_not_pull_trae(self):
+        result = self._run(["core.backends.registry"])
+        self.assertEqual(result.stdout.strip(), "False",
+                         "import registry 本身就该是懒的")
+
+
 if __name__ == "__main__":
     unittest.main()
 

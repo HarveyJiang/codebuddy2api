@@ -15,8 +15,6 @@ from fastapi import HTTPException
 from .base import BackendHTTPError, BackendSpec  # noqa: F401（re-export 便利）
 from .workbuddy import WorkBuddyBackend
 
-TRAE_PREFIX = "trae/"
-
 _BACKENDS: dict[str, BackendSpec] = {}
 
 
@@ -183,7 +181,11 @@ def make_credential(path):
         doc = {}
     if isinstance(doc, dict):
         name = doc.get("backend")
-        if name in _BACKENDS or name == "trae":
+        # 判据是「这个名字是不是已知后端」，**不是**「它是否已被构造」。
+        # 用 _BACKENDS 判断会漏掉懒构造的后端（还没被触碰过就不在表里），
+        # 于是那份凭据被静默交给默认后端解析 —— 类型不对但不报错，
+        # 正是「加后端零改动」最容易悄悄破掉的地方。
+        if name in known_names():
             return spec_for(name).make_credential(path)
     return spec_for(default_name()).make_credential(path)
 
