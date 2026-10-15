@@ -58,7 +58,21 @@ WAF_CODES = frozenset({"11128"})
 
 # 已知后端名。snapshot() 恒定列出这几个桶，好让管理页拿到**稳定**的结构——
 # 只列「碰巧出现过」的后端，前端就得处理桶随时出现/消失的情况。
-KNOWN_BACKENDS = ("workbuddy", "trae")
+#
+# 由注册表推导（registry.known_names）而不是写死元组：新增后端后 WAF 分桶自动跟上。
+# 这里是**函数**不是常量，因为注册表是懒构造的（trae 按需 import），
+# 模块导入期就求值会把 trae 拖进所有部署形态。
+def known_backends() -> tuple[str, ...]:
+    from core.backends.registry import known_names
+
+    return known_names()
+
+
+#: 默认后端名（账号未标 backend 时归到它），同样由注册表声明。
+def default_backend() -> str:
+    from core.backends.registry import default_name
+
+    return default_name()
 
 # WAF 拦截的文案兜底。**只作兜底**：主判据是结构化 code，上游改文案时
 # 结构化码还在；反过来只靠文案会在编解码差异下漏判。
@@ -134,7 +148,7 @@ class WafIpGate:
         self._until: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def note_waf(self, account_id, now=None, backend="workbuddy") -> bool:
+    def note_waf(self, account_id, now=None, backend=None) -> bool:
         """记一次某账号的 WAF 拦截；返回记账后该后端的 IP 级拦截是否激活。
 
         调用方据此 fail-fast 终止轮转（优先于退避等待）。
@@ -147,7 +161,7 @@ class WafIpGate:
         - 达到阈值才激活，并清空该桶的窗口：解除后需要全新的一批命中才能
           再次判定，不会拿旧账立刻重新触发。
         """
-        bucket = str(backend or "workbuddy")
+        bucket = str(backend or default_backend())
         current = float(now if now is not None else self._clock())
         with self._lock:
             if current < self._until.get(bucket, 0.0):
@@ -163,10 +177,10 @@ class WafIpGate:
                 return True
             return False
 
-    def active(self, now=None, backend="workbuddy") -> bool:
+    def active(self, now=None, backend=None) -> bool:
         """该后端的 IP 级拦截是否处于激活期。"""
         current = float(now if now is not None else self._clock())
-        bucket = str(backend or "workbuddy")
+        bucket = str(backend or default_backend())
         with self._lock:
             return current < self._until.get(bucket, 0.0)
 
@@ -197,6 +211,6 @@ class WafIpGate:
                         "window_seconds": int(self.window)}
             if backend is not None:
                 return one(str(backend))
-            return {"by_backend": {b: one(b) for b in KNOWN_BACKENDS},
+            return {"by_backend": {b: one(b) for b in known_backends()},
                     "threshold": self.threshold,
                     "window_seconds": int(self.window)}

@@ -960,8 +960,15 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         html = (await self.client.get("/admin/", headers={"Authorization": "Bearer " + API}))
         # /admin/ 需要管理会话吗？静态页直接返回
         assert html.status_code in (200, 401)
-        index = CONFTEST_ROOT / "admin" / "static" / "index.html"
-        assert 'id="mode-trae"' in index.read_text(encoding="utf-8")
+        index = (CONFTEST_ROOT / "admin" / "static" / "index.html").read_text(encoding="utf-8")
+        # 需求 2 之后登录方式按钮**由后端注册表渲染**，index.html 不再写死后端名。
+        # 静态页只需保证容器与面板还在（面板是纯 UI，与后端名无关）。
+        assert 'id="account-modes"' in index
+        assert 'id="trae-login-panel"' in index
+        assert 'id="mode-trae"' not in index, "登录按钮应由 GET /admin/api/backends 渲染，不该写死在 HTML 里"
+        # 渲染来源仍在（app.js 按 login_kind 生成按钮）。
+        app_js = (CONFTEST_ROOT / "admin" / "static" / "app.js").read_text(encoding="utf-8")
+        assert "function renderLoginModes()" in app_js
 
     # ---- 本机接收器（免复制粘贴） ----
 
@@ -1641,7 +1648,7 @@ def _registry(clock=None):
 
 def test_registry_trae_builtin_seed_and_disable():
     reg = _registry()
-    reg.ensure_trae_builtin()
+    reg.ensure_static_catalog("trae")
     ids = reg.snapshot_ids()
     assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 20
     enabled = reg.enabled_models()
@@ -1670,28 +1677,28 @@ def test_registry_trae_builtin_seed_and_disable():
 
 def test_registry_refresh_trae_models_replaces_builtin():
     reg = _registry()
-    reg.ensure_trae_builtin()
+    reg.ensure_static_catalog("trae")
 
     class FakeManager:
         def fetch_models(self):
             return [{"id": "dyn-a", "name": "DynA", "context_length": 2048},
                     {"id": "dyn-b", "name": "DynB", "context_length": 4096}]
 
-    reg.trae_credential_getter = lambda: FakeManager()
-    assert reg.refresh_trae_models() is True
+    reg.backend_credential_getter = lambda _b: FakeManager()
+    assert reg.refresh_catalog("trae") is True
     ids = {i for i in reg.snapshot_ids() if i.startswith("trae/")}
     assert ids == {"trae/dyn-a", "trae/dyn-b"}  # 静态兜底表被动态表替换
-    assert reg.trae_entries()[0] == {"id": "dyn-a", "name": "DynA", "context_length": 2048}
+    assert reg.catalog_entries("trae")[0] == {"id": "dyn-a", "name": "DynA", "context_length": 2048}
     # 失败保留上次快照
     class Boom:
         def fetch_models(self):
             raise T.TraeAPIError("boom", status=500)
-    reg.trae_credential_getter = lambda: Boom()
-    assert reg.refresh_trae_models() is False
+    reg.backend_credential_getter = lambda _b: Boom()
+    assert reg.refresh_catalog("trae") is False
     assert {i for i in reg.snapshot_ids() if i.startswith("trae/")} == {"trae/dyn-a", "trae/dyn-b"}
     # 无 Trae 账号 → 静默保留
-    reg.trae_credential_getter = lambda: None
-    assert reg.refresh_trae_models() is False
+    reg.backend_credential_getter = lambda _b: None
+    assert reg.refresh_catalog("trae") is False
     assert "trae/dyn-a" in reg.snapshot_ids()
 
 
@@ -1703,8 +1710,8 @@ def test_registry_trae_credits_reach_snapshot():
         def fetch_models(self):
             return [{"id": "glm-5.3", "name": "GLM-5.3", "context_length": 200000, "credits": 0.39}]
 
-    reg.trae_credential_getter = lambda: FakeManager()
-    assert reg.refresh_trae_models() is True
+    reg.backend_credential_getter = lambda _b: FakeManager()
+    assert reg.refresh_catalog("trae") is True
     rows = {m["id"]: m for m in reg.snapshot()["models"]}
     row = rows["trae/glm-5.3"]
     assert row["backend"] == "trae" and row["credits"] == 0.39
@@ -1714,7 +1721,7 @@ def test_registry_trae_credits_reach_snapshot():
 def test_registry_kill_switch_hides_trae(monkeypatch):
     import os
     reg = _registry()
-    reg.ensure_trae_builtin()
+    reg.ensure_static_catalog("trae")
     monkeypatch.setenv("CODEBUDDY_ENABLE_TRAE", "0")
     assert all(not m.startswith("trae/") for m in reg.enabled_models())
     assert all(m.get("backend") != "trae" for m in reg.snapshot()["models"])

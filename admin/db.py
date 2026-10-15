@@ -153,7 +153,35 @@ def _v7_to_v8(db):
                  AND EXISTS (SELECT 1 FROM accounts WHERE accounts.id = request_logs.account_id)""")
 
 
-SCHEMA_VERSION = 8
+def _v8_to_v9(db):
+    """v8 → v9：给 models 补 synced_at（每个后端的「上次拉取时刻」）。
+
+    为什么要单独一列而不是继续用 settings.models_updated：settings 是一行固定列
+    的表（SETTINGS_COLUMNS），后端数量是可变的，没法为每个后端各留一列。把
+    「这份目录什么时候同步的」放在**目录行自己**身上，加后端时不用动 schema。
+
+    回填：用 settings.models_updated 填已存在的行 —— 对默认后端那是**准确**的
+    （历史上只有它一份目录）；其它后端的行填 0（「从没记过」），下次拉取就会写上
+    真实时刻，语义是「未知」而不是「很久以前」。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(models)")}
+    if "synced_at" not in columns:
+        db._write.execute("ALTER TABLE models ADD COLUMN synced_at INTEGER NOT NULL DEFAULT 0")
+        # settings 是**一行宽表**（id=1 + 各字段一列），不是 key/value 表。
+        rows = db._write.execute("SELECT models_updated FROM settings WHERE id=1").fetchone()
+        updated = 0
+        if rows and rows[0] is not None:
+            try:
+                updated = int(rows[0])
+            except (TypeError, ValueError):
+                updated = 0
+        if updated:
+            # 带前缀的行（其它后端）历史上没有独立的同步时刻，保持 0（语义为「未知」）。
+            db._write.execute("UPDATE models SET synced_at=? WHERE model_id NOT LIKE '%/%'",
+                              (updated,))
+
+
+SCHEMA_VERSION = 9
 
 MICRO = 1_000_000
 
@@ -192,7 +220,7 @@ KEY_COLUMNS = (
 
 MODEL_COLUMNS = (
     "name", "description", "credits_micro", "max_input_tokens", "source", "available",
-    "enabled", "sort_order", "promo",
+    "enabled", "sort_order", "promo", "synced_at",
 )
 
 LOG_COLUMNS = (
@@ -331,7 +359,8 @@ class Database:
             credits_micro INTEGER, max_input_tokens INTEGER,
             source TEXT NOT NULL DEFAULT 'builtin',
             available INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
-            sort_order INTEGER NOT NULL DEFAULT 0, promo TEXT)""",
+            sort_order INTEGER NOT NULL DEFAULT 0, promo TEXT,
+            synced_at INTEGER NOT NULL DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS request_logs (
             id INTEGER PRIMARY KEY,
             time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api', path TEXT NOT NULL,
@@ -499,7 +528,7 @@ class Database:
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
-                  (8, _v7_to_v8))
+                  (8, _v7_to_v8), (9, _v8_to_v9))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -553,9 +582,18 @@ class Database:
                 (1, *(values.get(column) for column in self.SETTINGS_COLUMNS)))
 
     def update_settings(self, values):
+        """局部更新设置行；**行不存在时补建**（不是静默不生效）。
+
+        原实现是裸 UPDATE：settings 行尚未建立时它匹配 0 行、静默成功返回，
+        调用方以为写进去了。任何在「首次 save_settings 之前」写设置的路径
+        （如模型目录 persist）都会踩到 —— 数据看起来「偶尔丢失」，最难查。
+        改 UPSERT：先保证行存在，再更新传入的列。
+        """
         if not values:
             return
         with self.transaction():
+            self._write.execute(
+                "INSERT OR IGNORE INTO settings (id) VALUES (1)")
             self._write.execute(
                 f"UPDATE settings SET {', '.join(f'{k}=?' for k in values)} WHERE id=1",
                 tuple(values.values()))
@@ -683,7 +721,8 @@ class Database:
                          _to_int(item.get("max_input_tokens")) or None,
                          item.get("source") or "upstream",
                          _to_int(item.get("available"), 1), _to_int(item.get("enabled"), 1),
-                         _to_int(item.get("sort_order")), item.get("promo")))
+                         _to_int(item.get("sort_order")), item.get("promo"),
+                         _to_int(item.get("synced_at"))))
         with self.transaction():
             self._write.executemany(
                 f"INSERT INTO models ({', '.join(columns)}) VALUES ({marks})"

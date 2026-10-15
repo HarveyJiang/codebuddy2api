@@ -90,6 +90,8 @@ pytest --durations=10         # 看谁最慢
 node tests/frontend/fmttokens.test.mjs      # 积分/token 的整数展示口径
 node tests/frontend/modelgroup.test.mjs     # 同名模型跨后端的合并分组
 node tests/frontend/rendermodels.test.mjs   # 用真实 overview 数据渲染模型表
+node tests/frontend/pooltable.test.mjs      # 概览内联账号表：分页切片与行点击分派
+node tests/frontend/renderdashboard.test.mjs # 用真实 overview 数据渲染概览账号表与详情字段
 ```
 
 `rendermodels.test.mjs` 读一份 state.db（默认 `/tmp/opencode/v7fresh`，可用

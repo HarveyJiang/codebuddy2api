@@ -24,7 +24,12 @@ from admin.guards import (
 )
 from admin.reset_at import earliest_deadline, parse_reset_at, parse_retry_after
 from admin.rotation import WAF_IP_WINDOW, WafIpGate, backoff_after, is_waf_error
-from core.backends.registry import backend_name_for
+from core.backends.registry import (
+    backend_name_for,
+    default_name as default_backend,
+    known_names as known_backends,
+    spec_for,
+)
 from core.backends.trae import TraeAPIError, interpret_checkin_claim
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
@@ -227,7 +232,7 @@ class AccountPool:
                         filled = True
             for item in store.data["accounts"].values():
                 if "backend" not in item:
-                    item["backend"] = "workbuddy"
+                    item["backend"] = default_backend()
                     filled = True
             if filled:
                 store.keys_dirty = True
@@ -386,7 +391,7 @@ class AccountPool:
         def same_backend(entry):
             # 未指定 backend（老调用方/测试）时不过滤，保持原有行为。
             # 快照条目一律带 backend（models.snapshot 显式写入），缺失时按 workbuddy。
-            return backend is None or entry.get("backend", "workbuddy") == backend
+            return backend is None or entry.get("backend", default_backend()) == backend
 
         candidates = [entry for entry in snapshot.values()
                       if entry.get("enabled") and entry["id"] not in tried
@@ -458,7 +463,7 @@ class AccountPool:
                 if whitelist:
                     candidates = [row for row in candidates if row["id"] in whitelist]
             if backend is not None:
-                candidates = [row for row in candidates if row.get("backend", "workbuddy") == backend]
+                candidates = [row for row in candidates if row.get("backend", default_backend()) == backend]
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             routing = self._routing_for(kid)
@@ -646,12 +651,15 @@ class AccountPool:
             data = self.store.data["account_status"].setdefault(aid, {})
             data["request_count"] = data.get("request_count", 0) + 1
             data["last_request"] = int(self.clock())
-            backend = self.store.data["accounts"][aid].get("backend", "workbuddy")
-            if status == 404 and backend == "trae":
-                # Trae 404＝该 config_name 不存在/不可用：软冷却 10 分钟，不计入连续失败
-                # （账号本身通常是好的，不升级到 2h 硬冷却）。
-                data.update(cooldown_until=self.clock() + 600,
-                            last_error="模型不可用（404），已软冷却 10 分钟")
+            backend = self.store.data["accounts"][aid].get("backend", default_backend())
+            soft = spec_for(backend).soft_cooldown_for(status)
+            if soft is not None:
+                # 该状态码对这个后端是「软」的：模型/资源不可用，账号本身通常是好的。
+                # 只做有界冷却，不计入连续失败（否则会把好账号升级到 2h 硬冷却）。
+                # 具体冷却时长由后端自己声明（见 BackendSpec.soft_cooldown）。
+                minutes = max(1, int(soft) // 60)
+                data.update(cooldown_until=self.clock() + soft,
+                            last_error=f"模型不可用（{status}），已软冷却 {minutes} 分钟")
             elif status in (401, 403, 402, 429):
                 # 指数退避：连续失败翻倍冷却时长，上限 2 小时；成功请求重置计数。
                 fails = data.get("consecutive_fails", 0) + 1
@@ -756,9 +764,11 @@ class AccountPool:
                         manager._refresh()
                     self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
-                # Trae 账号：刷新（上方）走 ExchangeToken；积分/签到走 ug 接口。
-                if item.get("backend", "workbuddy") == "trae":
-                    return self._operate_trae(aid, manager, action)
+                # 非默认后端（如 Trae）：刷新（上方）走各自凭据的刷新；积分/签到
+                # 走各自的上游接口。分派依据是后端**声明**的支持情况，不是后端名。
+                only = spec_for(item.get("backend", default_backend())).account_ops_backend
+                if only is not None:
+                    return self._operate_nondefault(aid, manager, action, only)
                 headers = manager.get_headers()
                 if "workbuddy.ai" in str(headers.get("X-Domain", "")).lower():
                     return {"id": aid, "ok": False, "message": "当前仅支持国内账号积分与签到"}
@@ -811,11 +821,16 @@ class AccountPool:
                 self.update(aid, last_error=message)
                 return {"id": aid, "ok": False, "message": message}
 
-    def _operate_trae(self, aid, manager, action):
-        """Trae 账号的积分/签到：ug 接口（checkin_credits status/claim + ide_user_ent_usage）。
+    def _operate_nondefault(self, aid, manager, action, backend):
+        """非默认后端的积分/签到（目前即 Trae：ug 接口 checkin_credits + ide_user_ent_usage）。
 
         与 WorkBuddy 路径同构：先查签到状态 → 按需执行签到 → 拉积分余额。
         签到查询失败不阻断积分拉取（action=checkin 除外，必须显式报错）。
+
+        ``backend`` 由 BackendSpec.account_ops_backend 分派传入，本方法目前只有
+        Trae 一种实现（凭据管理器的 checkin_status / checkin_claim /
+        user_ent_usage 是 Trae 侧的能力）；第三个后端接入时按同样的接口实现，
+        pool 无需再改。
         """
         today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
         message = "积分状态已更新"
@@ -917,7 +932,7 @@ class AccountPool:
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
             # 自动签到覆盖两后端（WorkBuddy 走 billing，Trae 走 ug checkin_credits）。
-            due = [aid for aid, item in self.store.data["accounts"].items() if item.get("backend", "workbuddy") in ("workbuddy", "trae") and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
+            due = [aid for aid, item in self.store.data["accounts"].items() if spec_for(item.get("backend", default_backend())).supports_auto_checkin and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
         if cfg["auto_checkin"]:
             for aid in due:
                 _, due_time = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), 0)
@@ -1281,7 +1296,7 @@ class PoolMiddleware:
                        # 这条请求走的是哪条链路（trae / workbuddy）。取**实际选中的账号**
                        # 的 backend，而不是由模型名推导的值——轮转/降级之后两者可能不同，
                        # 记实际发生的事实才能用于事后排查。
-                       "backend": self.pool.store.data["accounts"].get(aid, {}).get("backend", "workbuddy"),
+                       "backend": self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend()),
                        "model_id": model_name, "model_name": model_name,
                        "error_code": None}
         # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
@@ -1344,7 +1359,7 @@ class PoolMiddleware:
                 # 与 account_id/account_name 同步刷新：切号后这条记录才是「实际用的那个号」。
                 # 排队切号已按后端隔离（try_select 传 backend），所以正常不会变；但一旦
                 # 哪天隔离被改坏，这里如实记录反而能让事后排查看到「打到了另一个后端」。
-                log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", "workbuddy")
+                log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
                 log_context["model_id"] = attempt_model
                 log_context["model_name"] = attempt_model
             # 每次尝试都要用新的 receive 闭包与新的 attempt_body（换模型时 body 变了）。
@@ -1406,7 +1421,7 @@ class PoolMiddleware:
                 {"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
         self.pool.flush()
 
-    def _note_waf_if_any(self, aid, outcome, backend="workbuddy"):
+    def _note_waf_if_any(self, aid, outcome, backend=None):
         """这次结果是否算 WAF/通道拦截？是则记账，返回该后端是否已激活。
 
         判据见 admin/rotation.py：结构化 code（11128）为主，403 需配合通道文案。

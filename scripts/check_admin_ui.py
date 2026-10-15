@@ -23,10 +23,16 @@ for ref in set(re.findall(r'\$\("([^"]+)"\)', js)):
 nav = set(re.findall(r'data-page="([^"]+)"', html))
 # 只认「页面容器」：id="page-xxx" 出现在 class="page-panel" 的元素上。
 panels = set(re.findall(r'id="page-([\w-]+)" class="page-panel"', html))
+# 需求 6 之后「账号池」并进概览：page-accounts 仍存在，但只是给旧深链
+# （#accounts）一个「已并入概览」的落地页，侧边栏不再有它。
+REDIRECT_PAGES = {"accounts"}
 if nav - panels:
     failures.append(f"有导航按钮但没有对应页面: {sorted(nav - panels)}")
-if panels - nav:
-    failures.append(f"有页面但没有导航入口: {sorted(panels - nav)}")
+if panels - nav - REDIRECT_PAGES:
+    failures.append(f"有页面但没有导航入口: {sorted(panels - nav - REDIRECT_PAGES)}")
+# 反向：redirect 页不该再出现在侧边栏（需求 6 明确要求移除）。
+if REDIRECT_PAGES & nav:
+    failures.append(f"侧边栏不应再有这些页签: {sorted(REDIRECT_PAGES & nav)}")
 
 # 3) labels 里必须给每个页面写好标题/眉题/说明，否则 goPage 解构会 undefined。
 labels = dict(re.findall(r'^\s*(\w+): \[("[^"]*", ){0,1}', js, re.M))
@@ -35,8 +41,8 @@ if not label_block:
     failures.append("找不到 labels 定义")
 else:
     defined = set(re.findall(r"^\s*(\w+):", label_block.group(1), re.M))
-    if panels - defined:
-        failures.append(f"页面缺少 labels 条目: {sorted(panels - defined)}")
+    if panels - defined - REDIRECT_PAGES:
+        failures.append(f"页面缺少 labels 条目: {sorted(panels - defined - REDIRECT_PAGES)}")
 
 # 4) 设置页必须真的装了那些设置控件，别只搬了标题把控件落在账号池页。
 settings_panel = re.search(r'<section id="page-settings".*?</section>', html, re.S)
@@ -60,6 +66,9 @@ if accounts_panel:
     for element in ("auto-checkin", "queue-failover", "backup-enabled", "pool-routing"):
         if f'id="{element}"' in accounts_panel.group(0):
             failures.append(f"账号池页仍残留设置控件: {element}")
+    # 需求 6：账号池并进概览后，这一页只该是一句「已并入概览」的说明。
+    if 'id="accounts-body"' in accounts_panel.group(0):
+        failures.append("账号池页仍留着账号表格 —— 它应该只在概览里")
 else:
     failures.append("找不到 page-accounts 区块")
 

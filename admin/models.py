@@ -21,8 +21,14 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from core.backends import trae as trae_backend
-from core.backends.registry import trae_enabled
+from core.backends.registry import (
+    backend_name_for,
+    default_name as default_backend,
+    is_enabled as is_backend_enabled,
+    known_names as known_backends,
+    spec_for,
+    strip_prefix,
+)
 
 BACKEND = "https://copilot.tencent.com"
 ORIGIN = "https://www.codebuddy.cn"
@@ -42,8 +48,25 @@ REFRESH_INTERVAL = 6 * 3600
 SOURCE_UPSTREAM = "upstream"
 SOURCE_BUILTIN = "builtin"
 SOURCE_CUSTOM = "custom"
-# Trae 第二后端模型在 models 表与对外的 id 前缀（内存里存 bare id）。
-TRAE_PREFIX = "trae/"
+
+
+def backend_for_model_id(mid):
+    """对外模型 id → 所属后端名（按各后端声明的前缀）。
+
+    取代原先散落各处的 ``mid.startswith("trae/")`` 判断：前缀是后端自己的声明，
+    加后端时这里不用改。
+    """
+    name = backend_name_for(mid)
+    return name
+
+
+def strip_model_prefix(mid):
+    """对外模型 id → bare id（内存里各后端目录用的键）。"""
+    return strip_prefix(mid)
+
+
+# 兼容旧名（models 表里存的就是带前缀的对外 id，历史上叫 TRAE_PREFIX）。
+TRAE_PREFIX = spec_for("trae").model_prefix
 
 
 def normalize_source(value):
@@ -70,32 +93,165 @@ def _label(model):
 
 
 class ModelRegistry:
-    def __init__(self, get_credential=None, clock=time.time, trae_credential_getter=None):
-        """get_credential: callable returning a manager whose get_headers() yields auth headers.
-        trae_credential_getter: callable returning a TraeCredentialManager (dynamic Trae catalog)."""
+    """模型目录：**每个后端各持一份**。
+
+    内存结构是 ``_catalogs[backend] = {bare_id: info}`` + 每份的 available/disabled/
+    updated/error。默认后端（workbuddy）与 Trae 对称存放，加第三个后端时这里一行不用改
+    —— 结构从 ``BackendSpec`` 的后端列表上长出来。
+
+    对外的 id 带后端前缀（``trae/glm-5.2``）以便客户端路由；内存里存 bare id。
+    """
+
+    def __init__(self, get_credential=None, clock=time.time, backend_credential_getter=None):
+        """get_credential: callable returning a manager whose get_headers() yields auth headers
+        （默认后端的目录凭据）。
+        backend_credential_getter: ``callable(backend_name) -> manager``，非默认后端的
+        目录凭据。取代了原先写死的 ``trae_credential_getter`` —— 加第三个后端时
+        server 不用再传一个专用函数进来。
+        """
         self.get_credential = get_credential
-        self.trae_credential_getter = trae_credential_getter
+        self.backend_credential_getter = backend_credential_getter
         self.clock = clock
         # RLock: snapshot() 持锁调用 active_promo()，后者经模块级引用回到
         # promotions 属性再次取锁，非重入锁会自死锁，导致 /admin/api/overview
         # 永久挂起（登录成功但账号/模型全部加载不出）。
         self._lock = threading.RLock()
-        self._catalog = {}      # id -> {name, description, credits, max_input_tokens, source}
-        self._available = []    # ordered ids from the upstream cli agent
-        self._disabled = set()  # user-disabled ids
-        # 用户手工添加的模型 id。上游菜单不一定列全（灰度、区域差异、菜单滞后），
-        # 这些模型上游没返回但仍可调用，必须跨 fetch() 存活。
-        self._custom = set()
         self._promotions = []   # dynamic discounts parsed from the product config
-        self._updated = 0
-        self._error = None
-        # Trae 第二后端模型目录：bare config_name 存储，对外以 `trae/` 前缀暴露。
-        self._trae_catalog = {}      # id -> {name, description, credits, max_input_tokens, source}
-        self._trae_available = []    # ordered bare ids
-        self._trae_disabled = set()  # user-disabled bare ids
-        self._trae_updated = 0
-        self._trae_error = None
+        # backend -> 目录状态。默认后端也用同一个结构（不再有「主目录 + trae 附录」）。
+        self._state: dict[str, dict] = {}
+        self._default = default_backend()
+        for name in known_backends():
+            self._ensure_state(name)
         _registry_ref[0] = self
+
+    # -- per-backend catalog state -----------------------------------------
+    def _ensure_state(self, backend):
+        st = self._state.get(backend)
+        if st is None:
+            st = self._state[backend] = {
+                "catalog": {},      # bare id -> {name, description, credits, max_input_tokens, source}
+                "available": [],    # ordered bare ids
+                "disabled": set(),  # user-disabled bare ids
+                "custom": set(),    # 用户手工添加的（只对默认后端有意义）
+                "updated": 0,
+                "error": None,
+            }
+        return st
+
+    def _state_for(self, backend):
+        return self._state.get(backend) or self._ensure_state(backend)
+
+    def credential_getter_for(self, backend):
+        """该后端拉目录用的凭据获取函数。
+
+        只有声明了 ``needs_own_credential_for_catalog`` 的后端才拿自己的账号；
+        其余（含默认后端）用 ``get_credential``。这样「拉目录要用哪个后端的账号」
+        完全由后端声明决定，admin 不写死任何后端名。
+        """
+        spec = spec_for(backend)
+        if spec.needs_own_credential_for_catalog and backend != self._default \
+                and self.backend_credential_getter is not None:
+            return lambda: self.backend_credential_getter(backend)
+        return self.get_credential
+
+    # -- 兼容层：默认后端的旧属性名 ---------------------------------------
+    # 既有代码/测试直接读写这些名字（默认后端的目录就是主目录）。语义不变；
+    # **新代码请用 _state_for(backend)**（多后端版本）。
+    def _default_state(self):
+        return self._state_for(self._default)
+
+    @property
+    def _catalog(self):
+        return self._default_state()["catalog"]
+
+    @_catalog.setter
+    def _catalog(self, value):
+        self._default_state()["catalog"] = value
+
+    @property
+    def _available(self):
+        return self._default_state()["available"]
+
+    @_available.setter
+    def _available(self, value):
+        self._default_state()["available"] = value
+
+    @property
+    def _disabled(self):
+        return self._default_state()["disabled"]
+
+    @_disabled.setter
+    def _disabled(self, value):
+        self._default_state()["disabled"] = value
+
+    @property
+    def _custom(self):
+        return self._default_state()["custom"]
+
+    @_custom.setter
+    def _custom(self, value):
+        self._default_state()["custom"] = value
+
+    @property
+    def _updated(self):
+        return self._default_state()["updated"]
+
+    @_updated.setter
+    def _updated(self, value):
+        self._default_state()["updated"] = value
+
+    @property
+    def _error(self):
+        return self._default_state()["error"]
+
+    @_error.setter
+    def _error(self, value):
+        self._default_state()["error"] = value
+
+    # Trae 侧的旧属性名，同样保留（历史代码/测试用）。
+    @property
+    def _trae_state(self):
+        return self._state_for("trae")
+
+    @property
+    def _trae_catalog(self):
+        return self._trae_state["catalog"]
+
+    @_trae_catalog.setter
+    def _trae_catalog(self, value):
+        self._trae_state["catalog"] = value
+
+    @property
+    def _trae_available(self):
+        return self._trae_state["available"]
+
+    @_trae_available.setter
+    def _trae_available(self, value):
+        self._trae_state["available"] = value
+
+    @property
+    def _trae_disabled(self):
+        return self._trae_state["disabled"]
+
+    @_trae_disabled.setter
+    def _trae_disabled(self, value):
+        self._trae_state["disabled"] = value
+
+    @property
+    def _trae_updated(self):
+        return self._trae_state["updated"]
+
+    @_trae_updated.setter
+    def _trae_updated(self, value):
+        self._trae_state["updated"] = value
+
+    @property
+    def _trae_error(self):
+        return self._trae_state["error"]
+
+    @_trae_error.setter
+    def _trae_error(self, value):
+        self._trae_state["error"] = value
 
     # -- persistence -------------------------------------------------------
     def load(self, db):
@@ -105,49 +261,49 @@ class ModelRegistry:
         否则 snapshot_ids() 会把它们算成「已知」，PoolMiddleware 就会把「上游已下线」
         误报成「管理页已禁用」而拒掉请求。
 
-        Trae 第二后端的模型与 WorkBuddy 同表存放，model_id 带 `trae/` 前缀（与
-        对外暴露的 id 一致），加载时剥前缀进 _trae_* 结构。
+        各后端的模型同表存放，model_id 带各自前缀（与对外暴露的 id 一致），
+        加载时按前缀分派到对应后端的目录。
         """
         with self._lock:
             # include_custom：手工添加的行可能 available=0（上游没返回它），
             # 只按 available=1 加载会让它们在重启后消失。
             rows = db.load_models(only_available=True, include_custom=True)
-            wb_rows = {mid: row for mid, row in rows.items()
-                       if not mid.startswith(TRAE_PREFIX)}
-            trae_rows = {mid: row for mid, row in rows.items()
-                         if mid.startswith(TRAE_PREFIX)}
-            self._catalog, self._available, self._custom = {}, [], set()
-            order_rows = sorted(wb_rows.items(),
-                                key=lambda kv: kv[1].get("sort_order", 0))
-            for mid, row in order_rows:
-                source = normalize_source(row.get("source"))
-                self._catalog[mid] = {"name": row.get("name") or mid,
-                                      "description": row.get("description"),
-                                      "credits": row.get("credits"),
-                                      "max_input_tokens": row.get("max_input_tokens"),
-                                      "source": source,
-                                      "_promo": row.get("promo")}
-                self._available.append(mid)
-                if source == SOURCE_CUSTOM:
-                    self._custom.add(mid)
-                if not row.get("enabled", 1):
-                    self._disabled.add(mid)
             settings = db.get_settings() or {}
-            self._updated = settings.get("models_updated", 0)
-            # Trae 目录：同表前缀行剥前缀恢复；禁用状态取 enabled=0。
-            self._trae_catalog, self._trae_available, self._trae_disabled = {}, [], set()
-            trae_order = sorted(trae_rows.items(),
-                                key=lambda kv: kv[1].get("sort_order", 0))
-            for mid, row in trae_order:
-                bare = mid[len(TRAE_PREFIX):]
-                self._trae_catalog[bare] = {"name": row.get("name") or bare,
-                                            "description": row.get("description"),
-                                            "credits": row.get("credits"),
-                                            "max_input_tokens": row.get("max_input_tokens"),
-                                            "source": normalize_source(row.get("source"))}
-                self._trae_available.append(bare)
-                if not row.get("enabled", 1):
-                    self._trae_disabled.add(bare)
+            for backend in list(self._state):
+                prefix = spec_for(backend).model_prefix
+                state = self._ensure_state(backend)
+                state["catalog"], state["available"], state["disabled"] = {}, [], set()
+                if backend == self._default:
+                    state["custom"] = set()
+                # 「上次拉取时刻」记在目录行自己身上（models.synced_at），
+                # 而不是 settings 的固定列 —— 后端数量是可变的，settings 留不出列。
+                state["updated"] = 0
+                # 带前缀的后端只吃自己的行；默认后端吃所有**没有别的前缀**的行。
+                own = {mid: row for mid, row in rows.items() if backend_for_model_id(mid) == backend}
+                order_rows = sorted(own.items(), key=lambda kv: kv[1].get("sort_order", 0))
+                for mid, row in order_rows:
+                    bare = mid[len(prefix):] if prefix else mid
+                    source = normalize_source(row.get("source"))
+                    state["catalog"][bare] = {"name": row.get("name") or bare,
+                                              "description": row.get("description"),
+                                              "credits": row.get("credits"),
+                                              "max_input_tokens": row.get("max_input_tokens"),
+                                              "source": source,
+                                              "_promo": row.get("promo") if backend == self._default else None}
+                    state["available"].append(bare)
+                    # 自定义只对默认后端有意义（见 add()）：别的后端目录完全由上游
+                    # 决定。非默认后端的自定义行不进 catalog，下次 persist 时会被标
+                    # 成 available=0 保留行（供 request_logs join），不再对外可见。
+                    if source == SOURCE_CUSTOM and backend == self._default:
+                        state["custom"].add(bare)
+                    if not row.get("enabled", 1):
+                        state["disabled"].add(bare)
+                    state["updated"] = max(state["updated"], int(row.get("synced_at") or 0))
+                # 默认后端的同步时刻另有 settings.models_updated 一条既有契约。
+                # 目录里一行都没有（拉过一次但上游返回空表）时，行上带不了这个值，
+                # 回落到 settings —— 否则重启后会被当成「从没拉过」而反复重拉。
+                if backend == self._default and not state["updated"]:
+                    state["updated"] = settings.get("models_updated", 0) or 0
 
     def persist(self, db):
         """把当前目录写回 models 表（UPSERT 不删行）。
@@ -160,46 +316,42 @@ class ModelRegistry:
         """
         with self._lock:
             rows = {}
-            tail = len(self._available)   # 不在 _available 的行从末尾开始编号，保持稳定
-            for mid, info in self._catalog.items():
-                # source 必须忠实写回：自定义项若被写成 upstream，重启后 _custom
-                # 就空了，下一次 fetch() 会把它当「上游已消失」而冲掉。
-                source = normalize_source(info.get("source"))
-                if mid in self._custom:
-                    source = SOURCE_CUSTOM
-                if mid in self._available:
-                    sort_order = self._available.index(mid)
-                else:
-                    # 同一序位会让 reload 时的相对顺序随机（sorted 稳定但输入无序）。
-                    tail += 1
-                    sort_order = tail
-                rows[mid] = {"name": info.get("name") or mid, "description": info.get("description"),
-                             "credits": info.get("credits"), "max_input_tokens": info.get("max_input_tokens"),
-                             "source": source,
-                             "available": 1 if mid in self._available else 0,
-                             "enabled": 0 if mid in self._disabled else 1,
-                             "sort_order": sort_order,
-                             "promo": info.get("_promo")}
-            # 上次标记 available 的、这次 catalog 里已不在的：写 available=0 保留行。
-            trae_tail = len(self._trae_available)
-            for bare, info in self._trae_catalog.items():
-                mid = TRAE_PREFIX + bare
-                if bare in self._trae_available:
-                    sort_order = self._trae_available.index(bare)
-                else:
-                    trae_tail += 1
-                    sort_order = trae_tail
-                rows[mid] = {"name": info.get("name") or bare,
-                             "description": info.get("description"),
-                             "credits": info.get("credits"),
-                             "max_input_tokens": info.get("max_input_tokens"),
-                             "source": normalize_source(info.get("source")),
-                             "available": 1 if bare in self._trae_available else 0,
-                             "enabled": 0 if bare in self._trae_disabled else 1,
-                             "sort_order": sort_order,
-                             "promo": None}
+            for backend in list(self._state):
+                state = self._ensure_state(backend)
+                prefix = spec_for(backend).model_prefix
+                catalog, available = state["catalog"], state["available"]
+                disabled, custom = state["disabled"], state["custom"]
+                # 不在 available 的行从末尾开始编号，保持稳定（同一序位会让 reload
+                # 时的相对顺序随机 —— sorted 稳定但输入无序）。
+                tail = len(available)
+                for bare, info in catalog.items():
+                    # source 必须忠实写回：自定义项若被写成 upstream，重启后 custom
+                    # 就空了，下一次 fetch() 会把它当「上游已消失」而冲掉。
+                    source = normalize_source(info.get("source"))
+                    if bare in custom:
+                        source = SOURCE_CUSTOM
+                    if bare in available:
+                        sort_order = available.index(bare)
+                    else:
+                        tail += 1
+                        sort_order = tail
+                    rows[prefix + bare] = {
+                        "name": info.get("name") or bare,
+                        "description": info.get("description"),
+                        "credits": info.get("credits"),
+                        "max_input_tokens": info.get("max_input_tokens"),
+                        "source": source,
+                        "available": 1 if bare in available else 0,
+                        "enabled": 0 if bare in disabled else 1,
+                        "sort_order": sort_order,
+                        "promo": info.get("_promo") if backend == self._default else None,
+                        # 每份目录的「上次拉取时刻」写在行上，重启后各后端各归各的。
+                        "synced_at": state["updated"],
+                    }
             db.save_models(rows)
-            db.update_settings({"models_updated": self._updated})
+            # settings.models_updated 继续写默认后端的值：它是既有对外契约
+            # （迁移回填与老版本读它），不能因为换列就断掉。
+            db.update_settings({"models_updated": self._state_for(self._default)["updated"]})
 
     # -- upstream fetch ----------------------------------------------------
     def fetch(self):
@@ -344,43 +496,63 @@ class ModelRegistry:
             self._available = [mid for mid in BUILTIN_ORDER if mid in self._catalog]
             self._updated = 0
 
-    # -- Trae 第二后端模型目录 ----------------------------------------------
-    def ensure_trae_builtin(self):
-        """无动态表时用 Trae 静态 32 条兜底（ Trae 后端恒在 /v1/models 可见）。"""
-        with self._lock:
-            if self._trae_available:
-                return
-            self._trae_catalog = {m["id"]: {"name": m["id"], "description": None, "credits": None,
-                                            "max_input_tokens": m.get("context_length"),
-                                            "max_context_length": m.get("max_context_length"),
-                                            "source": "builtin"}
-                                  for m in trae_backend.TRAE_STATIC_MODELS}
-            self._trae_available = [m["id"] for m in trae_backend.TRAE_STATIC_MODELS]
-            self._trae_updated = 0
+    # -- 各后端的静态兜底与动态刷新 ------------------------------------------
+    def ensure_static_catalog(self, backend):
+        """无动态目录时用该后端声明的 ``static_catalog`` 兜底。
 
-    def refresh_trae_models(self):
-        """拉取 Trae 动态模型表（get_detail_param，需一个启用的 Trae 账号）。
-
-        失败保留上次快照；从未拉到过则维持 builtin。返回是否拉到新表。
+        静态表由后端自己声明（``BackendSpec.static_catalog``），admin 不再知道
+        「Trae 有 20 条静态模型」这件事 —— 加后端时这里不用改。
+        默认后端的静态兜底是内置官方列表，走 ensure_builtin()。
         """
+        if backend == self._default:
+            self.ensure_builtin()
+            return
+        spec = spec_for(backend)
+        with self._lock:
+            state = self._ensure_state(backend)
+            if state["available"]:
+                return
+            state["catalog"] = {m["id"]: {"name": m.get("name") or m["id"],
+                                          "description": m.get("description"),
+                                          "credits": m.get("credits"),
+                                          "max_input_tokens": m.get("context_length"),
+                                          "max_context_length": m.get("max_context_length"),
+                                          "source": SOURCE_BUILTIN}
+                                for m in spec.static_catalog}
+            state["available"] = [m["id"] for m in spec.static_catalog]
+            state["updated"] = 0
+
+    def refresh_catalog(self, backend):
+        """拉取该后端的动态目录（需一个该后端的启用账号）。
+
+        失败保留上次快照；从未拉到过则维持静态兜底。返回是否拉到新表。
+        传输细节（打哪个接口、怎么鉴权）在后端自己那里，admin 只负责挑凭据、
+        存结果、算 updated/error —— 所以加后端时这个方法不用改。
+        """
+        spec = spec_for(backend)
+        if not spec.refreshable_catalog or not spec.catalog_method:
+            return False
+        getter = self.credential_getter_for(backend)
         manager = None
-        if self.trae_credential_getter is not None:
+        if getter is not None:
             try:
-                manager = self.trae_credential_getter()
+                manager = getter()
             except Exception:
                 manager = None
-        entries = None
-        if manager is not None:
-            try:
-                entries = manager.fetch_models()
-            except Exception as e:
-                with self._lock:
-                    self._trae_error = f"拉取失败：{type(e).__name__}"
-                return False
+        if manager is None:
+            return False
+        try:
+            entries = spec.fetch_catalog(manager)
+        except Exception as e:
+            with self._lock:
+                self._ensure_state(backend)["error"] = f"拉取失败：{type(e).__name__}"
+            return False
         if not entries:
             return False
         with self._lock:
+            state = self._ensure_state(backend)
             catalog = {}
+            order = []
             for e in entries:
                 mid = str(e.get("id") or "").strip()
                 if not mid:
@@ -390,91 +562,113 @@ class ModelRegistry:
                                 "credits": e.get("credits"),
                                 "max_input_tokens": e.get("context_length"),
                                 "max_context_length": e.get("max_context_length"),
-                                "source": "upstream"}
+                                "source": SOURCE_UPSTREAM}
+                order.append(mid)
             if not catalog:
                 return False
-            self._trae_catalog = catalog
-            self._trae_available = [str(e["id"]) for e in entries if str(e.get("id") or "") in catalog]
-            self._trae_disabled &= set(self._trae_available)
-            self._trae_updated = int(self.clock())
-            self._trae_error = None
+            state["catalog"] = catalog
+            state["available"] = order
+            # 上游已下线的模型不再保留禁用状态（重新上线时默认启用）。
+            state["disabled"] &= set(order)
+            state["updated"] = int(self.clock())
+            state["error"] = None
         return True
 
-    def trae_entries(self):
-        """供 core.backends.trae 目录提供者：bare id 列表（含被禁用的——禁用只挡客户端请求）。"""
+    def catalog_entries(self, backend):
+        """供后端自己的目录提供者用：bare id 列表（含被禁用的 —— 禁用只挡客户端请求）。"""
         with self._lock:
-            return [{"id": mid, "name": (self._trae_catalog.get(mid) or {}).get("name") or mid,
-                     "context_length": (self._trae_catalog.get(mid) or {}).get("max_input_tokens") or 131072}
-                    for mid in self._trae_available if mid in self._trae_catalog]
+            state = self._state_for(backend)
+            return [{"id": mid,
+                     "name": (state["catalog"].get(mid) or {}).get("name") or mid,
+                     "context_length": (state["catalog"].get(mid) or {}).get("max_input_tokens") or 131072}
+                    for mid in state["available"] if mid in state["catalog"]]
 
     # -- queries -----------------------------------------------------------
     def snapshot(self):
         """Full catalog with management flags and current promo, for the admin UI.
 
-        排序规则：启用的在前、禁用的在后；同组内按单价（credits）升序，
-        None（按标准计费）视为 0，与免费模型并列最前。
-        Trae 模型固定排在 WorkBuddy 之后（backend="trae"），组内启用在前。
+        排序规则：按后端（注册表顺序，默认后端在最前）；每个后端内启用的在前、
+        禁用的在后；同组内按单价（credits）升序，None（按标准计费）视为 0，
+        与免费模型并列最前。
+
+        后端顺序来自注册表声明，不再是「默认后端 + 追加 Trae」的写死两段式。
         """
         now = datetime.now(CN)
+        models = []
+        updated, error = 0, None
         with self._lock:
-            models = []
-            for mid in self._available:
-                if mid not in self._catalog:
+            for backend in known_backends():
+                if not is_backend_enabled(backend):
                     continue
-                entry = dict(self._catalog[mid], id=mid, enabled=mid not in self._disabled,
-                             custom=mid in self._custom, backend="workbuddy")
-                entry["source"] = normalize_source(entry.get("source"))
-                stored = entry.pop("_promo", None)
-                # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
-                # 在读取时算，两者不一致时以内置表为准。
-                promo = active_promo(mid, now)
-                if promo and isinstance(entry.get("credits"), (int, float)):
-                    entry["promo"] = {"label": promo[0] or stored or "折扣", "factor": promo[1],
-                                      "credits": round(entry["credits"] * promo[1], 4)}
-                elif stored and isinstance(entry.get("credits"), (int, float)):
-                    entry["promo"] = {"label": stored, "factor": 1.0, "credits": entry["credits"]}
-                models.append(entry)
-            models.sort(key=lambda m: (
-                not m["enabled"],
-                m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,
-                self._available.index(m["id"]),
-            ))
-            if trae_enabled():
-                trae_models = []
-                for mid in self._trae_available:
-                    entry = self._trae_catalog.get(mid)
-                    if not entry:
+                state = self._state_for(backend)
+                prefix = spec_for(backend).model_prefix
+                available, catalog = state["available"], state["catalog"]
+                group = []
+                for bare in available:
+                    if bare not in catalog:
                         continue
-                    trae_models.append(dict(entry, id="trae/" + mid, backend="trae",
-                                            enabled=mid not in self._trae_disabled))
-                trae_models.sort(key=lambda m: not m["enabled"])
-                models.extend(trae_models)
-            return {"updated": self._updated, "error": self._error, "models": models}
+                    entry = dict(catalog[bare], id=prefix + bare,
+                                 enabled=bare not in state["disabled"],
+                                 backend=backend)
+                    if backend == self._default:
+                        entry["custom"] = bare in state["custom"]
+                    entry["source"] = normalize_source(entry.get("source"))
+                    stored = entry.pop("_promo", None)
+                    # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
+                    # 在读取时算，两者不一致时以内置表为准。
+                    promo = active_promo(prefix + bare, now)
+                    if promo and isinstance(entry.get("credits"), (int, float)):
+                        entry["promo"] = {"label": promo[0] or stored or "折扣", "factor": promo[1],
+                                          "credits": round(entry["credits"] * promo[1], 4)}
+                    elif stored and isinstance(entry.get("credits"), (int, float)):
+                        entry["promo"] = {"label": stored, "factor": 1.0, "credits": entry["credits"]}
+                    group.append(entry)
+                group.sort(key=lambda m: (
+                    not m["enabled"],
+                    m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,
+                    available.index(m["id"][len(prefix):] if prefix else m["id"]),
+                ))
+                models.extend(group)
+                if backend == self._default:
+                    updated, error = state["updated"], state["error"]
+            # updated/error 报告**默认后端**的刷新状态：管理页的「上次拉取」提示
+            # 说的是主目录；各后端的细节在各自的目录提供者里。
+            return {"updated": updated, "error": error, "models": models}
 
     def enabled_models(self):
-        """Ids available to API clients: upstream list minus user-disabled (+ Trae 前缀表)。"""
+        """Ids available to API clients: 各后端 enabled 的模型（带各自前缀）。"""
         with self._lock:
-            result = [mid for mid in self._available if mid not in self._disabled]
-            if trae_enabled():
-                result += ["trae/" + mid for mid in self._trae_available if mid not in self._trae_disabled]
-            return result
+            out = []
+            for backend in known_backends():
+                if not is_backend_enabled(backend):
+                    continue
+                state = self._state_for(backend)
+                prefix = spec_for(backend).model_prefix
+                out += [prefix + mid for mid in state["available"] if mid not in state["disabled"]]
+            return out
 
     def snapshot_ids(self):
         """All known ids (enabled + disabled), for distinguishing 'disabled' from 'unknown'."""
         with self._lock:
-            return set(self._available) | {"trae/" + mid for mid in self._trae_available}
+            out = set()
+            for backend in known_backends():
+                state = self._state_for(backend)
+                prefix = spec_for(backend).model_prefix
+                out |= {prefix + mid for mid in state["available"]}
+            return out
 
     def set_enabled(self, mid, enabled):
+        backend = backend_for_model_id(mid)
+        prefix = spec_for(backend).model_prefix
+        bare = mid[len(prefix):] if prefix else mid
         with self._lock:
-            if mid.startswith(TRAE_PREFIX):
-                bare = mid[len(TRAE_PREFIX):]
-                if bare not in self._trae_catalog and bare not in self._trae_available:
-                    raise KeyError(mid)
-                self._trae_disabled.discard(bare) if enabled else self._trae_disabled.add(bare)
+            state = self._state_for(backend)
+            if bare not in state["catalog"] and bare not in state["available"]:
+                raise KeyError(mid)
+            if enabled:
+                state["disabled"].discard(bare)
             else:
-                if mid not in self._catalog and mid not in self._available:
-                    raise KeyError(mid)
-                self._disabled.discard(mid) if enabled else self._disabled.add(mid)
+                state["disabled"].add(bare)
 
     def add(self, mid, enabled=True, **fields):
         """添加或更新一个模型。
@@ -487,26 +681,34 @@ class ModelRegistry:
           `fetch()` 会把它合并回来，不会冲掉。`available=1` 表示「用户认为它能用」。
 
         返回最终的 source。
+
+        自定义模型只对**默认后端**有意义：其它后端的目录完全由上游决定
+        （用户不该往 Trae 目录里塞一个上游没有的模型 —— 那个模型调不通）。
         """
+        backend = backend_for_model_id(mid)
+        prefix = spec_for(backend).model_prefix
+        bare = mid[len(prefix):] if prefix else mid
         with self._lock:
-            known = mid in self._catalog
-            source = normalize_source((self._catalog.get(mid) or {}).get("source"))
+            state = self._state_for(backend)
+            catalog, available = state["catalog"], state["available"]
+            known = bare in catalog
+            source = normalize_source((catalog.get(bare) or {}).get("source"))
             if not known:
                 source = SOURCE_CUSTOM
-                self._custom.add(mid)
-                self._available.append(mid)
-                self._catalog[mid] = {"source": SOURCE_CUSTOM}
-            entry = self._catalog[mid]
+                state["custom"].add(bare)
+                available.append(bare)
+                catalog[bare] = {"source": SOURCE_CUSTOM}
+            entry = catalog[bare]
             for key, value in fields.items():
                 if value is not None:
                     entry[key] = value
             if not entry.get("name"):
-                entry["name"] = mid
+                entry["name"] = bare
             entry["source"] = source
             if enabled:
-                self._disabled.discard(mid)
+                state["disabled"].discard(bare)
             else:
-                self._disabled.add(mid)
+                state["disabled"].add(bare)
             return source
 
     def remove(self, mid):
@@ -514,25 +716,35 @@ class ModelRegistry:
 
         上游模型删了没用：下一次 fetch() 会把它原地带回来，而且会让
         request_logs.model_id 的 join 断掉（表里保留 available=0 的行正是为此）。
-        自定义项必须同时从 _custom 移除，否则下次合并又把它加回来。
+        自定义项必须同时从 custom 移除，否则下次合并又把它加回来。
         """
+        backend = backend_for_model_id(mid)
+        prefix = spec_for(backend).model_prefix
+        bare = mid[len(prefix):] if prefix else mid
         with self._lock:
-            if mid not in self._catalog:
+            state = self._state_for(backend)
+            if bare not in state["catalog"]:
                 raise KeyError(mid)
-            if mid not in self._custom:
+            if bare not in state["custom"]:
                 raise ValueError("upstream")
-            self._custom.discard(mid)
-            self._catalog.pop(mid, None)
-            self._available = [x for x in self._available if x != mid]
-            self._disabled.discard(mid)
+            state["custom"].discard(bare)
+            state["catalog"].pop(bare, None)
+            state["available"] = [x for x in state["available"] if x != bare]
+            state["disabled"].discard(bare)
 
     def is_custom(self, mid):
+        backend = backend_for_model_id(mid)
+        prefix = spec_for(backend).model_prefix
+        bare = mid[len(prefix):] if prefix else mid
         with self._lock:
-            return mid in self._custom
+            return bare in self._state_for(backend)["custom"]
 
     def info(self, mid):
+        backend = backend_for_model_id(mid)
+        prefix = spec_for(backend).model_prefix
+        bare = mid[len(prefix):] if prefix else mid
         with self._lock:
-            return dict(self._catalog.get(mid) or {})
+            return dict(self._state_for(backend)["catalog"].get(bare) or {})
 
 
 # 官方元数据快照（/v3/config live 数据 + 官方 product.json）。cli 菜单模型在前，

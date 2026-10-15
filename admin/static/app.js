@@ -13,7 +13,7 @@ const creditsFmt = v => {
   return Math.floor(n).toLocaleString("zh-CN");
 };
 let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
-let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null, traeTimer = null, traeTick = null, traeBase = "", traeExpiresAt = 0, traeTotal = 600;
+let accountMode = "import", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null, traeTimer = null, traeTick = null, traeBase = "", traeExpiresAt = 0, traeTotal = 600;
 const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
@@ -70,23 +70,17 @@ function goPage(next) {
   if (next === "settings") loadBackups().catch(e => toast(e.message));
 }
 function render() {
-  const {accounts, keys, models, uptime, events} = overview;
+  const {accounts, keys, models, events} = overview;
+  renderLoginModes();
   const active = accounts.find(a => a.enabled && a.pool_state === "available") || accounts.find(a => a.enabled);
   paintVersion(overview.version?.label);
   renderDashboard();
-  $("account-count").textContent = accounts.length; $("account-badge").textContent = accounts.length;
-  const routing = overview.pool?.default_routing || "round_robin";
-  const routingLabel = {round_robin:"账号池轮转", random:"随机分配", expiry_first:"优先用完快过期积分"}[routing] || routing;
-  $("active-name").textContent = routingLabel;
-  $("active-state").textContent = "新请求按各密钥的分配策略选择账号，自动跳过暂停与冷却账号";
+  // 需求 6：账号池并进概览，账号表格（搜索/筛选/批量签到/逐账号操作）就长在概览里。
+  // 侧边栏不再有「账号池」页；下面这些元素都是概览页的。
+  $("dash-account-badge").textContent = accounts.length;
   $("test-account").textContent = "账号池轮转 · 自动选择可用账号";
-  $("uptime").textContent = uptime < 60 ? "已启动不到 1 分钟" : `持续运行 ${Math.floor(uptime / 3600)} 小时 ${Math.floor(uptime % 3600 / 60)} 分钟`;
   $("accounts-empty").hidden = accounts.length > 0;
   renderAccounts();
-  const count = status => accounts.filter(a => a.pool_state === status).length;
-  $("pool-counts").textContent = `全部 ${accounts.length}  ·  可用 ${count("available")}  ·  冷却 ${count("cooling")}  ·  暂停 ${count("paused")}  ·  耗尽 ${count("exhausted")}`;
-  const known = accounts.filter(a => a.remaining !== null && a.remaining !== undefined);
-  $("total-credits").textContent = known.length ? creditsFmt(known.reduce((s,a) => s + a.remaining, 0)) + (known.length < accounts.length ? "（部分）" : "") : "待查询";
   if (!$("pool-settings").contains(document.activeElement)) {
     $("pool-routing").value = overview.pool?.default_routing || "round_robin"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; $("sync-start").value = overview.pool?.sync_start || "10:00"; $("sync-end").value = overview.pool?.sync_end || "20:00";
     $("queue-failover").checked = overview.pool?.queue_failover || false; $("queue-model-fallback").checked = overview.pool?.queue_model_fallback !== false; $("queue-retry").value = overview.pool?.queue_retry ?? 3; $("queue-cooldown").value = overview.pool?.queue_cooldown ?? 120; $("queue-hold-ms").value = overview.pool?.queue_hold_ms ?? 3000; $("queue-fallback-model").value = overview.pool?.queue_fallback_model || "fast-model";
@@ -117,14 +111,24 @@ function render() {
   $("test-history").innerHTML = events.length ? events.map(e => `<div class="history-row"><span class="mono muted">${esc(stamp(e.time * 1000))}</span><strong>${esc(e.model)}</strong><span class="pill ${e.ok ? "green" : "red"}">${e.ok ? "成功" : "失败"}</span><span class="mono">${e.seconds}s</span></div>`).join("") : '<p class="history-empty">暂无测试记录，发送第一条测试消息。</p>';
 }
 // 后端元数据与徽标。**所有与后端名有关的显示都走这几个 helper**，不在各处写
-// `a.backend === "trae"`：将来加后端（如阿里千问办公）只需在此登记，页面各处不用动。
-// 图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
-const BACKEND_ICON = {workbuddy: "◈", trae: "⚡"};
-const BACKEND_NAME = {workbuddy: "WorkBuddy", trae: "Trae"};
-const backendIcon = b => BACKEND_ICON[b] || "◇";
-const backendName = b => BACKEND_NAME[b] || (b || "未知");
+// `a.backend === "trae"`：将来加后端（如阿里千问办公）只在后端侧新增一个类，
+// 页面各处不用动。
+//
+// 元数据来自 `GET /admin/api/backends`（服务端读后端注册表），**不在前端登记**：
+// 前端若自己留一张表，加了后端忘了同步就会静默显示成默认值——正是这次要消灭的
+// 那类 bug。图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
+let backends = [];
+function applyBackends(list) {
+  backends = (Array.isArray(list) ? list : []).slice()
+    .sort((a, b) => (a.order ?? 50) - (b.order ?? 50) || String(a.name).localeCompare(String(b.name)));
+}
+const backendMeta = b => backends.find(x => x.name === b) || null;
+const backendIcon = b => backendMeta(b)?.icon || "◇";
+const backendName = b => backendMeta(b)?.label || b || "未知";
 // 列表列宽窄时用短名（最近请求的后端列）。
-const backendLabel = b => ({workbuddy: "WB", trae: "Trae"}[b] || "—");
+const backendLabel = b => backendMeta(b)?.short || b || "—";
+// 后端在展示顺序里的序号；未知后端排在已知的后面（而不是插到最前）。
+const backendOrder = b => backendMeta(b)?.order ?? 50;
 
 // 请求行里的后端徽标；backend 取自**实际选中的账号**，老记录/账号已删显示「—」。
 function backendBadge(b) {
@@ -133,7 +137,7 @@ function backendBadge(b) {
 }
 // 带后端名的徽标（账号表、模型表用），形如「◈ WorkBuddy」。
 function backendTag(b) {
-  const key = b || "workbuddy";
+  const key = b || backends[0]?.name;
   return `<span class="mini-backend mini-${esc(key)}" title="${esc(backendName(key))} 账号">${esc(backendIcon(key))} ${esc(backendName(key))}</span>`;
 }
 
@@ -151,8 +155,8 @@ function renderModels() {
   $("models-body").innerHTML = groups.map(renderModelGroup).join("") || '<tr><td colspan="7" class="muted">模型列表为空，请点击「立即拉取」或手动添加。</td></tr>';
 }
 
-// 按「剥掉 trae/ 前缀后的模型名」归组：同名的不同后端合并到一组。
-// 组内保持 workbuddy 在前、其余按后端名排序，保证渲染顺序稳定。
+// 按「剥掉后端前缀后的模型名」归组：同名的不同后端合并到一组。
+// 组内保持默认后端在前、其余按注册表顺序，保证渲染顺序稳定。
 function groupModelsByName(list) {
   const byName = new Map();
   for (const m of list) {
@@ -160,13 +164,18 @@ function groupModelsByName(list) {
     if (!byName.has(key)) byName.set(key, {key, items: []});
     byName.get(key).items.push(m);
   }
-  const order = {workbuddy: 0, trae: 1};
   const groups = [...byName.values()];
-  for (const g of groups) g.items.sort((a, b) => ((order[a.backend] ?? 9) - (order[b.backend] ?? 9)) || a.id.localeCompare(b.id));
-  groups.sort((a, b) => (order[a.items[0].backend] ?? 9) - (order[b.items[0].backend] ?? 9) || a.key.localeCompare(b.key));
+  for (const g of groups) g.items.sort((a, b) => (backendOrder(a.backend) - backendOrder(b.backend)) || a.id.localeCompare(b.id));
+  groups.sort((a, b) => (backendOrder(a.items[0].backend) - backendOrder(b.items[0].backend)) || a.key.localeCompare(b.key));
   return groups;
 }
-const modelBaseName = id => String(id || "").replace(/^trae\//, "");
+// 模型 id 去掉后端前缀后的本名。前缀表来自注册表（后端可声明任意前缀），
+// 不再写死 `trae/`。
+function modelBaseName(id) {
+  let s = String(id || "");
+  for (const b of backends) if (b.prefix && s.startsWith(b.prefix)) s = s.slice(b.prefix.length);
+  return s;
+}
 
 // 某个同名组包含哪些条目 —— **渲染与批量操作共用这一处判断**。
 // 若两边各算一遍，将来改了归组规则就会「显示 2 条、只操作到 1 条」且界面不报错。
@@ -188,7 +197,7 @@ function renderModelGroup(g) {
   const anyEnabled = enabledCount > 0;
 
   // 后端标记：单后端直接打标；多后端在每个值前面标，读得出「哪个数属于哪个后端」。
-  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || "workbuddy")}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))} ${esc(backendLabel(m.backend))}</span>`;
+  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))} ${esc(backendLabel(m.backend))}</span>`;
 
   const creditsCell = multi
     ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span></div>`).join("")
@@ -227,9 +236,11 @@ function renderDashboard() {
   const fmt = value => Math.floor(Number(value)).toLocaleString("zh-CN");
   const rate = value => value === null || value === undefined ? "—" : value.toFixed(1) + "%";
   $("dash-available").textContent = accounts.filter(a=>a.pool_state === "available").length + " / " + accounts.length;
-  // 两后端积分是不同体系，分开汇总展示（WorkBuddy 积分 / Trae 积分）。
+  // 各后端积分是不同体系，分开汇总展示（如 WorkBuddy 积分 / Trae 积分）。
+  // 后端列表来自注册表：加后端后这里自动多一段，不必改代码。
   const known = accounts.filter(a=>typeof a.remaining === "number");
-  const parts = ["workbuddy","trae"].map(b => known.filter(a=>(a.backend||"workbuddy")===b)).filter(l=>l.length).map(l=>creditsFmt(l.reduce((s,a)=>s+a.remaining,0)));
+  const parts = backends.map(b => known.filter(a=>(a.backend || backends[0]?.name)===b.name))
+    .filter(l=>l.length).map(l=>creditsFmt(l.reduce((s,a)=>s+a.remaining,0)));
   $("dash-credits").textContent = parts.length ? parts.join("  ·  ") : "—";
   $("dash-credit-note").textContent = known.length < accounts.length ? `已查询 ${known.length}/${accounts.length} 个账号，余额可能不完整` : accounts.some(a=>a.credits_stale) ? "包含待刷新余额，以最近一次查询为准" : "以最近一次上游查询为准";
   $("dash-requests").textContent = fmt(m.completed || 0);
@@ -240,8 +251,6 @@ function renderDashboard() {
   $("dash-since").textContent = "统计开始于 " + stamp((m.started_at || 0)*1000);
   $("dash-routing").textContent = ({round_robin:"轮流分配请求，自动跳过不可用账号", random:"在可用账号中随机分配", expiry_first:"优先消耗最早到期的积分"}[overview.pool?.default_routing] || "按各密钥的分配策略选择账号");
   const states={available:"可用",paused:"已暂停",cooling:"冷却中",exhausted:"积分耗尽",invalid:"凭据异常"};
-  $("dash-account-list").innerHTML = accounts.slice(0,8).map(a=>`<div class="dashboard-account"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong>${a.nickname ? `<small class="cell-note">${esc(a.nickname)}</small>` : ""}</div><div class="dashboard-account-credit"><strong>${a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)}</strong><small class="cell-note">${esc(backendName(a.backend))} 积分</small></div><span class="pill ${a.pool_state === 'available' ? 'green' : 'amber'}">${states[a.pool_state] || '待查询'}</span></div>`).join("") || '<p class="history-empty">尚未添加账号，点击“添加账号”开始。</p>';
-  if(accounts.length > 8) $("dash-account-list").insertAdjacentHTML("beforeend",'<p class="muted">更多账号请前往账号池查看。</p>');
 }
 const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
 // 分配策略的图标与短名：列表里用「图标 + 短名」展示，编辑集中到设置弹框。
@@ -277,6 +286,8 @@ document.querySelectorAll("[data-dashboard-page]").forEach(b=>b.addEventListener
 $("dash-add").addEventListener("click",()=>openAccount());
 $("dash-base").textContent=location.origin+"/v1";
 $("dash-copy").addEventListener("click",()=>copy(location.origin+"/v1"));
+// 账号表的当前页与每页条数。与最近请求一样默认 10 条，选项 10/20/30/50。
+let accountPage = 0, accountPageSize = 10;
 function renderAccounts() {
   const query = $("account-search").value.toLowerCase(), filter = $("account-filter").value;  // 快过期的排前面：先按最早过期时间升序，再按状态严重度，最后按剩余积分升序。
   const severity = {invalid: 0, exhausted: 1, cooling: 2, paused: 3, available: 4};
@@ -290,22 +301,77 @@ function renderAccounts() {
       return (x.remaining ?? Infinity) - (y.remaining ?? Infinity);
     });
   const labels = {available:["可用","green"],cooling:["冷却中","amber"],paused:["已暂停",""],exhausted:["积分耗尽","amber"],invalid:["凭据异常","red"]};
-  $("accounts-body").innerHTML = rows.map(a => {
+  // 翻页：账号多时一屏放不下，搜索/筛选仍作用于**全部**账号（先筛后排再切片）。
+  const pages = Math.max(1, Math.ceil(rows.length / accountPageSize));
+  if (accountPage > pages - 1) accountPage = pages - 1;
+  if (accountPage < 0) accountPage = 0;
+  const pageRows = rows.slice(accountPage * accountPageSize, (accountPage + 1) * accountPageSize);
+  const pager = $("account-pager");
+  if (pager) {
+    pager.hidden = rows.length <= accountPageSize;
+    $("account-page-info").textContent = `第 ${accountPage + 1} / ${pages} 页 · 共 ${rows.length} 个`;
+    $("account-prev").disabled = accountPage === 0;
+    $("account-next").disabled = accountPage >= pages - 1;
+  }
+  $("accounts-body").innerHTML = pageRows.map(a => {
     const status = labels[a.pool_state] || ["待查询", ""];
     // 未查询过的账号 remaining 为 null。creditsFmt(null) 会得到 "0"，
     // 显示成「剩余积分 0」与真的耗尽无法区分 —— 明确显示「待查询」。
     const credits = a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining);
     const expiring = a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon);
     const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
-    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong>${backendTag(a.backend)}${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    // 账号类型图标（需求 5）：用后端注册表的 icon，而不是固定的首字母。
+    // 首字母在两个后端都可能一样时无法区分账号类型，这正是需求要解决的问题。
+    const kindIcon = `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${esc(backendIcon(a.backend))}</span>`;
+    // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<div><strong>${esc(a.name)}</strong>${backendTag(a.backend)}${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
-$("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
-$("account-filter").addEventListener("change", () => { if(overview) renderAccounts(); });
+$("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
+$("account-filter").addEventListener("change", () => { accountPage = 0; if(overview) renderAccounts(); });
+$("account-prev").addEventListener("click", () => { accountPage = Math.max(0, accountPage - 1); if(overview) renderAccounts(); });
+$("account-next").addEventListener("click", () => { accountPage += 1; if(overview) renderAccounts(); });
+$("account-page-size").addEventListener("change", e => { accountPageSize = Number(e.target.value) || 10; accountPage = 0; if(overview) renderAccounts(); });
+
+// 账号详情弹框（需求 6）：点账号行打开。**只读** —— 行内的操作按钮仍承担写操作，
+// 这里不重复一份，避免两条写路径各自漂移。
+function openAccountDetail(a) {
+  if (!a) return;
+  const yes = v => v === true ? "是" : v === false ? "否" : "—";
+  const stampOr = v => v ? stamp(v * 1000) : "—";
+  const rows = [
+    ["账号类型", `${backendIcon(a.backend)} ${backendName(a.backend)}`],
+    ["UID", a.uid || "—"],
+    ["昵称", a.nickname || "—"],
+    ["状态", a.pool_state || "—"],
+    ["剩余积分", a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)],
+    ["积分更新时间", stampOr(a.credits_updated)],
+    ["3 天内到期", a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon)],
+    ["最早一批过期", stampOr(a.earliest_expiry)],
+    ["预计过期浪费", a.expire_unused ? creditsFmt(a.expire_unused) : "—"],
+    ["日耗估算", a.daily_rate ? creditsFmt(a.daily_rate) : "—"],
+    ["预计用完天数", a.days_to_empty === null || a.days_to_empty === undefined ? "—" : String(a.days_to_empty)],
+    ["今日已签到", yes(a.today_checked_in)],
+    ["签到时段", a.checkin_slot ? `${a.checkin_slot} ${a.checkin_when || ""}` : "—"],
+    ["冷却至", a.cooldown_until > Date.now()/1000 ? stamp(a.cooldown_until*1000) : "—"],
+    ["排队让位至", a.queued_until > Date.now()/1000 ? stamp(a.queued_until*1000) : "—"],
+    ["凭据有效期", stamp(a.expires_at) + (a.expired ? "（已到期）" : "")],
+    ["调度权重", String(a.weight || 0)],
+    ["是否启用", yes(a.enabled)],
+    ["最近错误", a.last_error || "—"],
+  ];
+  $("account-detail-title").textContent = a.name || "账号详情";
+  $("account-detail-sub").textContent = `${backendName(a.backend)} 账号 · ${a.id}`;
+  $("account-detail-body").innerHTML = rows.map(([k, v]) =>
+    `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("");
+  $("account-detail-dialog").showModal();
+}
 async function refresh(loadCredits) {
   $("refresh").disabled = true;
   try {
     if (loadCredits) { try { await api("pool/refresh-credits", {method:"POST"}); } catch(e) {} }
+    // 后端元数据先于 overview：渲染函数全依赖它（图标/名称/顺序/前缀）。
+    try { applyBackends((await api("backends"))?.backends); } catch (e) { /* 旧版本服务无此接口，helper 会回落默认值 */ }
     overview = await api("overview"); render(); $("load-error").hidden = true;
     // 用量页的账号下拉依赖 overview，deep-link 进来时它还是 null，这里补一次。
     if (usageInitialized) fillUsageAccounts();
@@ -348,6 +414,10 @@ $("refresh").addEventListener("click", async () => {
   } else { refresh().catch(e=>toast(e.message)); }
 });
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
+$("dash-add").addEventListener("click", () => openAccount());
+$("dash-add-account").addEventListener("click", () => openAccount());
+$("empty-add").addEventListener("click", () => openAccount());
+$("accounts-back-dash").addEventListener("click", e => { e.preventDefault(); goPage("dashboard"); });
 $("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value)}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 
@@ -445,7 +515,6 @@ async function awaitRestart() {
 function showRestoreNotice() {
   if (!$("login").hidden) $("login-error").textContent = "数据库已恢复，请重新登录。";
 }
-$("go-guide").addEventListener("click", () => goPage("guide"));
 document.querySelectorAll(".close-dialog").forEach(b => b.addEventListener("click", () => b.closest("dialog").close()));
 function clearOAuth() {
   oauthGeneration++; clearTimeout(oauthTimer);
@@ -457,14 +526,45 @@ function clearOAuth() {
   $("oauth-status").textContent = "登录链接 5 分钟内有效。同一账号重新登录会更新凭据。";
   $("oauth-status").className = "banner oauth-status";
 }
+// 登录方式：**由后端注册表的 login_kind 声明驱动**（需求 2）。
+//
+// 这张表是纯 UI 映射 —— 「哪种登录流程对应哪个面板 DOM」，不含后端名。
+// 后端声明 login_kind="trae" 就渲染 Trae 授权面板；将来一个后端声明
+// login_kind="qwen" 时，这里加一条映射 + 一个面板即可，**不必改后端逻辑**。
+// 「导入文件」是通用兜底，任何后端都能用，永远渲染。
+const LOGIN_MODE_PANELS = {browser: "browser-login-panel", trae: "trae-login-panel", import: "file-import-panel"};
+const LOGIN_MODE_ICONS = {browser: "↗", trae: "⚡", import: "⇧"};
+const LOGIN_MODE_TITLES = {browser: "登录", trae: "授权", import: "导入文件"};
+const loginKinds = () => [...new Set([
+  ...backends.map(b => b.login_kind).filter(Boolean), "import"])];
+// 后端声明了 login_kind 才渲染它的登录按钮 —— 加后端时按钮自动出现。
+function renderLoginModes() {
+  const box = $("account-modes");
+  if (!box) return;
+  const kinds = loginKinds();
+  box.innerHTML = kinds.map(k => {
+    const owner = backends.find(b => b.login_kind === k);
+    const label = k === "import" ? "导入文件"
+      : `${LOGIN_MODE_ICONS[k] || "◆"} ${backendName(owner?.name)} ${LOGIN_MODE_TITLES[k] || ""}`.trim();
+    return `<button id="mode-${esc(k)}" type="button" aria-pressed="${k === accountMode}">${esc(label)}</button>`;
+  }).join("");
+  for (const k of kinds) {
+    const btn = $("mode-" + k);
+    if (btn) btn.addEventListener("click", () => setAccountMode(k));
+  }
+}
 function setAccountMode(mode) {
   clearOAuth(); clearTrae(); accountMode = mode;
-  $("browser-login-panel").hidden = mode !== "browser";
-  $("trae-login-panel").hidden = mode !== "trae";
-  $("file-import-panel").hidden = $("account-import").hidden = mode !== "file";
-  $("mode-browser").setAttribute("aria-pressed", String(mode === "browser"));
-  $("mode-trae").setAttribute("aria-pressed", String(mode === "trae"));
-  $("mode-file").setAttribute("aria-pressed", String(mode === "file"));
+  for (const [kind, panel] of Object.entries(LOGIN_MODE_PANELS)) {
+    const el = $(panel);
+    // 「导入文件」是通用兜底，任何后端都能用；其余按 login_kind 对号入座。
+    if (el) el.hidden = kind !== mode && !(kind === "import" && mode === "import");
+  }
+  $("file-import-panel").hidden = $("account-import").hidden = mode !== "import";
+  for (const kind of loginKinds()) {
+    const btn = $("mode-" + kind);
+    if (btn) btn.setAttribute("aria-pressed", String(kind === mode));
+  }
   $("account-error").textContent = "";
 }
 function stopTraeWait() { clearTimeout(traeTimer); clearInterval(traeTick); traeTimer = traeTick = null; }
@@ -507,9 +607,6 @@ function clearTrae() {
   $("trae-callback").value = ""; $("trae-submit").disabled = false;
   setTraeStatus("点击上方按钮生成登录链接，10 分钟内有效。");
 }
-$("mode-browser").addEventListener("click", () => setAccountMode("browser"));
-$("mode-trae").addEventListener("click", () => setAccountMode("trae"));
-$("mode-file").addEventListener("click", () => setAccountMode("file"));
 async function pollTrae() {
   if (!traeFlow) return;
   const flow = traeFlow;
@@ -573,7 +670,12 @@ $("trae-submit").addEventListener("click", async () => {
   } finally { $("trae-submit").disabled = false; }
 });
 $("account-dialog").addEventListener("close", () => { clearOAuth(); clearTrae(); $("account-form").reset(); $("file-label").textContent = "选择或拖入 .info / .json 文件"; $("account-error").textContent = ""; });
-function openAccount() { setAccountMode("browser"); $("account-dialog").showModal(); }
+function openAccount() {
+  // 默认选中「第一个有专属登录流程的后端」，没有就用通用的「导入文件」。
+  const first = backends.find(b => b.login_kind);
+  setAccountMode(first ? first.login_kind : "import");
+  $("account-dialog").showModal();
+}
 async function pollOAuth(generation) {
   if (generation !== oauthGeneration || !oauthFlow) return;
   const flow = oauthFlow;
@@ -611,7 +713,6 @@ $("oauth-start").addEventListener("click", async () => {
 });
 $("oauth-copy").addEventListener("click", () => { if (oauthFlow) copy(oauthFlow.url); });
 $("oauth-retry").addEventListener("click", () => { $("oauth-retry").hidden = true; pollOAuth(oauthGeneration); });
-$("add-account").addEventListener("click", openAccount); $("empty-add").addEventListener("click", openAccount);
 async function readFile(file) {
   if (!file) return;
   if (file.size > 1024 * 1024) throw new Error("文件超过 1 MB，请选择登录凭据文件");
@@ -623,7 +724,7 @@ $("file-drop").addEventListener("dragover", e => { e.preventDefault(); $("file-d
 $("file-drop").addEventListener("dragleave", () => $("file-drop").classList.remove("drag-over"));
 $("file-drop").addEventListener("drop", e => { e.preventDefault(); $("file-drop").classList.remove("drag-over"); readFile(e.dataTransfer.files[0]).catch(err => $("account-error").textContent = err.message); });
 $("account-form").addEventListener("submit", async e => {
-  if (accountMode !== "file") { e.preventDefault(); return; }
+  if (accountMode !== "import") { e.preventDefault(); return; }
   e.preventDefault(); e.submitter.disabled = true; $("account-error").textContent = "";
   try {
     let credential; try { credential = JSON.parse($("credential-json").value); } catch { throw new Error("请选择文件或粘贴有效的 JSON 内容"); }
@@ -662,7 +763,13 @@ function fmtTokens(n) {
 // 判据用 dialog.open，不引进新标记——回调关掉了就说明它接管了后续流程。
 $("confirm-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; const dialog = $("confirm-dialog"); try { await pendingConfirm(); if (!dialog.open) return; dialog.close(); await refresh(); toast("操作已保存"); } catch (err) { $("confirm-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 $("accounts-body").addEventListener("click", async e => {
-  const b = e.target.closest("[data-action]"); if (!b) return;
+  const b = e.target.closest("[data-action]");
+  if (!b) {
+    // 点行**空白处**打开详情弹框（需求 6）；点操作按钮仍执行操作，不弹框。
+    const tr = e.target.closest("tr[data-account]");
+    if (tr) openAccountDetail(overview.accounts.find(x => x.id === tr.dataset.account));
+    return;
+  }
   const a = overview.accounts.find(x => x.id === b.dataset.id); if (!a) return;
   if (["status","checkin","refresh"].includes(b.dataset.action)) {
     b.disabled = true;

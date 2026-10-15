@@ -366,9 +366,13 @@ def _find_workbuddy_product_json() -> Path | None:
     return None
 
 
-def _load_models_from_workbuddy() -> list[str]:
+def _load_models_from_workbuddy() -> list[str]:  # arch-guard: ok —— 读的是 WorkBuddy 自己的 product.json（该后端独有），不是分派入口
     """
     从本机 WorkBuddy product.json 读取模型列表。
+
+    名字里带后端名是**准确**的、也是必要的：它读的就是 WorkBuddy 桌面客户端
+    自己落盘的那份 product.json（路径与格式都是该后端独有的），不是「按后端名
+    分派」的入口。另一个后端不会、也不该用这个文件。加后端**不需要**改这里。
 
     过滤规则：
     1. 只保留聊天模型（排除 text-to-image, text-to-video 等）
@@ -435,7 +439,7 @@ def get_available_models() -> list[str]:
     Returns:
         模型 ID 列表
     """
-    workbuddy_models = _load_models_from_workbuddy()
+    workbuddy_models = _load_models_from_workbuddy()  # arch-guard: ok —— 见该函数定义处的说明
 
     if workbuddy_models:
         # 成功从 WorkBuddy 加载，使用动态列表
@@ -601,7 +605,10 @@ def _resolve_backend_or_http(model_raw) -> tuple:
     """
     backend, upstream_model = resolve_backend(model_raw)
     cred = _cred()
-    if getattr(cred, "backend_name", "workbuddy") != backend.name:
+    # 凭据-后端一致性闸门：不比后端**名字**，比双方声明的凭据归属
+    # （见 BackendSpec.credential_name / CredentialManager.backend_name）。
+    cred_backend = getattr(cred, "backend_name", None)
+    if cred_backend is not None and cred_backend != backend.credential_name():
         raise HTTPException(
             status_code=503,
             detail={
@@ -721,7 +728,7 @@ async def chat_completions(
     try:
         _, raw = await _post_backend_once(backend, headers, body, timeout=300)
         collected = await _collect_stream(
-            _aiter_str_lines(raw), keep_reasoning=backend.name == "trae"
+            _aiter_str_lines(raw), keep_reasoning=backend.keep_reasoning_delta
         )
     except BackendHTTPError as e:
         _log(
@@ -1621,7 +1628,7 @@ async def count_tokens(
 
     # Trae：SOLO 上游大概率不遵守 max_tokens=1，走真实请求会白烧生成额度（Claude Code
     # 每条消息前都调 count_tokens），默认本地 chars/4 估算；env 可逃生走上游。
-    if backend.name == "trae" and os.environ.get("CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM", "0") != "1":
+    if not backend.count_tokens_upstream and os.environ.get("CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM", "0") != "1":
         return {"input_tokens": _estimate_tokens(chat_body)}
 
     headers = cred.get_headers()

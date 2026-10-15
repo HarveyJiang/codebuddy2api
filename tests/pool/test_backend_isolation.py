@@ -202,6 +202,85 @@ class BackendIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.pool.queued(self.wb))
 
 
+    # -- 5. 软冷却按后端声明，不得串到别的后端 ------------------------------
+    def _record(self, aid, status):
+        """让池子记一次该账号的请求结果（走真实 record 路径）。"""
+        self.pool.record(aid, status=status)
+
+    #: 会触发「连续失败退避」的状态码（见 pool.record 的 elif 分支）。
+    HARD_FAIL_CODES = (401, 403, 402, 429)
+
+    def test_soft_cooldown_applies_only_to_declaring_backend(self):
+        """回归：Trae 的「404 软冷却 10 分钟」不得被套到腾讯账号上。
+
+        腾讯上游 404 的含义是「模型不存在」这类硬失败，历史上按**普通失败**处理。
+        若把软冷却写成全局规则（或写死 ``if status == 404``），腾讯账号会在一次
+        404 后被冷却、且不计入任何失败统计，真实故障被悄悄掩盖。
+        """
+        self._record(self.tr, 404)
+        self._record(self.wb, 404)
+        tr_state = self.store.data["account_status"][self.tr]
+        wb_state = self.store.data["account_status"][self.wb]
+
+        # Trae 由自己声明：404 → 软冷却 600s。
+        self.assertGreater(tr_state["cooldown_until"], self.now + 500)
+        self.assertFalse(tr_state.get("consecutive_fails"))
+
+        # 腾讯：不是软冷却（不声明就不生效），没有 10 分钟冷却。
+        self.assertLessEqual(wb_state.get("cooldown_until", 0), self.now,
+                             "Trae 的 404 软冷却串到腾讯账号上了")
+
+    def test_soft_cooldown_withholds_hard_backoff(self):
+        """软冷却必须是**软**的：同一个状态码在腾讯要退避，在 Trae 不退避。
+
+        这条与上一条互补 —— 上一条防「软冷却串到别的后端」，这条防
+        「软冷却被实现的像硬失败一样」（那样好账号会被指数退避到 2h）。
+        """
+        # 先用一个确定会触发硬退避的状态码，证明两个账号的退避通路都是通的。
+        for aid in (self.tr, self.wb):
+            self._record(aid, 429)
+            self.assertGreaterEqual(self.store.data["account_status"][aid]["consecutive_fails"], 1)
+
+        # 换新池子（干净状态）：Trae 的 404 不进连续失败，腾讯的 404 也只是普通失败。
+        self.store.data["account_status"] = {}
+        self._record(self.tr, 404)
+        self.assertFalse(self.store.data["account_status"][self.tr].get("consecutive_fails"))
+        self.assertGreater(self.store.data["account_status"][self.tr]["cooldown_until"], self.now)
+
+    def test_soft_cooldown_duration_comes_from_declaration(self):
+        """冷却时长必须是声明值（Trae 600s），不是散在代码里的魔数。"""
+        from core.backends.registry import spec_for
+
+        self._record(self.tr, 404)
+        state = self.store.data["account_status"][self.tr]
+        expected = spec_for("trae").soft_cooldown_for(404)
+        self.assertEqual(expected, 600)
+        self.assertAlmostEqual(state["cooldown_until"], self.now + expected, delta=1)
+
+    def test_hard_fail_codes_are_not_soft_for_trae(self):
+        """只有声明过的状态码是软的；Trae 的 429 仍走指数退避。"""
+        self._record(self.tr, 429)
+        state = self.store.data["account_status"][self.tr]
+        self.assertEqual(state.get("consecutive_fails"), 1)
+        self.assertGreater(state["cooldown_until"], self.now)
+
+    def test_account_ops_dispatch_follows_declaration(self):
+        """积分/签到的实现由 BackendSpec.account_ops_backend 决定，不是比后端名。"""
+        from core.backends.registry import spec_for
+
+        self.assertIsNone(spec_for("workbuddy").account_ops_backend,
+                          "默认后端走 pool 的默认实现（billing 接口）")
+        self.assertEqual(spec_for("trae").account_ops_backend, "trae")
+        # 池子确实按声明分派：Trae 账号打到 _operate_nondefault，腾讯不走那里。
+        calls = []
+        self.pool._operate_nondefault = lambda aid, mgr, action, backend: (
+            calls.append((aid, backend)), {"id": aid, "ok": True, "message": "x"})[1]
+        self.pool.operate(self.tr, "status")
+        self.assertEqual(calls, [(self.tr, "trae")])
+        self.pool.operate(self.wb, "status")
+        self.assertEqual(calls, [(self.tr, "trae")], "腾讯账号不该走非默认后端的实现")
+
+
 if __name__ == "__main__":
     unittest.main()
 

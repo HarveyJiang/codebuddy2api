@@ -113,32 +113,35 @@ TRAE_STATIC_MODELS = [
 ]
 
 # ---------------------------------------------------------------------------
-# 模型目录：动态表（get_detail_param）优先，静态 32 条兜底
+# 模型目录：动态表（get_detail_param）优先，静态兜底
+#
+# 目录状态属于 **TraeBackend 实例**（见该类的 catalog_entries / set_catalog_provider）：
+# 实例级而非模块级，避免同一进程建两个 app 时互相串。下面这个模块级函数保留给
+# 「拿不到实例」的调用点，副作用是它会构造/复用注册表里的那个单例。
 # ---------------------------------------------------------------------------
 
-_CATALOG_PROVIDER = None
+def trae_model_catalog() -> list[dict]:
+    """当前生效的 Trae 模型目录（动态优先，静态兜底）。
+
+    实例存在就用实例的（admin 注入过提供者）；否则回落到静态表 —— 这样在
+    没起 admin 的进程里（如纯协议单测）行为不变。
+    """
+    try:
+        from .registry import _BACKENDS
+
+        inst = _BACKENDS.get("trae")
+        if inst is not None:
+            return inst.catalog_entries()
+    except Exception:
+        pass
+    return TRAE_STATIC_MODELS
 
 
 def set_catalog_provider(provider):
-    """注入动态模型表提供者（admin ModelRegistry 用）。
+    """兼容旧入口：把提供者注入注册表里的 Trae 单例。"""
+    from .registry import trae_backend
 
-    provider: 无参 callable，返回 [{"id","name","context_length"}]（bare config_name）
-    或 None/空（回落静态表）。异常同样回落静态表。
-    """
-    global _CATALOG_PROVIDER
-    _CATALOG_PROVIDER = provider
-
-
-def trae_model_catalog() -> list[dict]:
-    """当前生效的 Trae 模型目录（动态优先，静态兜底）。"""
-    if _CATALOG_PROVIDER is not None:
-        try:
-            dynamic = _CATALOG_PROVIDER()
-        except Exception:
-            dynamic = None
-        if dynamic:
-            return list(dynamic)
-    return TRAE_STATIC_MODELS
+    trae_backend().set_catalog_provider(provider)
 
 
 class UnknownTraeModel(Exception):
@@ -1123,6 +1126,65 @@ class TraeBackend(BackendSpec):
     name = "trae"
     owned_by = "trae-solo"
     tencent_policies = False
+
+    # 路由前缀：`trae/<名>` → 本后端，剥前缀后 map_model 归一为上游 config_name。
+    model_prefix = "trae/"
+
+    # 管理页元数据（需求 2/5/7）
+    label = "Trae"
+    short = "Trae"
+    icon = "⚡"
+    color = "#7c4dff"
+    order = 1
+    login_kind = "trae"
+
+    # 凭据：Unix 秒级 expiresAt（归一为毫秒要 ×1000）。
+    credential_backend = "trae"
+    expires_at_to_ms = 1000
+
+    # 积分/签到走 ug 接口，由 pool 分派到本后端的实现（_operate_nondefault）。
+    account_ops_backend = "trae"
+
+    # 404＝该 config_name 不存在/不可用：软冷却 10 分钟、不计连续失败
+    # （账号本身通常是好的，不升级到 2h 硬冷却）。
+    soft_cooldown = {404: 600}
+
+    # 上游是私有协议：非流式聚合要保留 reasoning_content；count_tokens 走本地估算
+    # （SOLO 上游大概率不遵守 max_tokens=1，走真实请求会白烧生成额度）。
+    keep_reasoning_delta = True
+    count_tokens_upstream = False
+
+    # 模型目录：动态表（get_detail_param）优先，静态兜底；拉动态表必须用
+    # **Trae 自己的**账号（拿默认后端账号的 headers 打过去必然 4xx）。
+    refreshable_catalog = True
+    needs_own_credential_for_catalog = True
+    catalog_method = "fetch_models"
+    static_catalog = TRAE_STATIC_MODELS
+
+    def __init__(self):
+        # 动态目录提供者由 admin 在启动时注入（它知道动态表存在哪、
+        # 什么时候刷过）。实例级而非模块级：模块级全局会在「同一进程里建了
+        # 两个 app」时互相串（测试就是这么用的）。
+        self._catalog_provider = None
+
+    def catalog_entries(self):
+        """当前生效的目录：动态表优先，静态兜底（见 set_catalog_provider）。"""
+        if self._catalog_provider is not None:
+            try:
+                dynamic = self._catalog_provider()
+            except Exception:
+                dynamic = None
+            if dynamic:
+                return list(dynamic)
+        return [{"id": m["id"], "name": m.get("name") or m["id"],
+                 "context_length": m.get("context_length")} for m in TRAE_STATIC_MODELS]
+
+    def set_catalog_provider(self, provider):
+        self._catalog_provider = provider
+
+    def model_catalog(self) -> list[dict]:
+        """本实例当前生效的模型目录（兼容 trae_model_catalog 的模块级调用）。"""
+        return self.catalog_entries()
 
     def chat_url(self) -> str:
         return AGENT_HOST + EP_CHAT

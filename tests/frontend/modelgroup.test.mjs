@@ -17,12 +17,24 @@ function slice(from, to) {
 }
 const code = [
   slice("function groupModelsByName(list) {", "\n}"),
-  slice("const modelBaseName = id =>", ";\n"),
+  slice("function modelBaseName(id) {", "\n}"),
   slice("const creditsText = m =>", ";\n"),
   slice("function modelsInGroup(list, key) {", "\n}"),
+  // 后端元数据现在来自服务端（需求 2），这几个 helper 是它的唯一消费口。
+  // 测试里注入一份与注册表一致的元数据，验证「元数据驱动」确实生效。
+  slice("let backends = [];", "\n"), 
+  slice("function applyBackends(list) {", "\n}"),
+  slice("const backendMeta = b =>", ";\n"),
+  slice("const backendOrder = b =>", ";\n"),
 ].join("\n");
-const { groupModelsByName, modelBaseName, creditsText, modelsInGroup } =
-  new Function(code + "\nreturn {groupModelsByName, modelBaseName, creditsText, modelsInGroup};")();
+const { groupModelsByName, modelBaseName, creditsText, modelsInGroup, applyBackends } =
+  new Function(code + "\nreturn {groupModelsByName, modelBaseName, creditsText, modelsInGroup, applyBackends};")();
+
+// 与 GET /admin/api/backends 的返回同构（顺序故意打乱，验证 applyBackends 会排序）。
+applyBackends([
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", color: "#7c4dff", order: 1, prefix: "trae/" },
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", color: "#2f6fed", order: 0, prefix: "" },
+]);
 
 let bad = 0;
 const check = (label, got, want) => {
@@ -64,10 +76,21 @@ check("hy3 单独成组（没有同名后端）",
 // 顺序稳定：workbuddy 在前。
 check("组内 workbuddy 排在 trae 前", step.items[0].backend, "workbuddy");
 
-// 前缀剥离只针对 trae/，不能误伤名字里带 trae 的模型。
+// 前缀剥离只针对后端声明的前缀，不能误伤名字里带相同字样的模型。
 check("modelBaseName 剥 trae/ 前缀", modelBaseName("trae/kimi-k2.6"), "kimi-k2.6");
 check("modelBaseName 不剥非前缀", modelBaseName("mytrae/x"), "mytrae/x");
 check("modelBaseName 对空值安全", modelBaseName(null), "");
+// 前缀来自元数据而非写死：换一个前缀声明，剥离行为随之改变。
+applyBackends([
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", order: 0, prefix: "" },
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", order: 1, prefix: "solo-" },
+]);
+check("前缀由元数据驱动", modelBaseName("solo/kimi"), "solo/kimi");
+check("前缀由元数据驱动（命中新前缀）", modelBaseName("trae/kimi"), "trae/kimi");
+applyBackends([
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", order: 0, prefix: "" },
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", order: 1, prefix: "trae/" },
+]);
 
 // 倍率措辞：0 必须显示「免费」而不是「×0」，否则用户以为收费但为 0。
 check("倍率 0 显示免费", creditsText({ credits: 0 }), "免费");

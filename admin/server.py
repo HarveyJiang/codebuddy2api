@@ -24,7 +24,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 from core import converter
-from core.backends.registry import make_credential
+from core.backends.registry import (
+    backend_meta,
+    backend_name_for,
+    default_name as default_backend,
+    known_names as known_backends,
+    make_credential,
+    spec_for,
+)
 from . import config, logging_setup
 from .browser_login import BrowserLogin
 from .db import UPSTREAM_GROUPS, Database
@@ -167,7 +174,7 @@ class Store:
                     continue
                 aid = secrets.token_hex(8)
                 name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
-                self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time()), "backend": doc.get("backend", "workbuddy")}
+                self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time()), "backend": doc.get("backend", default_backend())}
             if initial_key and not any(item["hash"] == digest(initial_key) for item in self.data["keys"].values()):
                 self.add_key("原有 API Key", value=initial_key)
             self.save()
@@ -232,7 +239,7 @@ class Store:
                     "file": str(item["file"]),
                     "enabled": bool(item.get("enabled", True)),
                     "created": int(item.get("created") or time.time()),
-                    "backend": item.get("backend", "workbuddy")}
+                    "backend": item.get("backend", default_backend())}
             status = old.get("account_status")
             if isinstance(status, dict):
                 for aid, fields in status.items():
@@ -275,9 +282,9 @@ class Store:
     def validate_credential(doc):
         if not isinstance(doc, dict) or not isinstance(doc.get("auth"), dict) or not isinstance(doc.get("account"), dict):
             raise HTTPException(400, "需要桌面端 .info／JSON 登录文件，包含 auth 和 account 对象")
-        backend = doc.get("backend", "workbuddy")
-        if backend not in ("workbuddy", "trae"):
-            raise HTTPException(400, "backend 字段无效（仅支持 workbuddy / trae）")
+        backend = doc.get("backend", default_backend())
+        if backend not in known_backends():
+            raise HTTPException(400, "backend 字段无效（仅支持 %s）" % " / ".join(known_backends()))
         for key in ("accessToken", "refreshToken"):
             if not isinstance(doc["auth"].get(key), str) or not doc["auth"][key].strip():
                 raise HTTPException(400, "凭据缺少 accessToken 或 refreshToken，请重新导出桌面端登录文件")
@@ -337,7 +344,7 @@ class Store:
 
     def save_browser_account(self, doc, name):
         self.validate_credential(doc)
-        backend = doc.get("backend", "workbuddy")
+        backend = doc.get("backend", default_backend())
         with self.lock:
             identity = (backend, doc["account"]["uid"], doc["account"].get("enterpriseId", ""))
             for aid, item in self.data["accounts"].items():
@@ -345,7 +352,7 @@ class Store:
                     old = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 except (ValueError, OSError):
                     continue
-                if (old.get("backend", "workbuddy"), old.get("account", {}).get("uid"), old.get("account", {}).get("enterpriseId", "")) == identity:
+                if (old.get("backend", default_backend()), old.get("account", {}).get("uid"), old.get("account", {}).get("enterpriseId", "")) == identity:
                     current = self.manager_for(aid, item)
                     if current:
                         with current._lock:
@@ -391,34 +398,49 @@ class Store:
                 self.managers[aid] = make_credential(self.file_for(item))
             return self.managers[aid]
 
-    def any_enabled_manager(self):
-        """A credential manager from any enabled WorkBuddy account, for background pulls
-        (model catalog). Trae accounts are excluded: their headers hit workbuddy.cn and 400."""
+    def any_manager(self, backend=None):
+        """任一启用账号的凭据管理器；``backend`` 给定时只看该后端。
+
+        取代原先的 ``any_enabled_manager`` / ``any_trae_manager`` 两个专用函数：
+        它们是同一段逻辑写两遍、只差一个后端名，加第三个后端就得再抄一遍。
+
+        调用方给 backend 的理由各不相同——后台拉模型目录只能用一个能打
+        workbuddy.cn 的账号（Trae 的 headers 打过去必然 400），而动态模型表 /
+        签到 / 积分又只能用 Trae 账号——所以这个参数是有意义的，不是可有可无。
+        """
         with self.lock:
             for aid, item in self.data["accounts"].items():
-                if item["enabled"] and item.get("backend", "workbuddy") == "workbuddy" and self.auth_dir.joinpath(item["file"]).exists():
+                if not item["enabled"]:
+                    continue
+                if backend is not None and item.get("backend", default_backend()) != backend:
+                    continue
+                if self.auth_dir.joinpath(item["file"]).exists():
                     return self.manager_for(aid, item)
             return None
 
-    def any_trae_manager(self):
-        """任一启用的 Trae 账号凭据管理器（动态模型表 / 签到 / 积分用）。"""
+    def any_enabled_manager(self):
+        """默认后端的一个启用账号管理器（后台拉模型目录用）。"""
+        return self.any_manager(default_backend())
+
+    def has_enabled_account(self, backend):
+        """该后端是否有启用账号（供测试请求前置检查，避免拿错后端的账号）。"""
         with self.lock:
-            for aid, item in self.data["accounts"].items():
-                if item["enabled"] and item.get("backend", "workbuddy") == "trae" and self.auth_dir.joinpath(item["file"]).exists():
-                    return self.manager_for(aid, item)
-            return None
+            return any(it.get("backend", default_backend()) == backend and it["enabled"]
+                       for it in self.data["accounts"].values())
 
     def account_rows(self):
         result = []
         for aid, item in self.data["accounts"].items():
-            backend = item.get("backend", "workbuddy")
+            backend = item.get("backend", default_backend())
             row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "created": item["created"], "backend": backend}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
-                # Trae 的 expiresAt 是 Unix 秒；统一归一为毫秒（前端/池按毫秒语义处理）。
-                if doc.get("backend", backend) == "trae":
-                    expiry = expiry * 1000
+                # 各后端 expiresAt 单位不同（Trae 是 Unix 秒），统一归一为毫秒
+                # （前端/池按毫秒语义处理）。换算系数由 spec 声明。
+                factor = spec_for(doc.get("backend", backend)).expires_at_to_ms
+                if factor != 1:
+                    expiry = expiry * factor
                 row.update({"nickname": str(doc["account"].get("nickname") or ""), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
             except (ValueError, OSError, KeyError):
                 row.update({"status": "invalid", "expired": True, "expires_at": 0, "refresh_available": False})
@@ -445,7 +467,7 @@ class Store:
                 except (ValueError, OSError, HTTPException):
                     continue
                 aid = secrets.token_hex(8)
-                backend = doc.get("backend", "workbuddy")
+                backend = doc.get("backend", default_backend())
                 self.data["accounts"][aid] = {
                     "file": path.name,
                     "name": str(doc.get("account", {}).get("nickname") or "已收养账号")[:60],
@@ -694,8 +716,12 @@ def _warn_legacy_config():
 
 def _stale_catalog(registry):
     """缓存 catalog 是否为旧格式（描述含英文、或未按单价升序）时需重新拉取。
-    只检查 WorkBuddy 行——Trae 行无单价、固定排在后面，不参与排序判断。"""
-    models = [m for m in (registry.snapshot().get("models") or []) if m.get("backend") != "trae"]
+
+    只检查**参与排序判定**的后端（默认后端）——另一侧的行往往没有单价、
+    固定排在后面，混进来会让「是否升序」永远为假，于是每次启动都重新拉一遍。
+    """
+    default = default_backend()
+    models = [m for m in (registry.snapshot().get("models") or []) if m.get("backend", default) == default]
     if not models:
         return False
     for entry in models:
@@ -740,17 +766,24 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
     metrics = RequestMetrics()
+    # 目录凭据：默认后端用 any_manager(默认后端)，其余后端各自按名字取。
+    # 由 needs_own_credential_for_catalog / ModelRegistry.credential_getter_for 决定
+    # 谁被用到 —— server 这里不再为某个具体后端留一个专用函数。
     model_registry = ModelRegistry(get_credential=store.any_enabled_manager,
-                                   trae_credential_getter=store.any_trae_manager)
+                                   backend_credential_getter=store.any_manager)
     # 供账号池选降级模型用（池先建、注册表后建，这里回填）。
     pool.model_registry = model_registry
     model_registry.load(store.db)
+    # 主目录（默认后端）的静态兜底；各后端由下面 _ensure_catalogs 统一兜底。
     model_registry.ensure_builtin()
-    # Trae 模型目录：动态表由 registry 拉取维护，bare id 经提供者暴露给
-    # core.backends.trae（map_model / 模型列表）；无动态表时用静态 32 条兜底。
-    model_registry.ensure_trae_builtin()
-    from core.backends import trae as trae_module
-    trae_module.set_catalog_provider(model_registry.trae_entries)
+    # 每个后端的模型目录：注册「谁去拉」的提供者 + 静态兜底。
+    # 后端列表来自注册表，加后端时这里不用改。
+    for _name in known_backends():
+        model_registry.ensure_static_catalog(_name)
+        _spec = spec_for(_name)
+        if _spec.catalog_method or _name == default_backend():
+            _reg, _n = model_registry, _name
+            _spec.set_catalog_provider(lambda _r=_reg, _b=_n: _r.catalog_entries(_b))
     # 缓存里的描述是旧逻辑（中文+英文拼接、上游原始顺序）时重新拉取一次，
     # 让展示立即变成「只有中文 + 按单价升序」。
     if _stale_catalog(model_registry):
@@ -807,11 +840,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     if today > now:
                         next_run = today
                 await asyncio.sleep(max(60, (next_run - now).total_seconds()))
+                # 主目录（默认后端）走 fetch()；其它后端各自刷新。
                 model_registry.fetch()
-                try:
-                    model_registry.refresh_trae_models()
-                except Exception:
-                    pass
+                for _name in known_backends():
+                    if _name == default_backend():
+                        continue
+                    try:
+                        model_registry.refresh_catalog(_name)
+                    except Exception:
+                        pass
                 model_registry.persist(store.db)
         models_task = asyncio.create_task(models_worker())
         try:
@@ -978,6 +1015,24 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         return await browser_login.cancel(fid, digest(req.cookies.get(COOKIE, "")))
 
+    @app.get("/admin/api/backends")
+    async def backends_api(req: Request):
+        """后端元数据（需求 2/5/7）：前端不再写死后端名。
+
+        返回每个已知后端的 label / icon / color / 前缀 / 登录方式 / 启用状态 /
+        账号数。加第三个后端后前端自动多一个徽标与筛选项，不必改 app.js。
+        """
+        store.require_admin(req)
+        with store.lock:
+            counts = {}
+            for item in store.data["accounts"].values():
+                name = item.get("backend", default_backend())
+                counts[name] = counts.get(name, 0) + 1
+        out = []
+        for meta in backend_meta():
+            out.append({**meta, "accounts": counts.get(meta["name"], 0)})
+        return {"backends": out}
+
     @app.get("/admin/api/overview")
     async def overview(req: Request):
         store.require_admin(req)
@@ -1104,11 +1159,19 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def models_refresh(req: Request):
         store.require_admin(req)
         ok = await asyncio.to_thread(model_registry.fetch)
-        # Trae 动态表独立刷新：失败不影响 WorkBuddy 表，反之亦然。
-        trae_ok = await asyncio.to_thread(model_registry.refresh_trae_models)
+        # 各后端的动态表独立刷新：一个失败不影响另一个（后端隔离）。
+        others_ok = True
+        for _name in known_backends():
+            if _name == default_backend():
+                continue
+            try:
+                got = await asyncio.to_thread(model_registry.refresh_catalog, _name)
+                others_ok = others_ok and bool(got)
+            except Exception:
+                others_ok = False
         model_registry.persist(store.db)
         snapshot = model_registry.snapshot()
-        if not ok and not trae_ok:
+        if not ok and not others_ok:
             raise HTTPException(502, snapshot.get("error") or "拉取失败")
         return {"ok": True, "count": len(snapshot["models"])}
 
@@ -1396,7 +1459,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         doc = body.get("credential")
         store.validate_credential(doc)
-        backend = doc.get("backend", "workbuddy")
+        backend = doc.get("backend", default_backend())
         name = clean_name(body.get("name"), str(doc["account"].get("nickname") or "新账号")[:60])
         with store.lock:
             if len(store.data["accounts"]) >= 100:
@@ -1642,7 +1705,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             if not item:
                 raise HTTPException(404, "账号不存在")
             new = dict(item)
-            if "backend" in body and body["backend"] != item.get("backend", "workbuddy"):
+            if "backend" in body and body["backend"] != item.get("backend", default_backend()):
                 raise HTTPException(400, "账号后端不可修改")
             if "name" in body:
                 new["name"] = clean_name(body["name"], item["name"])
@@ -1783,11 +1846,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             raise HTTPException(400, "测试消息需为 1–2000 个字符")
         if store.test_lock.locked():
             raise HTTPException(409, "已有测试正在进行")
-        if model.startswith("trae/"):
-            with store.lock:
-                has_trae = any(it.get("backend", "workbuddy") == "trae" and it["enabled"] for it in store.data["accounts"].values())
-            if not has_trae:
-                raise HTTPException(400, "请先启用一个 Trae 账号")
+        want = backend_name_for(model)
+        if want != default_backend():
+            # 非默认后端：必须真有一个该后端的启用账号，否则池子选不到号，
+            # 请求会以「没有可用账号」告终——这里提前给出可操作的提示。
+            if not store.has_enabled_account(want):
+                raise HTTPException(400, f"请先启用一个 {spec_for(want).label} 账号")
         elif store.any_enabled_manager() is None:
             raise HTTPException(400, "请先导入并启用一个账号")
         async with store.test_lock:

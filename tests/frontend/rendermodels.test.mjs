@@ -25,15 +25,18 @@ if (!existsSync(join(DB_ROOT, "management", "state.db"))) {
 }
 
 const snippets = [
-  /const BACKEND_ICON = \{[\s\S]*?\};\n/,
-  /const BACKEND_NAME = \{[\s\S]*?\};\n/,
+  // 后端元数据（需求 2）：来自服务端，前端只留消费口。
+  /let backends = \[\];\n/,
+  /function applyBackends\(list\) \{[\s\S]*?\n\}\n/,
+  /const backendMeta = [^\n]*\n/,
   /const backendIcon = [^\n]*\n/,
   /const backendName = [^\n]*\n/,
-  /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /const backendLabel = [^\n]*\n/,
+  /const backendOrder = [^\n]*\n/,
+  /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /function backendBadge\(b\) \{[\s\S]*?\n\}\n/,
   /function groupModelsByName\(list\) \{[\s\S]*?\n\}\n/,
-  /const modelBaseName = [^\n]*\n/,
+  /function modelBaseName\(id\) \{[\s\S]*?\n\}\n/,
   /const creditsText = [^\n]*\n/,
   /const ctxText = [^\n]*\n/,
   /function renderModelGroup\(g\) \{[\s\S]*?\n\}\n/,
@@ -49,8 +52,14 @@ const escMatch = src.match(/const esc = [^\n]*\n/);
 code += escMatch[0];
 
 const fn = new Function(code + `
-  return {renderModelGroup, groupModelsByName, backendBadge, backendTag, backendName, esc};
+  return {renderModelGroup, groupModelsByName, backendBadge, backendTag, backendName, applyBackends, esc};
 `)();
+
+// 注入与 GET /admin/api/backends 同构的元数据（真实服务返回的就是这份形状）。
+fn.applyBackends([
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", color: "#2f6fed", order: 0, prefix: "" },
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", color: "#7c4dff", order: 1, prefix: "trae/" },
+]);
 
 // 拉真实数据：直接调 overview（复用 stage2_verify 已经验证过的登录方式）。
 const PY = process.env.WB_TEST_PYTHON || "/tmp/opencode/wb-venv/bin/python";
