@@ -7,7 +7,7 @@ const creditsFmt = v => {
   return (Math.round(n * 100) / 100).toLocaleString("zh-CN", {maximumFractionDigits: 2});
 };
 let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
-let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null, traeTimer = null;
+let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null, traeTimer = null, traeTick = null, traeBase = "", traeExpiresAt = 0, traeTotal = 600;
 const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
@@ -200,14 +200,45 @@ function setAccountMode(mode) {
   $("mode-file").setAttribute("aria-pressed", String(mode === "file"));
   $("account-error").textContent = "";
 }
+function stopTraeWait() { clearTimeout(traeTimer); clearInterval(traeTick); traeTimer = traeTick = null; }
+function setTraeStatus(text, warning) {
+  traeBase = text;
+  $("trae-status").className = "banner oauth-status" + (warning ? " warning" : "");
+  $("trae-status").textContent = text;
+}
+function renderTraeWait() {
+  if (!traeFlow) return 0;
+  const left = Math.max(0, Math.round((traeExpiresAt - Date.now()) / 1000));
+  $("trae-status").textContent = `${traeBase} · 等待中(${left}s/${traeTotal}s)`;
+  return left;
+}
+function tickTraeWait() {
+  clearInterval(traeTick);
+  traeTick = setInterval(() => {
+    if (!traeFlow) { stopTraeWait(); return; }
+    if (renderTraeWait() <= 0) {
+      traeFlow = null;
+      stopTraeWait();
+      setTraeStatus("登录链接已过期，请重新生成。", true);
+    }
+  }, 1000);
+}
+function startTraeWait(expiresAtMs) {
+  // 用相对剩余时长，避免客户端/服务端时钟偏差；服务端 TTL 600s，异常值回落默认。
+  const left = Math.round((expiresAtMs - Date.now()) / 1000);
+  traeTotal = left > 0 && left <= 3600 ? left : 600;
+  traeExpiresAt = Date.now() + traeTotal * 1000;
+  renderTraeWait();
+  tickTraeWait();
+}
+function resumeTraeWait() { if (traeFlow) { renderTraeWait(); tickTraeWait(); } }
 function clearTrae() {
-  const previous = traeFlow; traeFlow = null; clearTimeout(traeTimer);
+  const previous = traeFlow; traeFlow = null; stopTraeWait();
   if (previous && csrf) api("trae/" + previous.id, {method:"DELETE"}).catch(() => {});
   $("trae-link-box").hidden = true; $("trae-open").removeAttribute("href");
   $("trae-start").disabled = false; $("trae-start").textContent = "生成登录链接 ↗";
   $("trae-callback").value = ""; $("trae-submit").disabled = false;
-  $("trae-status").className = "banner oauth-status";
-  $("trae-status").textContent = "点击上方按钮生成登录链接，10 分钟内有效。";
+  setTraeStatus("点击上方按钮生成登录链接，10 分钟内有效。");
 }
 $("mode-browser").addEventListener("click", () => setAccountMode("browser"));
 $("mode-trae").addEventListener("click", () => setAccountMode("trae"));
@@ -219,23 +250,23 @@ async function pollTrae() {
     const result = await api("trae/flow/" + flow.id);
     if (!traeFlow || traeFlow.id !== flow.id) return;
     if (result.status === "done") {
-      traeFlow = null;
-      $("trae-status").className = "banner oauth-status";
+      traeFlow = null; stopTraeWait();
       $("account-dialog").close(); await refresh();
       toast(`Trae 账号已添加${result.nickname ? "：" + result.nickname : ""}`);
       return;
     }
     if (result.status === "error") {
-      $("trae-status").className = "banner warning oauth-status";
-      $("trae-status").textContent = result.message || "登录失败，请重新生成链接";
+      traeFlow = null; stopTraeWait();
+      setTraeStatus(result.message || "登录失败，请重新生成链接", true);
       return;
     }
     if (result.status === "expired") {
-      $("trae-status").className = "banner warning oauth-status";
-      $("trae-status").textContent = "登录链接已过期，请重新生成。";
+      traeFlow = null; stopTraeWait();
+      setTraeStatus("登录链接已过期，请重新生成。", true);
       return;
     }
-    $("trae-status").textContent = $("trae-status").textContent.replace(/\s*·\s*等待中\.\.\.$/, "") + " · 等待中…";
+    // 等待中：文案由 1s 倒计时统一渲染，这里只负责继续轮询。
+    renderTraeWait();
     traeTimer = setTimeout(pollTrae, 3000);
   } catch (e) {
     traeTimer = setTimeout(pollTrae, 5000);
@@ -249,7 +280,8 @@ $("trae-start").addEventListener("click", async () => {
     traeFlow = flow;
     $("trae-open").href = flow.url; $("trae-link-box").hidden = false;
     $("trae-start").textContent = "重新生成链接";
-    $("trae-status").textContent = "登录链接已就绪。在浏览器用手机号／验证码登录后，浏览器会跳到打不开的 127.0.0.1 地址——复制地址栏的完整链接，粘贴到下方完成绑定。";
+    setTraeStatus("登录链接已就绪。在浏览器用手机号／验证码登录后，浏览器会跳到打不开的 127.0.0.1 地址——复制地址栏的完整链接，粘贴到下方完成绑定。");
+    startTraeWait(flow.expires_at);
     traeTimer = setTimeout(pollTrae, 4000);
   } catch (e) { $("account-error").textContent = e.message; }
   finally { $("trae-start").disabled = false; }
@@ -260,15 +292,17 @@ $("trae-submit").addEventListener("click", async () => {
   const callback = $("trae-callback").value.trim();
   if (!callback) { $("account-error").textContent = "请粘贴浏览器地址栏的完整回调链接"; return; }
   $("trae-submit").disabled = true; $("account-error").textContent = "";
-  $("trae-status").className = "banner oauth-status"; $("trae-status").textContent = "正在换取 Trae 凭据…";
+  stopTraeWait();                       // 换取凭据期间暂停轮询与倒计时
+  setTraeStatus("正在换取 Trae 凭据…");
   try {
     const result = await api("trae/login", {method:"POST", body:{id:traeFlow.id, callback_url:callback}});
-    traeFlow = null;
+    traeFlow = null; stopTraeWait();
     $("account-dialog").close(); await refresh();
     toast(result.updated ? "Trae 账号凭据已更新" : "Trae 账号已添加");
   } catch (e) {
     $("account-error").textContent = e.message;
-    $("trae-status").className = "banner warning oauth-status"; $("trae-status").textContent = e.message;
+    setTraeStatus(e.message, true);
+    if (traeFlow) { resumeTraeWait(); traeTimer = setTimeout(pollTrae, 3000); }  // 流程仍有效则恢复
   } finally { $("trae-submit").disabled = false; }
 });
 $("account-dialog").addEventListener("close", () => { clearOAuth(); clearTrae(); $("account-form").reset(); $("file-label").textContent = "选择或拖入 .info / .json 文件"; $("account-error").textContent = ""; });
