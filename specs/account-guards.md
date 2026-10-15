@@ -9,6 +9,35 @@
 
 ---
 
+## 零、关于「要不要继续从 KeyPort 抄」——已调研，结论是不抄
+
+`KeyPort` 剩余的功能（captcha 农场、旅行/任务/试用奖励领取、激活遥测）**全部建立在
+ZCode / z.ai 的 API 上**，与本项目的上游腾讯 CodeBuddy 不是同一套服务。逐项对应：
+
+| KeyPort 功能 | 它依赖的端点 | 归属 |
+|---|---|---|
+| captcha 农场 | `zcode.z.ai` 的 `X-Aliyun-Captcha-Verify-Param`（阿里云无痕验证） | z.ai |
+| 奖励领取 | `{plan_base}/billing/preview` + `billing/claim` | z.ai 的套餐系统 |
+| 激活遥测 | `/api/v1/client/configs`、`/api/v1/event/report`（免鉴权） | z.ai |
+| **本项目上游** | `copilot.tencent.com`、`www.codebuddy.cn/v2/billing/meter/` | 腾讯 CodeBuddy |
+
+判定依据（可复核）：
+
+1. 本仓库全局搜 `captcha` / `X-Aliyun` / `verifyParam` **零命中**——我们从未给上游
+   发过验证码参数，上游也从未索要。
+2. captcha 模块的注释自己写明：参数**一次性**、连缓存 45 秒都在其环境下失效。
+   这是端点行为，换上游即无意义。
+3. 奖励领取的资格判据是 z.ai 自己的激活遥测，其文档写明「激活上报必须先于 preview，
+   否则形成 preview 恒空 → 永不激活的死锁」。这套状态机只在 z.ai 上有意义。
+4. 另外两个**确实**基于腾讯 CodeBuddy 的参考实现（`Sliverkiss/CodeBuddy2api`、
+   `orangeboyChen/codebuddy2api`）经查**都没有**任何签到 / 领取 / 奖励自动化代码。
+
+因此本项目上游侧唯一的自动化就是**签到**（`daily-checkin` +
+`checkin-activity-status`，见 `AccountPool.operate`）。要新增奖励类功能，必须先证明
+腾讯这边存在对应端点——**不要照抄 z.ai 的接口名**，那只会产生永远 404 的废代码。
+
+---
+
 ## 一、账号限额护栏（`admin/guards.py`）
 
 ### 为什么需要
