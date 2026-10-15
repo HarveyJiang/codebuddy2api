@@ -15,14 +15,29 @@ const labels = {
   models: ["模型管理", "MODEL CATALOG", "与官方客户端一致的模型列表，可按需启用或禁用。"],
   test: ["连接测试", "CONNECTION LAB", "经账号池按路由规则发起请求，确认模型能否正常响应。"],
   usage: ["用量明细", "USAGE LEDGER", "查看上游账单级的积分消耗，默认只读本地库，点击「拉取上游」才请求上游。"],
+  settings: ["设置", "WORKSPACE SETTINGS", "签到、排队容错、默认分配与数据库备份等全局设置。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
 };
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stamp = ts => ts ? new Date(ts).toLocaleString("zh-CN", {hour12:false}) : "未提供";
 function toast(message) { $("toast").textContent = message; $("toast").hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $("toast").hidden = true, 4500); }
-function showLogin() {
+function showLogin(message) {
   csrf = ""; overview = null; $("workspace").hidden = true; $("login").hidden = false; $("boot").hidden = true;
   document.querySelectorAll("dialog[open]").forEach(d => d.close()); $("admin-key").value = "";
+  // 登录页上的说明：恢复流程会主动清掉会话，这时把人踢回登录页是**预期行为**，
+  // 不作说明会让人以为「操作失败/被登出」。
+  $("login-error").textContent = message || "";
+}
+// 版本标识：登录页与会话内的侧边栏各一处，统一走 /health（未鉴权、开销极小，
+// 登录前也要能显示，所以不能只依赖 overview）。取不到就保持原样，不显示 null。
+function paintVersion(label) {
+  if (!label) return;
+  $("login-version").textContent = label;
+  $("sidebar-version").textContent = label;
+}
+async function loadVersion() {
+  try { const health = await (await fetch("/health", {credentials:"same-origin"})).json(); paintVersion(health.version); }
+  catch { /* 版本只是展示项，拿不到不影响使用 */ }
 }
 async function api(path, options = {}) {
   const method = options.method || "GET";
@@ -46,9 +61,12 @@ function goPage(next) {
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
   if (next === "usage") initUsagePage();
+  if (next === "settings") loadBackups().catch(e => toast(e.message));
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
+  const active = accounts.find(a => a.enabled && a.pool_state === "available") || accounts.find(a => a.enabled);
+  paintVersion(overview.version?.label);
   renderDashboard();
   $("account-count").textContent = accounts.length; $("account-badge").textContent = accounts.length;
   const routing = overview.pool?.default_routing || "round_robin";
@@ -65,6 +83,8 @@ function render() {
   $("total-credits").textContent = known.length ? creditsFmt(known.reduce((s,a) => s + a.remaining, 0)) + (known.length < accounts.length ? "（部分）" : "") : "待查询";
   if (!$("pool-settings").contains(document.activeElement)) {
     $("pool-routing").value = overview.pool?.default_routing || "round_robin"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; $("sync-start").value = overview.pool?.sync_start || "10:00"; $("sync-end").value = overview.pool?.sync_end || "20:00";
+    $("queue-failover").checked = overview.pool?.queue_failover || false; $("queue-model-fallback").checked = overview.pool?.queue_model_fallback !== false; $("queue-retry").value = overview.pool?.queue_retry ?? 3; $("queue-cooldown").value = overview.pool?.queue_cooldown ?? 120; $("queue-hold-ms").value = overview.pool?.queue_hold_ms ?? 3000; $("queue-fallback-model").value = overview.pool?.queue_fallback_model || "fast-model";
+    paintSettings();
   }
   $("keys-body").innerHTML = keys.map(k => {
     const u = k.usage || {};
@@ -175,7 +195,7 @@ function renderAccounts() {
     const credits = creditsFmt(a.remaining);
     const expiring = creditsFmt(a.expiring_soon);
     const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
-    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}</strong>${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}</strong>${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
@@ -221,8 +241,103 @@ $("refresh").addEventListener("click", async () => {
   } else { refresh().catch(e=>toast(e.message)); }
 });
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value)}});await refresh();toast("账号池设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value)}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
+
+// ── 数据库备份 ──────────────────────────────────────────────────────────
+let backups = null, backupBusy = false;
+function paintSettings() {
+  const pool = overview.pool || {};
+  $("backup-enabled").checked = !!pool.backup_enabled;
+  $("backup-interval").value = pool.backup_interval_hours ?? 24;
+  $("backup-keep").value = pool.backup_keep ?? 10;
+  // 账号限额护栏。0 = 关闭，是默认值。
+  $("guard-reserve-credits").value = pool.guard_reserve_credits ?? 0;
+  $("guard-daily-token-limit").value = pool.guard_daily_token_limit ?? 0;
+  $("guard-daily-credit-limit").value = pool.guard_daily_credit_limit ?? 0;
+  $("guard-model-daily-token-limit").value = pool.guard_model_daily_token_limit ?? 0;
+}
+async function loadBackups() {
+  const data = await api("backups");
+  backups = data;
+  $("backup-schedule").textContent = data.schedule;
+  $("backup-badge").textContent = data.count;
+  $("backup-dir-note").textContent = `保存在服务器 ${data.dir}，可按需下载到本地。`;
+  $("backup-empty").hidden = data.count > 0;
+  $("backup-body").innerHTML = data.items.map(b => `<tr><td><code>${esc(b.name)}</code>${b.is_last ? ' <span class="pill green">最近一次</span>' : ""}</td><td class="mono muted">${esc(b.created_text)}</td><td class="muted">${esc(b.age_text)}</td><td class="align-right mono">${esc(b.size_text)}</td><td class="align-right"><button class="secondary" data-backup-download="${esc(b.name)}">下载</button> <button class="secondary" data-backup-restore="${esc(b.name)}">恢复</button> <button class="danger" data-backup-delete="${esc(b.name)}">删除</button></td></tr>`).join("");
+}
+function backupGuard(button, fn) {
+  return async () => {
+    if (backupBusy) return;
+    backupBusy = true; const original = button.textContent; button.disabled = true;
+    try { await fn(); } catch (e) { toast(e.message); }
+    finally { backupBusy = false; button.disabled = false; button.textContent = original; }
+  };
+}
+$("backup-save").addEventListener("click", backupGuard($("backup-save"), async () => {
+  await api("pool/settings", {method:"PATCH", body:{backup_enabled:$("backup-enabled").checked, backup_interval_hours:Number($("backup-interval").value), backup_keep:Number($("backup-keep").value)}});
+  await refresh(); await loadBackups(); toast("备份设置已保存");
+}));
+$("backup-now").addEventListener("click", backupGuard($("backup-now"), async () => {
+  $("backup-now").textContent = "备份中…";
+  const data = await api("backups", {method:"POST"});
+  await refresh(); await loadBackups();
+  toast(`已生成备份 ${data.name}`);
+}));
+$("backup-body").addEventListener("click", async e => {
+  const button = e.target.closest("button"); if (!button) return;
+  const {backupDownload, backupRestore, backupDelete} = button.dataset;
+  if (backupDownload) {
+    // 备份接口要求管理会话（带 csrf 的 fetch 下拉不动），先取 blob 再造临时链接触发下载。
+    try {
+      const response = await fetch(`/admin/api/backups/${encodeURIComponent(backupDownload)}/download`, {credentials:"same-origin"});
+      if (!response.ok) throw new Error("下载失败，请重新登录后再试");
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a"); link.href = url; link.download = backupDownload;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (backupDelete) {
+    confirmAction("删除备份", `确定删除 ${backupDelete} 吗？删除后无法恢复。`, async () => {
+      await api(`backups/${encodeURIComponent(backupDelete)}`, {method:"DELETE"});
+      await loadBackups();
+    });
+    return;
+  }
+  if (backupRestore) {
+    confirmAction("恢复数据库", `将用 ${backupRestore} 替换当前数据库，并自动重启服务。恢复前会先备份当前数据，确定继续？`, async () => {
+      await api(`backups/${encodeURIComponent(backupRestore)}/restore`, {method:"POST"});
+      // 服务正在重启：页面会短暂失联，提示后轮询等它回来。
+      $("confirm-dialog").close();
+      toast("已开始恢复，服务正在重启…");
+      setTimeout(awaitRestart, 3000);
+    });
+  }
+});
+async function awaitRestart() {
+  // 恢复成功后进程会在 0.5s 左右退出。这里要能穿过「还活着 → 503 → 断开 → 新进程」
+  // 整个过渡期：先等一会儿让旧进程真的退出，再轮询到重新能登录为止。
+  //
+  // 注意：恢复会丢掉内存里的管理会话（os._exit 清空 sessions），所以旧 cookie
+  // 必定失效。api() 拿到 401 会调 showLogin() 把人踢回登录页——这在恢复流程里
+  // 是预期结果，不是故障，所以轮询期间不弹错误提示，只在登录页上方说明一句。
+  await new Promise(r => setTimeout(r, 2000));
+  for (let i = 0; i < 40; i++) {
+    try {
+      await api("overview");
+      await refresh(); await loadBackups(); toast("服务已恢复连接"); return;
+    } catch { showRestoreNotice(); }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  toast("服务仍未恢复，请检查容器日志");
+}
+// 恢复会杀掉内存里的会话，轮询期间被 401 踢回登录页时补一句说明，
+// 免得用户以为是「操作失败」或「莫名被登出」。
+function showRestoreNotice() {
+  if (!$("login").hidden) $("login-error").textContent = "数据库已恢复，请重新登录。";
+}
 $("go-guide").addEventListener("click", () => goPage("guide"));
 document.querySelectorAll(".close-dialog").forEach(b => b.addEventListener("click", () => b.closest("dialog").close()));
 function clearOAuth() {
@@ -435,7 +550,9 @@ function fmtTokens(n) {
   }
   return trim(v / 1000000) + "M";
 }
-$("confirm-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { await pendingConfirm(); $("confirm-dialog").close(); await refresh(); toast("操作已保存"); } catch (err) { $("confirm-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
+// 回调自行关闭对话框时（恢复备份会重启服务，不能让这里再 refresh）就跳过收尾。
+// 判据用 dialog.open，不引进新标记——回调关掉了就说明它接管了后续流程。
+$("confirm-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; const dialog = $("confirm-dialog"); try { await pendingConfirm(); if (!dialog.open) return; dialog.close(); await refresh(); toast("操作已保存"); } catch (err) { $("confirm-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 $("accounts-body").addEventListener("click", async e => {
   const b = e.target.closest("[data-action]"); if (!b) return;
   const a = overview.accounts.find(x => x.id === b.dataset.id); if (!a) return;
@@ -738,4 +855,4 @@ $("keys-body").addEventListener("click", async e => {
   } catch (err) { $("usage-history-body").innerHTML = `<tr><td colspan="3" class="history-empty">${esc(err.message)}</td></tr>`; }
 });
 
-(async () => { try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();
+(async () => { loadVersion(); try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();

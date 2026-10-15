@@ -66,10 +66,75 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(s["sync_start"], "11:00")
         self.assertEqual(s["default_routing"], "expiry_first")
         self.assertEqual(s["models_updated"], 9)
+        # 容量队列六项同样往返（默认关，存 1/0 表示开关）。
+        db.update_settings({"queue_failover": 1, "queue_retry": 5, "queue_cooldown": 77,
+                            "queue_hold_ms": 2500, "queue_model_fallback": 0,
+                            "queue_fallback_model": "fast-model"})
+        s = db.get_settings()
+        self.assertEqual((s["queue_failover"], s["queue_retry"], s["queue_cooldown"]), (1, 5, 77))
+        self.assertEqual((s["queue_hold_ms"], s["queue_model_fallback"]), (2500, 0))
+        self.assertEqual(s["queue_fallback_model"], "fast-model")
+        # 备份设置同样往返（默认关自动备份，last_at 记录上次成功时间）。
+        db.update_settings({"backup_enabled": 1, "backup_interval_hours": 12,
+                            "backup_keep": 5, "backup_last_at": 1770000000,
+                            "backup_last_name": "state-20260101-000000.db"})
+        s = db.get_settings()
+        self.assertEqual((s["backup_enabled"], s["backup_interval_hours"], s["backup_keep"]), (1, 12, 5))
+        self.assertEqual(s["backup_last_at"], 1770000000)
+        self.assertEqual(s["backup_last_name"], "state-20260101-000000.db")
         db.close()
         reopened = Database(self.root / "t.db")
         self.assertEqual(reopened.get_settings()["checkin_time"], "08:30")
+        self.assertEqual(reopened.get_settings()["queue_retry"], 5)
+        self.assertEqual(reopened.get_settings()["backup_interval_hours"], 12)
         reopened.close()
+
+    def test_v3_database_migrates_to_v4(self):
+        """v3 老库一路升到当前版本：补出队列与备份设置列，老数据不丢。"""
+        import sqlite3
+        path = self.root / "old.db"
+        # 手工造一个 v3 库：只有老列，版本号写 3。
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO schema_meta VALUES ('version','3');"
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL,"
+            " enabled INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL DEFAULT 0);"
+            "INSERT INTO accounts VALUES ('a1','旧账号','a.info',1,100);"
+            "CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1),"
+            " auto_checkin INTEGER NOT NULL DEFAULT 1, checkin_time TEXT NOT NULL DEFAULT '09:00',"
+            " affinity_expiry_days INTEGER NOT NULL DEFAULT 3,"
+            " credit_min_interval INTEGER NOT NULL DEFAULT 60,"
+            " sync_start TEXT NOT NULL DEFAULT '10:00', sync_end TEXT NOT NULL DEFAULT '20:00',"
+            " batch_spread INTEGER NOT NULL DEFAULT 90,"
+            " default_routing TEXT NOT NULL DEFAULT 'round_robin',"
+            " models_updated INTEGER NOT NULL DEFAULT 0);"
+            "INSERT INTO settings (id) VALUES (1);")
+        conn.commit()
+        conn.close()
+        db = Database(path)
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                         str(SCHEMA_VERSION))
+        # 新列被补出来，且带正确默认值（默认关闭）。
+        columns = {row[1] for row in db.query("PRAGMA table_info(accounts)")}
+        self.assertIn("queued_until", columns)
+        settings = db.get_settings()
+        self.assertEqual(settings["queue_failover"], 0)
+        self.assertEqual(settings["queue_retry"], 3)
+        self.assertEqual(settings["queue_hold_ms"], 3000)
+        self.assertEqual(settings["queue_fallback_model"], "fast-model")
+        # v4→v5 的备份列也被补出来，且默认「不开自动备份」。
+        # 这是刻意的：定时备份持续占磁盘，不能因为升级就替用户打开。
+        self.assertEqual(settings["backup_enabled"], 0)
+        self.assertEqual(settings["backup_interval_hours"], 24)
+        self.assertEqual(settings["backup_keep"], 10)
+        self.assertEqual(settings["backup_last_at"], 0)
+        self.assertEqual(settings["backup_last_name"], "")
+        # 老数据保留。
+        self.assertEqual(db.load_accounts()["a1"]["name"], "旧账号")
+        # 迁移可重复执行（幂等），重开不再报 duplicate column。
+        db.close()
+        Database(path).close()
 
     def test_accounts_money_micro_roundtrip(self):
         db = Database(self.root / "t.db")

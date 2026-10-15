@@ -1,6 +1,6 @@
 # 配置收敛 Spec：统一入口 + .env
 
-> 状态：设计中。范围是**收敛已有配置的读取方式**，不引入新的配置体系（不引 pydantic-settings、
+> 状态：已实现（2026-10-15）。原设计见正文；实现见 `core/runtime_config.py` 与 `core/runtime_logging.py`。范围是**收敛已有配置的读取方式**，不引入新的配置体系（不引 pydantic-settings、
 > 不建 YAML 配置文件）。
 
 ## 背景

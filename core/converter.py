@@ -74,6 +74,7 @@ from .responses_adapter import (
     responses_request_to_chat,
 )
 from .responses_projection import project_responses_chat_body
+from .replay_policy import explain as explain_transport
 from .system_identity import filter_system_identity
 
 # ---------------------------------------------------------------------------
@@ -658,8 +659,13 @@ async def chat_completions(
     if backend.tencent_policies and "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
-    # 腾讯后端不支持 developer role，遇到会触发安全策略拦截（11128），统一映射为 system
-    if backend.tencent_policies and "messages" in body and isinstance(body["messages"], list):
+    # 腾讯后端不吃 developer role（OpenAI 新规范里 system 的替身），统一映射为 system。
+    #
+    # 注意：**这不是 11128 的原因**。11128（"Illegal API invocation from an
+    # unapproved channel"）是上游 WAF 对请求内容的指纹识别，换账号无效——线上实测
+    # 连续换遍全池 8 个账号全部 11128，能救的只有改请求内容（见 system_identity /
+    # desensitize）。developer role 只是被上游当未知 role 拒掉，属于另一回事。
+    if "messages" in body and isinstance(body["messages"], list):
         body["messages"] = [
             dict(m, role="system")
             if isinstance(m, dict) and m.get("role") == "developer"
@@ -728,7 +734,6 @@ async def chat_completions(
         )
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
-
 
 def _last_user_text(messages: list) -> str:
     """取最后一条 user 消息的文本，用于日志预览。"""
@@ -1009,6 +1014,7 @@ async def _stream_upstream(
             f"上游 {config.get().stream_idle_timeout} 秒无数据，连接已中止"
         )
         return
+
 
     # 收尾：把缓冲区里残留的不完整行（无尾随换行）也解析掉，否则会漏掉
     # 最后一帧里的 finish_reason / [DONE]，把正常结束误判成截断。
@@ -1521,6 +1527,7 @@ async def _stream_anthropic(
         }
         yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
         return
+
 
     # 上游未发出终止信号就结束：补一个 error 事件，客户端才不会把截断当正常结束。
     if not converter.completed:

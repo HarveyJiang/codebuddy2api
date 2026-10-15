@@ -31,10 +31,16 @@ from .db import UPSTREAM_GROUPS, Database
 from .pool import AccountPool, PoolMiddleware, ROUTING_POLICIES
 from .metrics import RequestMetrics, MetricsMiddleware
 from .models import CN, ModelRegistry
+from . import backup as db_backup
+from . import version as app_version
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
 ASSETS = Path(__file__).parent / "static"
+# 健康库的字节下限。文件明显小于一页（SQLite 页大小 4096）就说明对象根本不是
+# 我们的库。注意这个下界只挡「明显不是数据库」，**不能**用来判断库是否为空——
+# 空库经备份接口产出后正好被撑到 4096 字节，卡在下界上，内容判定须交给 verify()。
+_MIN_HEALTHY_DB_BYTES = 4096
 
 
 def digest(value):
@@ -136,6 +142,9 @@ class Store:
         self.events = deque(maxlen=40)
         self.trae_flows = {}
         self.path = self.root / "state.db"
+        # 恢复期间置位：库已被关掉、进程即将退出，此时到达的请求必须快速失败，
+        # 而不是撞在已关闭的连接上报 500（"Cannot operate on a closed database"）。
+        self.restoring = False
         # SQLite 是唯一持久层；内存 self.data 是工作副本，写操作后统一落库。
         self.db = Database(self.path)
         self.data = {"accounts": {}, "account_status": {}, "keys": {}, "pool": {},
@@ -567,6 +576,51 @@ class Store:
                 usage["tokens"] = usage.get("tokens", 0) + int(tokens)
             self.keys_dirty = True
 
+    # -- 数据库备份 ---------------------------------------------------------
+
+    def backup_now(self, reason="manual"):
+        """生成一份备份并记录到设置里。返回备份信息；失败抛出异常由调用方转 500。
+
+        走 ``db_backup.create``（sqlite 在线备份），不直接拷文件——WAL 模式下
+        拷主库会漏掉还没 checkpoint 的已提交数据。
+        """
+        settings = self.data["pool"]
+        self.db.checkpoint()  # 顺手合并 WAL：备份本身不依赖它，但能让库保持紧凑
+        name = db_backup.create(self.root, self.path, keep=int(settings.get("backup_keep") or 10),
+                                minimal_size=_MIN_HEALTHY_DB_BYTES)
+        with self.lock:
+            self.data["pool"]["backup_last_at"] = int(time.time())
+            self.data["pool"]["backup_last_name"] = name
+        self.save()
+        # 只走 logging，**不**写 self.events——那个 deque 是「连接测试」页的
+        # 测试记录，前端按 {model, ok, seconds} 渲染（见 app.js），塞进备份事件
+        # 会让那一栏出现「undefined / 成功」的空行。
+        logging.getLogger("admin.backup").info("数据库备份完成（%s）：%s", reason, name)
+        return {"name": name, "reason": reason}
+
+    def backup_list(self):
+        """备份列表 + 设置里的定时状态，供设置页展示。"""
+        settings = self.data["pool"]
+        now = time.time()
+        items = []
+        for item in db_backup.list_backups(self.root):
+            items.append({
+                "name": item["name"], "size": item["size"], "created": item["created"],
+                "size_text": db_backup.human_size(item["size"]),
+                "created_text": db_backup.human_time(item["created"]),
+                "age_text": db_backup.describe_age(item["created"], now),
+                "is_last": item["name"] == settings.get("backup_last_name"),
+            })
+        return {
+            "items": items,
+            "count": len(items),
+            "dir": str(db_backup.backup_dir(self.root)),
+            "schedule": db_backup.schedule_hint(settings),
+            "remaining": db_backup.remaining_until(settings, now),
+            "last_at": int(settings.get("backup_last_at") or 0),
+            "last_name": settings.get("backup_last_name") or "",
+        }
+
     def require_admin(self, req):
         sid = req.cookies.get(COOKIE, "")
         with self.lock:
@@ -580,12 +634,24 @@ class Store:
 
 
 class AdminMiddleware:
-    def __init__(self, app):
+    """管理页中间件：限体积、加安全响应头，并在数据库恢复期间守住入口。
+
+    ``store`` 可为 None（不传即跳过恢复期检查），保持这个中间件能被单独测试。
+    """
+
+    def __init__(self, app, store=None):
         self.app = app
+        self.store = store
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not scope["path"].startswith("/admin"):
             return await self.app(scope, receive, send)
+        # 恢复期间库已关闭、进程即将退出。这里直接 503，避免请求撞在已关闭的
+        # sqlite 连接上抛 ProgrammingError（表现为 500 + 一屏堆栈）。
+        if self.store is not None and self.store.restoring:
+            response = JSONResponse(
+                {"detail": "数据库正在恢复，服务即将重启，请稍候刷新"}, 503)
+            return await response(scope, receive, send)
         messages, size = [], 0
         while True:
             message = await receive()
@@ -650,6 +716,21 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     if not logging_setup.configured():
         logging_setup.setup_logging(cfg.log_level, cfg.log_path)
     _warn_legacy_config()
+    data_root = Path(root or cfg.data_dir)
+    # 续跑上次没走完的恢复：恢复要「关库 → 覆盖 → 重开」，进程若在中间挂掉，
+    # state.db 可能已被替换成新库、或压根还是旧的。中转文件在，说明没走完，
+    # 这里补上——宁可多恢复一次，也不能让半截状态留在线上跑。
+    pending = db_backup.stale_pending(data_root)
+    if pending is not None:
+        try:
+            Path(data_root / "state.db").unlink(missing_ok=True)
+            os.replace(pending, data_root / "state.db")
+            db_backup.finish_restore(data_root)
+            logging.getLogger("admin.backup").warning(
+                "检测到中断的数据库恢复，已补完并继续启动")
+        except OSError:
+            logging.getLogger("admin.backup").exception(
+                "中断的数据库恢复未能补完，已保留中转文件待下次启动重试")
     store = Store(root or cfg.data_dir, auth_dir or cfg.auth_dir, initial_key if initial_key is not None else cfg.api_key, admin_key or cfg.admin_key)
     converter._check_auth = store.check_api
     # 以前这里把 log_path 硬覆盖成 None，导致设了 WORKBUDDY_LOG/CODEBUDDY2OPENAI_LOG
@@ -661,6 +742,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     metrics = RequestMetrics()
     model_registry = ModelRegistry(get_credential=store.any_enabled_manager,
                                    trae_credential_getter=store.any_trae_manager)
+    # 供账号池选降级模型用（池先建、注册表后建，这里回填）。
+    pool.model_registry = model_registry
     model_registry.load(store.db)
     model_registry.ensure_builtin()
     # Trae 模型目录：动态表由 registry 拉取维护，bare id 经提供者暴露给
@@ -691,6 +774,20 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     pass  # Per-account errors are persisted without credential data.
                 await asyncio.sleep(60)
         pool_task = asyncio.create_task(pool_worker())
+        async def backup_worker():
+            # 定时备份：每轮只做「醒来看一眼该不该跑」，间隔由设置决定。
+            # 单轮失败不退出循环——磁盘一时写满不该让自动备份永久停摆。
+            while True:
+                try:
+                    settings = store.data["pool"]
+                    if db_backup.due(settings):
+                        await asyncio.to_thread(store.backup_now, "scheduled")
+                    delay = db_backup.next_check_delay(settings)
+                except Exception:
+                    logging.getLogger("admin.backup").exception("自动备份失败")
+                    delay = db_backup.TICK_SECONDS
+                await asyncio.sleep(max(1, delay))
+        backup_task = asyncio.create_task(backup_worker())
         async def models_worker():
             # 每天在 04:00-05:00 之间随机选一分钟刷新模型配置（上游免鉴权接口，
             # 低峰期随机时刻，避免固定时间打点）。WorkBuddy 与 Trae 两张表都刷。
@@ -715,6 +812,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             cleanup_task.cancel()
             pool_task.cancel()
             models_task.cancel()
+            backup_task.cancel()
             try:
                 await cleanup_task
             except asyncio.CancelledError:
@@ -722,7 +820,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             await browser_login.close()
             # 优雅关闭：把 WAL 里未 checkpoint 的帧合并进主库再断开。
             store.db.close()
-            for task in (pool_task, models_task):
+            for task in (pool_task, models_task, backup_task):
                 try:
                     await task
                 except asyncio.CancelledError:
@@ -743,7 +841,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         models = model_registry.enabled_models()
         return list(models or _original_available_models())
     converter.get_available_models = _managed_models
-    app.add_middleware(AdminMiddleware)
+    app.add_middleware(AdminMiddleware, store=store)
     app.add_middleware(PoolMiddleware, pool=pool, model_registry=model_registry)
     app.add_middleware(MetricsMiddleware, metrics=metrics, store=store)
 
@@ -781,6 +879,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         status = "ok" if usable else "degraded"
         body = {
             "status": status,
+            "version": app_version.describe(),
             "uptime_s": int(time.time() - store.started),
             "accounts": {"total": detail["total"], "enabled": detail["enabled"],
                          "usable": usable, "auth_invalid": detail["auth_invalid"]},
@@ -884,8 +983,13 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             live = metrics.snapshot()
             merged = {**live, **summary,
                       "in_flight": live["in_flight"], "started_at": summary["first_time"] or live["started_at"],
-                      "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds}
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+                      "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds,
+                      # 实测成本账本规模。上游若从不返回 credit，这里会长期是 0——
+                      # 这个数字就是判断「账本到底有没有在用」的唯一依据。
+                      "cost_ledger": pool.cost_ledger.stats(),
+                      # WAF IP 级拦截状态。激活期间轮转会提前收手，不放大风控。
+                      "waf_gate": pool.waf_gate.snapshot()}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "pool_groups": {k: list(v) for k, v in AccountPool.SETTING_GROUPS.items()}, "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "version": app_version.snapshot(), "events": list(store.events)}
 
     @app.get("/admin/api/logs")
     async def logs(req: Request):
@@ -1128,9 +1232,154 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 0 <= spread <= 600:
                     raise HTTPException(400, "批量签到错峰需在 0-600 秒之间")
                 settings["batch_spread"] = spread
+            if "queue_failover" in body:
+                if type(body["queue_failover"]) is not bool:
+                    raise HTTPException(400, "排队自动切换开关无效")
+                settings["queue_failover"] = body["queue_failover"]
+            if "queue_model_fallback" in body:
+                if type(body["queue_model_fallback"]) is not bool:
+                    raise HTTPException(400, "模型降级开关无效")
+                settings["queue_model_fallback"] = body["queue_model_fallback"]
+            if "queue_retry" in body:
+                try:
+                    retry = int(body["queue_retry"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "排队重试次数需为整数")
+                if not 1 <= retry <= 10:
+                    raise HTTPException(400, "排队重试次数需在 1-10 之间")
+                settings["queue_retry"] = retry
+            if "queue_cooldown" in body:
+                try:
+                    cooldown = int(body["queue_cooldown"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "排队让位时长需为整数秒")
+                if not 0 <= cooldown <= 3600:
+                    raise HTTPException(400, "排队让位时长需在 0-3600 秒之间")
+                settings["queue_cooldown"] = cooldown
+            if "queue_hold_ms" in body:
+                try:
+                    hold = int(body["queue_hold_ms"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "排队判定窗口需为整数毫秒")
+                # 上界刻意收紧：这是「扣留响应头」的时长，越长越容易拖慢并发。
+                if not 0 <= hold <= 10000:
+                    raise HTTPException(400, "排队判定窗口需在 0-10000 毫秒之间")
+                settings["queue_hold_ms"] = hold
+            if "queue_fallback_model" in body:
+                fallback = body["queue_fallback_model"]
+                if not isinstance(fallback, str) or not fallback.strip() or len(fallback) > 100:
+                    raise HTTPException(400, "兜底模型名无效")
+                settings["queue_fallback_model"] = fallback.strip()
+            # 账号级限额护栏（admin/guards.py）。上界给得宽，但要挡住明显误输入
+            # （把 token 上限填成 1e9 等于没开，填成负数会绕过 0=关闭 的语义）。
+            for field, label, upper in (
+                    ("guard_reserve_credits", "保留余额", 100_000_000),
+                    ("guard_daily_token_limit", "单账号日 token 上限", 10_000_000_000),
+                    ("guard_daily_credit_limit", "单账号日积分上限", 100_000_000),
+                    ("guard_model_daily_token_limit", "单账号单模型日 token 上限", 10_000_000_000)):
+                if field not in body:
+                    continue
+                try:
+                    value = int(body[field])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{label}需为整数")
+                if not 0 <= value <= upper:
+                    raise HTTPException(400, f"{label}需在 0-{upper} 之间（0 = 关闭）")
+                settings[field] = value
+            if "backup_enabled" in body:
+                if type(body["backup_enabled"]) is not bool:
+                    raise HTTPException(400, "自动备份开关无效")
+                settings["backup_enabled"] = body["backup_enabled"]
+            if "backup_interval_hours" in body:
+                try:
+                    hours = int(body["backup_interval_hours"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "自动备份间隔需为整数小时")
+                # 下界 1 小时：更密没有意义，只会把保留份数挤爆。
+                if not 1 <= hours <= 720:
+                    raise HTTPException(400, "自动备份间隔需在 1-720 小时之间")
+                settings["backup_interval_hours"] = hours
+            if "backup_keep" in body:
+                try:
+                    keep = int(body["backup_keep"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "备份保留份数需为整数")
+                if not 1 <= keep <= 100:
+                    raise HTTPException(400, "备份保留份数需在 1-100 之间")
+                settings["backup_keep"] = keep
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}
+
+    # -- 数据库备份 ---------------------------------------------------------
+
+    @app.get("/admin/api/backups")
+    async def backups_list(req: Request):
+        store.require_admin(req)
+        return await asyncio.to_thread(store.backup_list)
+
+    @app.post("/admin/api/backups")
+    async def backups_create(req: Request):
+        """手动触发一次备份。文件可能到 MB 级，放到线程里做，别卡住事件循环。"""
+        store.require_admin(req)
+        try:
+            result = await asyncio.to_thread(store.backup_now, "manual")
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(500, f"备份失败：{exc}")
+        return {"ok": True, **result, **store.backup_list()}
+
+    @app.get("/admin/api/backups/{name}/download")
+    async def backups_download(name: str, req: Request):
+        store.require_admin(req)
+        path = db_backup.resolve(store.root, name)
+        if path is None:
+            raise HTTPException(404, "备份不存在")
+        return FileResponse(path, media_type="application/vnd.sqlite3", filename=name)
+
+    @app.delete("/admin/api/backups/{name}")
+    async def backups_delete(name: str, req: Request):
+        store.require_admin(req)
+        if not await asyncio.to_thread(db_backup.remove, store.root, name):
+            raise HTTPException(404, "备份不存在")
+        return {"ok": True, **store.backup_list()}
+
+    @app.post("/admin/api/backups/{name}/restore")
+    async def backups_restore(name: str, req: Request):
+        """把指定备份恢复成线上库，然后重启进程。
+
+        这是**破坏性操作**，分四步，每步都刻意留着可续跑：
+        1. 先 verify()，备份本身不健康就直接拒绝，不碰线上库；
+        2. 覆盖前先给当前库打一份 ``pre-restore`` 备份，恢复错了还能退回来；
+        3. 覆盖用 os.replace 原子替换，替换前把文件放成 ``restore-pending.db``——
+           进程若在「已关闭连接、还没重开」之间挂掉，启动时会靠它续跑；
+        4. 重启进程（os._exit），由容器 restart 策略拉起，库才会被重新打开。
+        """
+        store.require_admin(req)
+        path = db_backup.resolve(store.root, name)
+        if path is None:
+            raise HTTPException(404, "备份不存在")
+        ok, message = await asyncio.to_thread(db_backup.verify, path)
+        if not ok:
+            raise HTTPException(400, f"备份不可用：{message}")
+        # 恢复前先自保：这一步失败就不该继续（否则等于把唯一一份好数据换掉）。
+        try:
+            safety = await asyncio.to_thread(store.backup_now, "pre-restore")
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(500, f"恢复前自动备份失败，已中止：{exc}")
+        with store.lock:
+            # 关库：WAL 先合并，再断开连接，之后替换文件才不会丢已提交数据。
+            store.db.close()
+            await asyncio.to_thread(db_backup.begin_restore, store.root, path, store.path)
+            await asyncio.to_thread(db_backup.finish_restore, store.root)
+        # 置位必须在关库**之前**才严谨，但那样会让恢复请求本身撞上 503；这里在
+        # 关库后立刻置位，把「库已关、进程未退」这个窗口缩到最小。窗口内到达的
+        # 请求由 AdminMiddleware 统一转成 503，不再抛 sqlite3.ProgrammingError。
+        store.restoring = True
+        logging.getLogger("admin.backup").warning(
+            "已从 %s 恢复数据库（恢复前已备份为 %s），即将重启进程", name, safety["name"])
+        asyncio.get_running_loop().call_later(0.5, lambda: os._exit(0))
+        return {"ok": True, "restored": name, "safety": safety["name"],
+                "message": "恢复完成，服务正在重启"}
 
     @app.post("/admin/api/accounts")
     async def add_account(req: Request):

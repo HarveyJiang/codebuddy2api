@@ -15,6 +15,8 @@ services:
       CODEBUDDY2OPENAI_KEY: ${CODEBUDDY2OPENAI_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
       CODEBUDDY_AUTH_DIR: /data/auth
       MANAGEMENT_DATA_DIR: /data/management
+      # 界面上的版本标识。留空则显示 unknown；用镜像 tag 填，便于核对线上跑的是哪一次发布。
+      WORKBUDDY_IMAGE_TAG: ${WORKBUDDY_IMAGE_TAG:-}
       TZ: Asia/Shanghai
     volumes:
       - ./data/auth:/data/auth

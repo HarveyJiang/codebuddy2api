@@ -46,7 +46,79 @@ def _v2_to_v3(db):
 
 
 def _v3_to_v4(db):
-    """v3 → v4：给 accounts 补 backend 列（Trae 第二后端合并引入）。
+    """v3 → v4：加容量队列字段（accounts.queued_until、settings 的 queue_* 六项）。
+
+    同样只补结构不动数据。settings 是单行表，加列必须 ALTER 且带默认值，
+    否则已存在的行会读出 NULL，而 POOL_DEFAULTS 的合并发生在 Python 侧、
+    只补字典里**缺的键**——列存在但为 NULL 时它不认为是缺键。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
+    if "queued_until" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN queued_until INTEGER")
+    settings_columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    for name, ddl in (("queue_failover", "INTEGER NOT NULL DEFAULT 0"),
+                      ("queue_retry", "INTEGER NOT NULL DEFAULT 3"),
+                      ("queue_cooldown", "INTEGER NOT NULL DEFAULT 120"),
+                      ("queue_hold_ms", "INTEGER NOT NULL DEFAULT 3000"),
+                      ("queue_model_fallback", "INTEGER NOT NULL DEFAULT 1"),
+                      ("queue_fallback_model", "TEXT NOT NULL DEFAULT 'fast-model'")):
+        if name not in settings_columns:
+            db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
+
+
+def _v4_to_v5(db):
+    """v4 → v5：加数据库备份设置（settings 的 backup_* 五项）。
+
+    和 v3→v4 同理：settings 是单行表，加列必须 ALTER 且带默认值，否则已存在
+    的那行读出 NULL，而 POOL_DEFAULTS 的合并只补「字典里缺的键」——列在但值为
+    NULL 时不算缺键，None 会一路传到 int() 上。
+
+    默认**关闭自动备份**：定时备份会持续占用磁盘，什么时候开、开多久由用户定，
+    不能因为升级就默认替人做决定。``backup_last_at`` 记录上次成功时间，
+    是定时器判断「该不该跑」的唯一依据，必须落库（进程重启不能重置计时）。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    for name, ddl in (("backup_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                      ("backup_interval_hours", "INTEGER NOT NULL DEFAULT 24"),
+                      ("backup_keep", "INTEGER NOT NULL DEFAULT 10"),
+                      ("backup_last_at", "INTEGER NOT NULL DEFAULT 0"),
+                      ("backup_last_name", "TEXT NOT NULL DEFAULT ''")):
+        if name not in columns:
+            db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
+
+
+def _v5_to_v6(db):
+    """v5 → v6：账号级限额护栏（settings 的 guard_* 四项）+ 账号日用量表。
+
+    护栏阈值默认 **0 = 关闭**。这是刻意选择：护栏是「替用户做决定」的功能，
+    默认值必须是无为，否则升级就会悄悄改变线上行为、甚至把账号池停掉。
+    和 v3→v4、v4→v5 同样的理由，加列必须带 NOT NULL DEFAULT，否则已存在
+    的那行读出 NULL——而 POOL_DEFAULTS 的合并只补「字典里缺的键」，列在但
+    值为 NULL 时不算缺键，None 会一路传到 int() 上。
+
+    同时新建 ``account_usage_daily``：护栏要问「这个账号今天用了多少」，
+    而 request_logs 只有状态与耗时、没有 token/credit 列，聚合不出来。
+    按 (账号, 天, 模型) 存，正好三种查询都能一次覆盖。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    for name, ddl in (("guard_reserve_credits", "INTEGER NOT NULL DEFAULT 0"),
+                      ("guard_daily_token_limit", "INTEGER NOT NULL DEFAULT 0"),
+                      ("guard_daily_credit_limit", "INTEGER NOT NULL DEFAULT 0"),
+                      ("guard_model_daily_token_limit", "INTEGER NOT NULL DEFAULT 0")):
+        if name not in columns:
+            db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
+    db._write.execute(
+        """CREATE TABLE IF NOT EXISTS account_usage_daily (
+            account_id TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+            count INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
+            credits_micro INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (account_id, day, model))""")
+    db._write.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_usage_day ON account_usage_daily(day)")
+
+
+def _v6_to_v7(db):
+    """v6 → v7：给 accounts 补 backend 列（Trae 第二后端合并引入）。
 
     与 _v2_to_v3 同样的理由：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
     必须 PRAGMA 判断后 ALTER。默认值 'workbuddy' 让历史账号全部落到 WorkBuddy 后端。
@@ -57,7 +129,7 @@ def _v3_to_v4(db):
             "ALTER TABLE accounts ADD COLUMN backend TEXT NOT NULL DEFAULT 'workbuddy'")
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 MICRO = 1_000_000
 
@@ -76,7 +148,7 @@ ACCOUNT_STATUS_COLUMNS = (
     "checkin_when", "checkin_offset_date", "token_refreshed", "auth_invalid", "refresh_slot",
     "refresh_slot_date", "refresh_window_date", "consecutive_fails", "cooldown_until",
     "request_count", "last_request", "last_error", "usage_synced_at", "usage_sync_error",
-    "usage_manual_synced_at",
+    "usage_manual_synced_at", "queued_until",
 )
 
 ACCOUNT_STATUS_DEFAULTS = {
@@ -181,6 +253,7 @@ class Database:
         token_refreshed INTEGER, auth_invalid INTEGER NOT NULL DEFAULT 0,
         refresh_slot TEXT, refresh_slot_date TEXT, refresh_window_date TEXT,
         consecutive_fails INTEGER NOT NULL DEFAULT 0, cooldown_until INTEGER,
+        queued_until INTEGER,
         request_count INTEGER NOT NULL DEFAULT 0, last_request INTEGER, last_error TEXT,
         usage_synced_at INTEGER, usage_sync_error TEXT,
         usage_manual_synced_at INTEGER)"""
@@ -210,6 +283,21 @@ class Database:
             sync_end TEXT NOT NULL DEFAULT '20:00',
             batch_spread INTEGER NOT NULL DEFAULT 90,
             default_routing TEXT NOT NULL DEFAULT 'round_robin',
+            queue_failover INTEGER NOT NULL DEFAULT 0,
+            queue_retry INTEGER NOT NULL DEFAULT 3,
+            queue_cooldown INTEGER NOT NULL DEFAULT 120,
+            queue_hold_ms INTEGER NOT NULL DEFAULT 3000,
+            queue_model_fallback INTEGER NOT NULL DEFAULT 1,
+            queue_fallback_model TEXT NOT NULL DEFAULT 'fast-model',
+            backup_enabled INTEGER NOT NULL DEFAULT 0,
+            backup_interval_hours INTEGER NOT NULL DEFAULT 24,
+            backup_keep INTEGER NOT NULL DEFAULT 10,
+            backup_last_at INTEGER NOT NULL DEFAULT 0,
+            backup_last_name TEXT NOT NULL DEFAULT '',
+            guard_reserve_credits INTEGER NOT NULL DEFAULT 0,
+            guard_daily_token_limit INTEGER NOT NULL DEFAULT 0,
+            guard_daily_credit_limit INTEGER NOT NULL DEFAULT 0,
+            guard_model_daily_token_limit INTEGER NOT NULL DEFAULT 0,
             models_updated INTEGER NOT NULL DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS session_bindings (
             affinity_key TEXT PRIMARY KEY, account_id TEXT NOT NULL,
@@ -234,6 +322,11 @@ class Database:
             key_id TEXT NOT NULL, day TEXT NOT NULL,
             count INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
             key_name TEXT, PRIMARY KEY (key_id, day))""",
+        """CREATE TABLE IF NOT EXISTS account_usage_daily (
+            account_id TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+            count INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
+            credits_micro INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (account_id, day, model))""",
         """CREATE INDEX IF NOT EXISTS idx_bindings_expires
             ON session_bindings(expires)""",
         """CREATE INDEX IF NOT EXISTS idx_logs_key_time
@@ -248,6 +341,8 @@ class Database:
             ON upstream_request_usage(account_id, request_time)""",
         """CREATE INDEX IF NOT EXISTS idx_key_usage_day
             ON key_usage_daily(day)""",
+        """CREATE INDEX IF NOT EXISTS idx_account_usage_day
+            ON account_usage_daily(day)""",
     )
 
     def __init__(self, path):
@@ -269,6 +364,7 @@ class Database:
         self.prune_request_logs()
         self.prune_upstream_usage()
         self.prune_key_usage_daily()
+        self.prune_account_usage_daily()
 
     # -- connections --------------------------------------------------------
     def _reader(self):
@@ -377,7 +473,7 @@ class Database:
 
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
-    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4))
+    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -408,7 +504,13 @@ class Database:
     # -- settings -----------------------------------------------------------
     SETTINGS_COLUMNS = (
         "auto_checkin", "checkin_time", "affinity_expiry_days", "credit_min_interval",
-        "sync_start", "sync_end", "batch_spread", "default_routing", "models_updated",
+        "sync_start", "sync_end", "batch_spread", "default_routing",
+        "queue_failover", "queue_retry", "queue_cooldown", "queue_hold_ms",
+        "queue_model_fallback", "queue_fallback_model", "models_updated",
+        "backup_enabled", "backup_interval_hours", "backup_keep",
+        "backup_last_at", "backup_last_name",
+        "guard_reserve_credits", "guard_daily_token_limit",
+        "guard_daily_credit_limit", "guard_model_daily_token_limit",
     )
 
     def get_settings(self, defaults=None):
@@ -732,6 +834,59 @@ class Database:
                 "DELETE FROM request_logs WHERE id IN"
                 " (SELECT id FROM request_logs ORDER BY id LIMIT ?)", (total - max_rows,))
         return total - max_rows
+
+    # -- account usage daily (guards) --------------------------------------
+    def add_account_usage(self, account_id, model, tokens, credits=0.0, day=None):
+        """累加一次账号用量（护栏的计数来源）。
+
+        与 key_usage_daily 的「覆盖当日快照」不同，这里是**累加**：调用点是
+        每笔完成的请求，粒度就是一次请求，没有快照可覆盖。重启后内存计数
+        丢失也无妨——库里已经逐次累加过了，这正是把计数放库里的原因。
+
+        ``credits`` 按 MICRO 落库（与其他金额列一致），避免浮点累加漂移。
+        """
+        if not account_id:
+            return
+        day = day or datetime.fromtimestamp(time.time(), CN).strftime("%Y-%m-%d")
+        with self.transaction():
+            self._write.execute(
+                """INSERT INTO account_usage_daily
+                       (account_id, day, model, count, tokens, credits_micro)
+                   VALUES (?,?,?,1,?,?)
+                   ON CONFLICT(account_id, day, model) DO UPDATE SET
+                     count = count + 1,
+                     tokens = tokens + excluded.tokens,
+                     credits_micro = credits_micro + excluded.credits_micro""",
+                (str(account_id), day, str(model or ""),
+                 _to_int(tokens) or 0, _to_micro(credits) or 0))
+
+    def account_usage_today(self, day=None):
+        """当天各账号的用量汇总 → {aid: {tokens, credits, models}}。
+
+        按 (账号, 模型) 聚合过一次再返回，上层不用再关心模型维度：
+        ``tokens`` / ``credits`` 是账号当天总量，``models`` 是逐模型 token 数。
+        """
+        day = day or datetime.fromtimestamp(time.time(), CN).strftime("%Y-%m-%d")
+        out = {}
+        for row in self.query(
+                "SELECT account_id, model, tokens, credits_micro FROM account_usage_daily"
+                " WHERE day = ?", (day,)):
+            aid = str(row["account_id"])
+            bucket = out.setdefault(aid, {"tokens": 0, "credits": 0.0, "models": {}})
+            tokens = int(row["tokens"] or 0)
+            bucket["tokens"] += tokens
+            bucket["credits"] += _from_micro(row["credits_micro"]) or 0.0
+            model = str(row["model"] or "")
+            if model:
+                bucket["models"][model] = bucket["models"].get(model, 0) + tokens
+        return out
+
+    def prune_account_usage_daily(self, keep_days=KEY_USAGE_KEEP_DAYS):
+        """启动时裁剪：day 是 TEXT 的 YYYY-MM-DD，可直接字符串比较。"""
+        cutoff = (datetime.fromtimestamp(time.time(), CN) - timedelta(days=keep_days)
+                  ).strftime("%Y-%m-%d")
+        with self.transaction():
+            self._write.execute("DELETE FROM account_usage_daily WHERE day < ?", (cutoff,))
 
     # -- key usage daily ---------------------------------------------------
     def save_key_usage_daily(self, keys):

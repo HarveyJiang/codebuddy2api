@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -52,9 +54,25 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["accounts"]["usable"], 1)
         # 默认响应不含账号名，避免未鉴权端点泄露信息。
         self.assertNotIn("detail", health["accounts"])
+        # 版本标识：未鉴权端点也带，登录页要靠它显示当前部署。
+        self.assertIn("version", health)
         await self.login()
         self.client.headers.pop("X-CSRF-Token")
         self.assertEqual((await self.client.post("/admin/api/keys", json={"name": "bad"})).status_code, 403)
+
+    async def test_version_reflects_injected_image_tag(self):
+        """注入镜像 tag 后，/health 与 overview 都要显示它。
+
+        首屏（登录页）只能读未鉴权的 /health，会话内读 overview；两处必须一致，
+        否则登录前后版本显示对不上。
+        """
+        with mock.patch.dict(os.environ, {"WORKBUDDY_IMAGE_TAG": "main-deadbeef"}, clear=True):
+            health = (await self.client.get("/health")).json()
+            self.assertEqual(health["version"], "main-deadbeef")
+            await self.login()
+            overview = (await self.client.get("/admin/api/overview")).json()
+            self.assertEqual(overview["version"]["label"], "main-deadbeef")
+            self.assertEqual(overview["version"]["image_tag"], "main-deadbeef")
 
     async def test_account_import_disable_delete_and_restart(self):
         await self.login()
@@ -285,6 +303,68 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.patch("/admin/api/pool/settings", json={"credit_min_interval": 99999})).status_code, 400)
         # 旧的积分同步间隔字段已移除。
         self.assertNotIn("sync_interval", (await self.client.get("/admin/api/overview")).json()["pool"])
+
+    async def test_queue_failover_settings_and_validation(self):
+        """容量队列自动切换的设置项：默认关闭、可开启、非法值拒绝、重启保留。"""
+        await self.login()
+        overview = (await self.client.get("/admin/api/overview")).json()
+        # 默认关闭：这是唯一会重放请求的功能，必须用户显式打开。
+        self.assertFalse(overview["pool"]["queue_failover"])
+        self.assertTrue(overview["pool"]["queue_model_fallback"])
+        saved = await self.client.patch("/admin/api/pool/settings", json={
+            "queue_failover": True, "queue_retry": 4, "queue_cooldown": 90,
+            "queue_hold_ms": 1500, "queue_model_fallback": False,
+            "queue_fallback_model": "fast-model"})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        pool = saved.json()["pool"]
+        self.assertTrue(pool["queue_failover"])
+        self.assertEqual((pool["queue_retry"], pool["queue_cooldown"]), (4, 90))
+        self.assertEqual(pool["queue_hold_ms"], 1500)
+        self.assertFalse(pool["queue_model_fallback"])
+        # 非法值一律 400，不要把坏配置带到运行期。
+        for bad in ({"queue_retry": 0}, {"queue_retry": 99}, {"queue_cooldown": -1},
+                    {"queue_cooldown": 99999}, {"queue_hold_ms": -5},
+                    {"queue_hold_ms": 60000}, {"queue_failover": "yes"},
+                    {"queue_model_fallback": 1}, {"queue_fallback_model": ""}):
+            response = await self.client.patch("/admin/api/pool/settings", json=bad)
+            self.assertEqual(response.status_code, 400, f"{bad} 应被拒绝")
+        # 重启后设置仍在：重建整个应用（重新读库）也必须读回同一个值。
+        self.make_app()
+        await self.login()
+        again = (await self.client.get("/admin/api/overview")).json()["pool"]
+        self.assertTrue(again["queue_failover"])
+        self.assertEqual(again["queue_retry"], 4)
+        self.assertEqual(again["queue_hold_ms"], 1500)
+
+    async def test_guard_settings_default_off_and_validated(self):
+        """账号限额护栏：默认全关、可开启、非法值拒绝、重启保留。"""
+        await self.login()
+        overview = (await self.client.get("/admin/api/overview")).json()
+        # 默认全 0 = 关闭。护栏会主动拒绝请求，默认必须无为。
+        for field in ("guard_reserve_credits", "guard_daily_token_limit",
+                      "guard_daily_credit_limit", "guard_model_daily_token_limit"):
+            self.assertEqual(overview["pool"][field], 0, field)
+        saved = await self.client.patch("/admin/api/pool/settings", json={
+            "guard_reserve_credits": 100, "guard_daily_token_limit": 5000,
+            "guard_daily_credit_limit": 50, "guard_model_daily_token_limit": 2000})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        pool = saved.json()["pool"]
+        self.assertEqual(pool["guard_reserve_credits"], 100)
+        self.assertEqual(pool["guard_daily_token_limit"], 5000)
+        self.assertEqual(pool["guard_daily_credit_limit"], 50)
+        self.assertEqual(pool["guard_model_daily_token_limit"], 2000)
+        # 非法值一律 400：负数会绕过 0=关闭 的语义，必须挡在入口。
+        for bad in ({"guard_reserve_credits": -1}, {"guard_daily_token_limit": "abc"},
+                    {"guard_daily_credit_limit": 10**12},
+                    {"guard_model_daily_token_limit": -100}):
+            response = await self.client.patch("/admin/api/pool/settings", json=bad)
+            self.assertEqual(response.status_code, 400, f"{bad} 应被拒绝")
+        # 重启后设置仍在。
+        self.make_app()
+        await self.login()
+        again = (await self.client.get("/admin/api/overview")).json()["pool"]
+        self.assertEqual(again["guard_reserve_credits"], 100)
+        self.assertEqual(again["guard_model_daily_token_limit"], 2000)
 
     async def test_custom_model_add_hide_and_callable(self):
         """手动添加模型：能保存、不被拉取冲掉、来源区分上游与自定义。"""
