@@ -1244,6 +1244,59 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.store.data["pool"]["queue_model_fallback"] = False
         self.assertEqual(self.pool.fallback_models("step-5-preview"), [])
 
+    def test_fallback_models_never_crosses_backend(self):
+        """降级只能在同后端内换模型：否则会拿腾讯账号去要字节的模型。
+
+        快照里两个后端的模型混在一个列表（trae 带 ``trae/`` 前缀），而换模型后
+        仍用**原 backend** 选号。不过滤就会出现「workbuddy 请求降级成 trae/xxx，
+        然后用腾讯账号去请求」，上游必然 4xx。回归：不传 backend 时保持旧行为。
+        """
+        registry = Mock()
+        registry.snapshot.return_value = {"models": [
+            {"id": "step-5-preview", "enabled": True, "credits": 0.0, "backend": "workbuddy"},
+            {"id": "space-bunny", "enabled": True, "credits": 0.08, "backend": "workbuddy"},
+            {"id": "fast-model", "enabled": True, "credits": 0.21, "backend": "workbuddy"},
+            # 更便宜，但属于另一个后端——绝不能被选进来。
+            {"id": "trae/glm-5.3-flash", "enabled": True, "credits": 0.06, "backend": "trae"},
+            {"id": "trae/space-bunny", "enabled": True, "credits": 0.01, "backend": "trae"},
+        ]}
+        self.pool.model_registry = registry
+
+        for backend in ("workbuddy", "trae"):
+            picked = self.pool.fallback_models("step-5-preview", backend=backend)
+            crossed = [m for m in picked if (m.startswith("trae/") != (backend == "trae"))]
+            self.assertEqual(crossed, [], f"{backend} 的降级候选里混进了另一个后端的模型")
+
+        # workbuddy 侧必须仍有可用候选（不能因过滤而退化成空）
+        wb = self.pool.fallback_models("step-5-preview", backend="workbuddy")
+        self.assertIn("space-bunny", wb)
+        self.assertNotIn("trae/space-bunny", wb)
+
+    def test_fallback_model_setting_is_also_backend_checked(self):
+        """设置里的兜底模型属于另一个后端时也要跳过。
+
+        否则用户把兜底配成 trae 模型，workbuddy 请求在试尽同档后就会去打它。
+        """
+        registry = Mock()
+        registry.snapshot.return_value = {"models": [
+            {"id": "step-5-preview", "enabled": True, "credits": 0.0, "backend": "workbuddy"},
+            {"id": "trae/fast-model", "enabled": True, "credits": 0.21, "backend": "trae"},
+        ]}
+        self.pool.model_registry = registry
+        self.store.data["pool"]["queue_fallback_model"] = "trae/fast-model"
+        ordered = self.pool.fallback_models("step-5-preview", backend="workbuddy")
+        self.assertNotIn("trae/fast-model", ordered,
+                         "兜底模型跨后端时必须跳过，否则会拿腾讯账号要字节模型")
+
+        # 同后端的兜底模型照常生效（别把功能一起修没了）。
+        self.store.data["pool"]["queue_fallback_model"] = "space-bunny"
+        registry.snapshot.return_value = {"models": [
+            {"id": "step-5-preview", "enabled": True, "credits": 0.0, "backend": "workbuddy"},
+            {"id": "space-bunny", "enabled": True, "credits": 0.21, "backend": "workbuddy"},
+        ]}
+        self.assertIn("space-bunny",
+                      self.pool.fallback_models("step-5-preview", backend="workbuddy"))
+
     async def test_disabled_feature_keeps_original_behaviour(self):
         """默认关闭时行为与改动前一致：排队响应原样透传，不重试。"""
         calls = []

@@ -356,11 +356,17 @@ class AccountPool:
     def queued(self, aid):
         return self.store.data["account_status"].get(aid, {}).get("queued_until", 0) > self.clock()
 
-    def fallback_models(self, current_model, tried=()):
+    def fallback_models(self, current_model, tried=(), backend=None):
         """按「同价位免费模型 → 快速路由兜底」给出降级候选（spec 4.5）。
 
         返回 id 列表，已试过的排除。管理后台未加载注册表时返回空列表——
         此时降级模型无从判断，退回纯换号行为比瞎猜模型名安全。
+
+        只能在同一 backend 内换模型：快照里 workbuddy 与 trae 的模型混在一起
+        （trae 带 ``trae/`` 前缀），而换模型后仍然用**原 backend** 的账号去请求
+        （见 PoolMiddleware 的 try_select(..., backend=backend)）。若不按 backend
+        过滤，workbuddy 请求会降级成 ``trae/xxx``，然后拿腾讯账号去要字节的模型，
+        上游必然 4xx——这正是后端隔离要防的那类串扰。
         """
         registry = self.model_registry
         if registry is None or not self._pool_cfg().get("queue_model_fallback", True):
@@ -377,8 +383,14 @@ class AccountPool:
             credits = entry.get("credits")
             return credits if isinstance(credits, (int, float)) else 0.0
 
+        def same_backend(entry):
+            # 未指定 backend（老调用方/测试）时不过滤，保持原有行为。
+            # 快照条目一律带 backend（models.snapshot 显式写入），缺失时按 workbuddy。
+            return backend is None or entry.get("backend", "workbuddy") == backend
+
         candidates = [entry for entry in snapshot.values()
-                      if entry.get("enabled") and entry["id"] not in tried]
+                      if entry.get("enabled") and entry["id"] not in tried
+                      and same_backend(entry)]
         if base_credits is not None and base_credits > 0:
             # ±50% 视为同档：上游倍率是离散小数，精确相等会几乎选不中。
             low, high = base_credits * 0.5, base_credits * 1.5
@@ -395,8 +407,11 @@ class AccountPool:
 
         ordered = [entry["id"] for entry in same_tier]
         # 兜底模型不参与上面的排序：它只在同档都排过队后才用一次。
+        # 同样要过 backend 检查：用户在设置里写的兜底模型可能属于另一个后端，
+        # 用它就会拿腾讯账号去要字节模型。
         fallback = self._pool_cfg().get("queue_fallback_model") or "fast-model"
-        if fallback not in tried and fallback in snapshot and fallback not in ordered:
+        if (fallback not in tried and fallback in snapshot and fallback not in ordered
+                and same_backend(snapshot[fallback])):
             ordered.append(fallback)
         return ordered
 
@@ -1301,7 +1316,7 @@ class PoolMiddleware:
                 if picked is None:
                     # 候选账号已试尽。先看能不能换个模型再继续，否则收工，
                     # 把上游最后一次的排队响应原样返回。
-                    next_model = self._next_model(pool_cfg, attempt_model, computed_models)
+                    next_model = self._next_model(pool_cfg, attempt_model, computed_models, backend)
                     if next_model is None:
                         break
                     computed_models.add(attempt_model)
@@ -1403,16 +1418,18 @@ class PoolMiddleware:
             return False
         return self.pool.waf_gate.note_waf(aid, backend=backend)
 
-    def _next_model(self, pool_cfg, current_model, computed_models):
+    def _next_model(self, pool_cfg, current_model, computed_models, backend=None):
         """挑下一个该试的模型；没有则返回 None（表示该收工了）。
 
         ``computed_models`` 是「已经取过候选的当前模型」集合——每换一次模型就
         把上一个记进来，保证同一个模型不会被反复取到同一个候选。
+        ``backend`` 必须透传：降级只能在同后端内换模型，否则会拿一个后端的账号
+        去要另一个后端的模型（见 fallback_models 的说明）。
         """
         if not pool_cfg.get("queue_model_fallback", True):
             return None
         tried = set(computed_models) | {current_model}
-        for candidate in self.pool.fallback_models(current_model, tried=tried):
+        for candidate in self.pool.fallback_models(current_model, tried=tried, backend=backend):
             return candidate
         return None
 

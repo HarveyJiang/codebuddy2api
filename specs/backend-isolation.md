@@ -26,7 +26,7 @@ header 或路径）。见 `core/backends/registry.py:backend_name_for`。
 
 ---
 
-## 四条必须成立的隔离不变量
+## 五条必须成立的隔离不变量
 
 ### 1. 选号必须带后端过滤
 
@@ -79,6 +79,30 @@ header 或路径）。见 `core/backends/registry.py:backend_name_for`。
 `pool_worker` 先 `adopt_auth_files()` 再 `tick()`。收养读的是**所有**后端的凭据文件，
 一个坏文件抛异常若不单独接住，**tick 根本不会跑**——两个后端的签到与刷新一起停摆。
 现在收养单独兜底并记日志，失败不影响本轮 tick。
+
+### 5. 排队降级换模型不得跨后端
+
+`AccountPool.fallback_models()` 从 `registry.snapshot()["models"]` 里挑降级候选，
+而这个快照**把两个后端的模型混在一个列表**（trae 条目带 `trae/` 前缀）。
+换模型之后 `PoolMiddleware` 仍然用**原 backend** 去 `try_select`：
+
+```python
+next_model = self._next_model(pool_cfg, attempt_model, computed_models, backend)
+...
+picked = self.pool.try_select(affinity_key, kid, tried_accounts,
+                              model=attempt_model, backend=backend)   # backend 没变
+```
+
+所以一旦不过滤，workbuddy 请求会降级成 `trae/glm-5.3-flash`，然后**拿腾讯账号去要
+字节的模型**——上游必然 4xx。这与「选号必须带后端过滤」是同一类风险的另一条出口：
+那条不变量管的是**账号**别串，这条管的是**模型名**别串。
+
+`fallback_models` 现在接受 `backend` 并按 `entry["backend"]` 过滤候选，用户配置的
+`queue_fallback_model` 也走同一检查（它同样可能被写成另一个后端的模型）。不传
+`backend` 时不过滤，保持老调用方的行为。
+
+回归测试：`test_fallback_models_never_crosses_backend`、
+`test_fallback_model_setting_is_also_backend_checked`（均验证过「去掉过滤即失败」）。
 
 ---
 
