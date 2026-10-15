@@ -627,6 +627,17 @@ workbuddy2api/
 python3 -m pytest tests/
 ```
 
+管理页前端还有一组不依赖浏览器的脚本（Node，无第三方依赖）：
+
+```bash
+node tests/frontend/fmttokens.test.mjs      # 积分/token 的整数展示口径
+node tests/frontend/modelgroup.test.mjs     # 同名模型跨后端的合并分组
+node tests/frontend/rendermodels.test.mjs   # 用真实 overview 数据渲染模型表
+```
+
+`rendermodels.test.mjs` 需要一份可用的 state.db（默认读 `/tmp/opencode/v7fresh`），
+它是唯一能抓出「字段名写错导致渲染成 undefined」这类模板错误的检查，改模型表时务必跑。
+
 ---
 
 ## 致谢

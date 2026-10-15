@@ -136,6 +136,60 @@ class DatabaseTests(unittest.TestCase):
         db.close()
         Database(path).close()
 
+    def test_v7_to_v8_backfills_backend_on_existing_request_logs(self):
+        """v7 → v8：request_logs 补 backend 列，并**按 account_id 回填历史行**。
+
+        历史行必须回填而不是留空：已有记录理应能看出走的是哪条链路。账号的 backend
+        是稳定属性，所以按 account_id 关联 accounts 是准确的。关联不到的（账号已删）
+        保持 NULL —— 一律标成 workbuddy 会造成假信息。
+        """
+        import sqlite3, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "state.db")
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);"
+                "INSERT INTO schema_meta VALUES ('version','7');"
+                "CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL,"
+                " file TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,"
+                " created INTEGER NOT NULL DEFAULT 0,"
+                " backend TEXT NOT NULL DEFAULT 'workbuddy');"
+                "INSERT INTO accounts VALUES ('w1','腾讯号','a.info',1,100,'workbuddy');"
+                "INSERT INTO accounts VALUES ('t1','字节号','b.info',1,100,'trae');"
+                "CREATE TABLE request_logs (id INTEGER PRIMARY KEY,"
+                " time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api',"
+                " path TEXT NOT NULL, status INTEGER, outcome TEXT NOT NULL,"
+                " duration_ms INTEGER NOT NULL, key_id TEXT, account_id TEXT,"
+                " account_name TEXT, model_id TEXT, model_name TEXT,"
+                " upstream_request_id TEXT);"
+                # time 必须用「刚才」而不是 1/2/3：启动时的 prune_request_logs 会按
+                # 93 天保留期清掉过期的行，用纪元时间戳会连被测数据一起删掉。
+                "INSERT INTO request_logs (time,path,outcome,duration_ms,account_id)"
+                " VALUES (strftime('%s','now'),'/v1/chat/completions','success',10,'w1');"
+                "INSERT INTO request_logs (time,path,outcome,duration_ms,account_id)"
+                " VALUES (strftime('%s','now'),'/v1/chat/completions','success',10,'t1');"
+                "INSERT INTO request_logs (time,path,outcome,duration_ms,account_id)"
+                " VALUES (strftime('%s','now'),'/v1/chat/completions','success',10,'gone');")
+            conn.commit()
+            conn.close()
+
+            db = Database(path)
+            self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                             str(SCHEMA_VERSION))
+            rows = {r["account_id"]: r["backend"] for r in
+                    db.query("SELECT account_id, backend FROM request_logs")}
+            self.assertEqual(rows["w1"], "workbuddy")
+            self.assertEqual(rows["t1"], "trae", "字节账号的历史行必须回填成 trae")
+            self.assertIsNone(rows["gone"], "账号已删除的行应保持 NULL，不能瞎猜")
+            # 幂等：重开不报 duplicate column，也不改变回填结果。
+            db.close()
+            db2 = Database(path)
+            again = {r["account_id"]: r["backend"] for r in
+                     db2.query("SELECT account_id, backend FROM request_logs")}
+            self.assertEqual(again, rows)
+            db2.close()
+
     def test_accounts_money_micro_roundtrip(self):
         db = Database(self.root / "t.db")
         db.save_accounts({"a1": {"name": "甲", "file": "a.info", "enabled": True, "created": 100}},

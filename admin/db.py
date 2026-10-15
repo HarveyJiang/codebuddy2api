@@ -129,7 +129,31 @@ def _v6_to_v7(db):
             "ALTER TABLE accounts ADD COLUMN backend TEXT NOT NULL DEFAULT 'workbuddy'")
 
 
-SCHEMA_VERSION = 7
+def _v7_to_v8(db):
+    """v7 → v8：给 request_logs 补 backend 列（最近请求要能区分 trae / workbuddy）。
+
+    与 _v6_to_v7 同样的理由：CREATE TABLE IF NOT EXISTS 不给已存在的表补列，
+    必须 PRAGMA 判断后 ALTER。
+
+    历史行回填而非留空：**已有记录**理应能看出走的是哪条链路，而账号的 backend
+    是稳定属性（一个 aid 不会在不同后端间迁移），所以按 account_id 关联 accounts
+    回填是准确的。关联不到的（账号已删除）保持 NULL，前端显示「—」。
+
+    默认值给 NULL 而不是 'workbuddy'：writes 时一律显式写 backend，默认值只影响
+    回填不到的旧行；把它们一律标成 workbuddy 会造成**假信息**。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(request_logs)")}
+    if "backend" not in columns:
+        db._write.execute("ALTER TABLE request_logs ADD COLUMN backend TEXT")
+        db._write.execute(
+            """UPDATE request_logs SET backend = (
+                   SELECT accounts.backend FROM accounts
+                   WHERE accounts.id = request_logs.account_id)
+               WHERE account_id IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM accounts WHERE accounts.id = request_logs.account_id)""")
+
+
+SCHEMA_VERSION = 8
 
 MICRO = 1_000_000
 
@@ -173,7 +197,7 @@ MODEL_COLUMNS = (
 
 LOG_COLUMNS = (
     "time", "source", "path", "status", "outcome", "duration_ms", "key_id", "account_id",
-    "account_name", "model_id", "model_name", "upstream_request_id",
+    "account_name", "model_id", "model_name", "upstream_request_id", "backend",
 )
 
 REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
@@ -313,7 +337,8 @@ class Database:
             time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api', path TEXT NOT NULL,
             status INTEGER, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL,
             key_id TEXT, account_id TEXT, account_name TEXT,
-            model_id TEXT, model_name TEXT, upstream_request_id TEXT)""",
+            model_id TEXT, model_name TEXT, upstream_request_id TEXT,
+            backend TEXT)""",
         """CREATE TABLE IF NOT EXISTS upstream_request_usage (
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
@@ -473,7 +498,8 @@ class Database:
 
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
-    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7))
+    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
+                  (8, _v7_to_v8))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")

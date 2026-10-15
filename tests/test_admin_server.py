@@ -9,9 +9,18 @@ from unittest import mock
 import httpx
 
 import admin.server as admin_server
+from admin.metrics import MetricsMiddleware, RequestMetrics
 
 ADMIN = "admin-test-credential-long-enough"
 API = "client-existing-key"
+
+
+async def _empty_receive():
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+async def _noop_send(message):
+    return None
 
 
 def credential(uid="one", name="测试账号"):
@@ -257,6 +266,52 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         # 不带 key_id 时行为不变（回归：不能把所有请求都过滤掉）。
         all_rows = (await self.client.get("/admin/api/logs?limit=50")).json()
         self.assertEqual(all_rows["total"], 25)
+        await self.client.aclose()
+
+    async def test_logs_expose_backend(self):
+        """request_logs.backend 必须透到 /admin/api/logs：最近请求要能区分 trae / workbuddy。
+
+        这是「后端隔离」在**可观测性**上的对应项——光写入不返回，界面依然分不清链路。
+        老记录（账号已删）的 backend 为 NULL，接口要原样返回而不是替成 'workbuddy'。
+
+        这里刻意**走真实请求链路**（MetricsMiddleware 写日志）而不是直接 append 行：
+        直接插库只能证明读接口透传，证明不了 backend 真的在写入点被取到。
+        """
+        await self.login()
+        store = self.app.state.store
+        # 两个账号，各属一个后端。
+        store.db.save_accounts(
+            {"w1": {"name": "腾讯号", "file": "w.info", "enabled": True, "created": 1,
+                    "backend": "workbuddy"},
+             "t1": {"name": "字节号", "file": "t.info", "enabled": True, "created": 1,
+                    "backend": "trae"}},
+            {})
+        seen = {}
+
+        async def inner(scope, receive, send):
+            # MetricsMiddleware 的外层，模拟 PoolMiddleware 挂上下文。
+            seen["scope"] = scope
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        middleware = MetricsMiddleware(inner, RequestMetrics(), source="api", store=store)
+        from admin.pool import REQUEST_LOG_CONTEXT
+        for account_id, backend in (("w1", "workbuddy"), ("t1", "trae")):
+            scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions",
+                     "headers": [],
+                     REQUEST_LOG_CONTEXT: {"key_id": "k1", "account_id": account_id,
+                                           "account_name": None, "backend": backend,
+                                           "model_id": "hy3", "model_name": "hy3",
+                                           "error_code": None}}
+            await middleware(scope, _empty_receive, _noop_send)
+
+        # 缓冲落库（平时由 5 秒防抖触发）。
+        store.save()
+        rows = (await self.client.get("/admin/api/logs?limit=10")).json()["rows"]
+        by_account = {r["account_id"]: r["backend"] for r in rows}
+        self.assertEqual(by_account["w1"], "workbuddy")
+        self.assertEqual(by_account["t1"], "trae",
+                         "trae 账号的请求必须记成 trae，否则界面会把字节请求标成腾讯")
         await self.client.aclose()
 
     async def test_usage_endpoints_paging_report_and_throttle(self):

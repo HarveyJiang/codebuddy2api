@@ -116,26 +116,105 @@ function render() {
   $("test-submit").disabled = !accounts.some(a => a.enabled) || busy;
   $("test-history").innerHTML = events.length ? events.map(e => `<div class="history-row"><span class="mono muted">${esc(stamp(e.time * 1000))}</span><strong>${esc(e.model)}</strong><span class="pill ${e.ok ? "green" : "red"}">${e.ok ? "成功" : "失败"}</span><span class="mono">${e.seconds}s</span></div>`).join("") : '<p class="history-empty">暂无测试记录，发送第一条测试消息。</p>';
 }
+// 后端元数据与徽标。**所有与后端名有关的显示都走这几个 helper**，不在各处写
+// `a.backend === "trae"`：将来加后端（如阿里千问办公）只需在此登记，页面各处不用动。
+// 图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
+const BACKEND_ICON = {workbuddy: "◈", trae: "⚡"};
+const BACKEND_NAME = {workbuddy: "WorkBuddy", trae: "Trae"};
+const backendIcon = b => BACKEND_ICON[b] || "◇";
+const backendName = b => BACKEND_NAME[b] || (b || "未知");
+// 列表列宽窄时用短名（最近请求的后端列）。
+const backendLabel = b => ({workbuddy: "WB", trae: "Trae"}[b] || "—");
+
+// 请求行里的后端徽标；backend 取自**实际选中的账号**，老记录/账号已删显示「—」。
+function backendBadge(b) {
+  if (!b) return '<span class="muted">—</span>';
+  return `<span class="mini-backend mini-${esc(b)}" title="该请求由 ${esc(b)} 账号处理">${esc(backendLabel(b))}</span>`;
+}
+// 带后端名的徽标（账号表、模型表用），形如「◈ WorkBuddy」。
+function backendTag(b) {
+  const key = b || "workbuddy";
+  return `<span class="mini-backend mini-${esc(key)}" title="${esc(backendName(key))} 账号">${esc(backendIcon(key))} ${esc(backendName(key))}</span>`;
+}
+
 function renderModels() {
   const catalog = overview?.models;
   const list = Array.isArray(catalog?.models) ? catalog.models : [];
-  $("models-badge").textContent = list.filter(m => m.enabled).length + " / " + list.length;
+  // 同名模型跨后端合并成一行（需求 8）。**只合并展示，底层仍是两个独立模型** ——
+  // 倍率/上下文往往不同（如 step-5-preview：腾讯免费、字节 0.48），若合成一个数，
+  // 成本账本与排队降级会误判免费/付费。
+  const groups = groupModelsByName(list);
+  $("models-badge").textContent = groups.filter(g => g.items.some(m => m.enabled)).length + " / " + groups.length;
   const note = $("models-note");
   if (catalog?.error) { note.textContent = `上游拉取异常：${catalog.error}（当前展示${catalog.updated ? "上次缓存" : "内置官方列表"}）`; note.classList.add("field-error"); }
-  else { note.textContent = catalog?.updated ? `上次拉取：${stamp(catalog.updated * 1000)} · 每 6 小时自动刷新。禁用的模型不会出现在 /v1/models，调用会被拒绝。` : "尚未从上游拉取过，展示内置官方列表。服务启动与每 6 小时会自动尝试拉取。"; note.classList.remove("field-error"); }
-  $("models-body").innerHTML = list.map(m => {
-    const credits = m.credits === null || m.credits === undefined ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
-    const promoNote = m.promo ? `<small class="cell-note">${esc(m.promo.label)} ×${m.promo.credits}</small>` : "";
-    const ctx = m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : m.max_input_tokens) : "—";
-    // max 模式（上游 max_mode=true）下的上下文上限；无 max 模式则不显示
-    const ctxNote = m.max_context_length && m.max_context_length > (m.max_input_tokens || 0)
-      ? `<small class="cell-note">max 模式 ${Math.round(m.max_context_length / 1000)}K</small>` : "";
-    // 来源：上游返回 / 内置兜底 / 用户手动添加。自定义项才能删。
-    const sourceLabel = {upstream:"上游", builtin:"内置", custom:"自定义"}[m.source] || m.source || "—";
-    const sourceTag = `<span class="pill ${m.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
-    const del = m.custom ? `<button class="danger" data-model-delete="${esc(m.id)}">删除</button>` : "";
-    return `<tr><td><strong>${esc(m.id)}</strong>${m.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}<small class="cell-note">${esc(m.name || "")}</small></td><td>${sourceTag}</td><td>${esc(m.description || "—")}</td><td><span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${credits}</span>${promoNote}</td><td class="mono">${ctx}${ctxNote}</td><td><span class="pill ${m.enabled ? "green" : ""}">${m.enabled ? "启用" : "禁用"}</span></td><td class="align-right">${del}<button data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}">${m.enabled ? "禁用" : "启用"}</button></td></tr>`;
-  }).join("") || '<tr><td colspan="7" class="muted">模型列表为空，请点击「立即拉取」或手动添加。</td></tr>';
+  else { note.textContent = catalog?.updated ? `上次拉取：${stamp(catalog.updated * 1000)} · 每 6 小时自动刷新。同名模型已合并展示，倍率/上下文按后端分行。禁用的模型不会出现在 /v1/models。` : "尚未从上游拉取过，展示内置官方列表。服务启动与每 6 小时会自动尝试拉取。"; note.classList.remove("field-error"); }
+  $("models-body").innerHTML = groups.map(renderModelGroup).join("") || '<tr><td colspan="7" class="muted">模型列表为空，请点击「立即拉取」或手动添加。</td></tr>';
+}
+
+// 按「剥掉 trae/ 前缀后的模型名」归组：同名的不同后端合并到一组。
+// 组内保持 workbuddy 在前、其余按后端名排序，保证渲染顺序稳定。
+function groupModelsByName(list) {
+  const byName = new Map();
+  for (const m of list) {
+    const key = modelBaseName(m.id);
+    if (!byName.has(key)) byName.set(key, {key, items: []});
+    byName.get(key).items.push(m);
+  }
+  const order = {workbuddy: 0, trae: 1};
+  const groups = [...byName.values()];
+  for (const g of groups) g.items.sort((a, b) => ((order[a.backend] ?? 9) - (order[b.backend] ?? 9)) || a.id.localeCompare(b.id));
+  groups.sort((a, b) => (order[a.items[0].backend] ?? 9) - (order[b.items[0].backend] ?? 9) || a.key.localeCompare(b.key));
+  return groups;
+}
+const modelBaseName = id => String(id || "").replace(/^trae\//, "");
+
+// 倍率/上下文的统一格式化。倍率保留后端给的精度（0.06 / 0.79 这种不能取整，
+// 否则会丢失免费与付费的区别）。
+const creditsText = m => m.credits === null || m.credits === undefined ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
+const ctxText = m => m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : String(m.max_input_tokens)) : "—";
+
+function renderModelGroup(g) {
+  const items = g.items;
+  const primary = items[0];
+  const multi = items.length > 1;
+  const enabledCount = items.filter(m => m.enabled).length;
+  const allEnabled = enabledCount === items.length;
+  const anyEnabled = enabledCount > 0;
+
+  // 后端标记：单后端直接打标；多后端在每个值前面标，读得出「哪个数属于哪个后端」。
+  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || "workbuddy")}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))} ${esc(backendLabel(m.backend))}</span>`;
+
+  const creditsCell = multi
+    ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span></div>`).join("")
+    : `<span class="pill ${primary.credits === 0 ? "green" : primary.credits && primary.credits >= 1 ? "amber" : ""}">${esc(creditsText(primary))}</span>`;
+  const promoNote = primary.promo ? `<small class="cell-note">${esc(primary.promo.label)} ×${primary.promo.credits}</small>` : "";
+
+  const ctxCell = multi
+    ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="mono">${esc(ctxText(m))}</span></div>`).join("")
+    : `<span class="mono">${esc(ctxText(primary))}</span>${primary.max_context_length && primary.max_context_length > (primary.max_input_tokens || 0) ? `<small class="cell-note">max 模式 ${Math.round(primary.max_context_length / 1000)}K</small>` : ""}`;
+
+  const sourceLabel = {upstream: "上游", builtin: "内置", custom: "自定义"}[primary.source] || primary.source || "—";
+  const sourceTag = `<span class="pill ${primary.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
+  const desc = items.map(m => m.description).find(Boolean);
+
+  // 行级批量开关：一次作用于该名字的**全部后端**（决定 8 的「合并显示 + 默认全选禁用/启用」）。
+  const batchToggle = `<button data-model-group-toggle="${esc(g.key)}" data-enabled="${allEnabled ? "0" : "1"}" title="一次${allEnabled ? "禁用" : "启用"}该模型在所有后端的条目">${allEnabled ? "全部禁用" : "全部启用"}</button>`;
+  // 单后端删除（仅自定义项可删）。
+  const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}">删除${multi ? ` ${esc(backendLabel(m.backend))}` : ""}</button>`).join("");
+  // 单后端开关：合并行里仍需能只停其中一个后端。
+  const perBackend = multi
+    ? `<small class="cell-note">${items.map(m => `<button class="model-mini-toggle" data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}" title="${esc(m.id)}">${tagFor(m)}${m.enabled ? "已启用" : "已禁用"}</button>`).join(" ")}</small>`
+    : "";
+
+  const idCell = multi
+    ? `<strong>${esc(g.key)}</strong><small class="cell-note">${items.length} 个后端：${esc(items.map(m => backendName(m.backend)).join(" / "))}</small>`
+    : `<strong>${esc(primary.id)}</strong><small class="cell-note">${esc(primary.name || "")}</small>`;
+
+  const stateCell = multi
+    ? `<span class="pill ${allEnabled ? "green" : anyEnabled ? "amber" : ""}">${allEnabled ? "启用" : anyEnabled ? `${enabledCount}/${items.length} 启用` : "禁用"}</span>`
+    : `<span class="pill ${primary.enabled ? "green" : ""}">${primary.enabled ? "启用" : "禁用"}</span>`;
+
+  return `<tr><td>${idCell}</td><td>${sourceTag}</td><td>${esc(desc || "—")}</td><td>${creditsCell}${promoNote}</td><td>${ctxCell}</td><td>${stateCell}</td><td class="align-right">${del}${batchToggle}${perBackend}</td></tr>`;
 }
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
@@ -155,7 +234,7 @@ function renderDashboard() {
   $("dash-since").textContent = "统计开始于 " + stamp((m.started_at || 0)*1000);
   $("dash-routing").textContent = ({round_robin:"轮流分配请求，自动跳过不可用账号", random:"在可用账号中随机分配", expiry_first:"优先消耗最早到期的积分"}[overview.pool?.default_routing] || "按各密钥的分配策略选择账号");
   const states={available:"可用",paused:"已暂停",cooling:"冷却中",exhausted:"积分耗尽",invalid:"凭据异常"};
-  $("dash-account-list").innerHTML = accounts.slice(0,8).map(a=>`<div class="dashboard-account"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong>${a.nickname ? `<small class="cell-note">${esc(a.nickname)}</small>` : ""}</div><div class="dashboard-account-credit"><strong>${a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)}</strong><small class="cell-note">${a.backend === "trae" ? "Trae 积分" : "积分"}</small></div><span class="pill ${a.pool_state === 'available' ? 'green' : 'amber'}">${states[a.pool_state] || '待查询'}</span></div>`).join("") || '<p class="history-empty">尚未添加账号，点击“添加账号”开始。</p>';
+  $("dash-account-list").innerHTML = accounts.slice(0,8).map(a=>`<div class="dashboard-account"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong>${a.nickname ? `<small class="cell-note">${esc(a.nickname)}</small>` : ""}</div><div class="dashboard-account-credit"><strong>${a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)}</strong><small class="cell-note">${esc(backendName(a.backend))} 积分</small></div><span class="pill ${a.pool_state === 'available' ? 'green' : 'amber'}">${states[a.pool_state] || '待查询'}</span></div>`).join("") || '<p class="history-empty">尚未添加账号，点击“添加账号”开始。</p>';
   if(accounts.length > 8) $("dash-account-list").insertAdjacentHTML("beforeend",'<p class="muted">更多账号请前往账号池查看。</p>');
 }
 const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
@@ -165,10 +244,11 @@ const ROUTING_ICON = {"": "↺", round_robin: "↻", random: "⁘", expiry_first
 const ROUTING_SHORT = {"": "跟随默认", round_robin: "轮转", random: "随机", expiry_first: "快过期优先"};
 let logOffset = 0, logTotal = 0;
 function renderLogRows(rows) {
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === 'test' ? '后台测试' : 'API'}<small class="cell-note mono">${esc(r.path)}</small></td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }
 async function loadLogs(offset) {
-  const size = Number($("dash-page-size").value) || 50;
+  // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
+  const size = Number($("dash-page-size").value) || 10;
   try {
     const data = await api(`logs?limit=${size}&offset=${offset}`);
     logOffset = data.offset; logTotal = data.total;
@@ -207,7 +287,7 @@ function renderAccounts() {
     const credits = a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining);
     const expiring = a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon);
     const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
-    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}</strong>${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong>${backendTag(a.backend)}${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
@@ -651,6 +731,27 @@ $("models-refresh").addEventListener("click", async () => {
   finally { $("models-refresh").disabled = false; $("models-refresh").innerHTML = '<span>↻</span> 立即拉取'; }
 });
 $("models-body").addEventListener("click", async e => {
+  // 批量开关：一次作用于同名模型的**全部后端**（需求 8 的「批量禁用、启用」）。
+  // 单后端开关仍保留在行内小字里，便于只停其中一条链路。
+  const batch = e.target.closest("[data-model-group-toggle]");
+  if (batch) {
+    const key = batch.dataset.modelGroupToggle;
+    const enabled = batch.dataset.enabled === "1";
+    const list = (overview?.models?.models || []).filter(m => modelBaseName(m.id) === key);
+    const targets = list.filter(m => !!m.enabled !== enabled);
+    if (!targets.length) return;
+    batch.disabled = true;
+    const verb = enabled ? "启用" : "禁用";
+    try {
+      // 逐个串行：任一失败要能定位到具体模型，且已成功的保持生效。
+      for (const m of targets) {
+        await api("models/" + encodeURIComponent(m.id), {method:"PATCH", body:{enabled}});
+      }
+      await refresh();
+      toast(`已${verb}「${key}」的 ${targets.length} 个后端条目`);
+    } catch (err) { toast(err.message); batch.disabled = false; await refresh(); }
+    return;
+  }
   const toggle = e.target.closest("[data-model-toggle]");
   if (toggle) {
     toggle.disabled = true;
@@ -849,7 +950,7 @@ let keyReqId = null, keyReqOffset = 0, keyReqSize = 10;
 function renderKeyRequests(rows) {
   $("key-requests-body").innerHTML = rows.map(r =>
     `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
-    + `<td>${esc(r.backend || "—")}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td>`
+    + `<td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td>`
     + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td>`
     + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
     || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';

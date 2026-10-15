@@ -1263,6 +1263,10 @@ class PoolMiddleware:
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
         log_context = {"key_id": kid, "account_id": aid,
                        "account_name": self.pool.store.data["accounts"].get(aid, {}).get("name"),
+                       # 这条请求走的是哪条链路（trae / workbuddy）。取**实际选中的账号**
+                       # 的 backend，而不是由模型名推导的值——轮转/降级之后两者可能不同，
+                       # 记实际发生的事实才能用于事后排查。
+                       "backend": self.pool.store.data["accounts"].get(aid, {}).get("backend", "workbuddy"),
                        "model_id": model_name, "model_name": model_name,
                        "error_code": None}
         # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
@@ -1322,6 +1326,10 @@ class PoolMiddleware:
                     continue
                 log_context["account_id"] = aid
                 log_context["account_name"] = self.pool.store.data["accounts"].get(aid, {}).get("name")
+                # 与 account_id/account_name 同步刷新：切号后这条记录才是「实际用的那个号」。
+                # 排队切号已按后端隔离（try_select 传 backend），所以正常不会变；但一旦
+                # 哪天隔离被改坏，这里如实记录反而能让事后排查看到「打到了另一个后端」。
+                log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", "workbuddy")
                 log_context["model_id"] = attempt_model
                 log_context["model_name"] = attempt_model
             # 每次尝试都要用新的 receive 闭包与新的 attempt_body（换模型时 body 变了）。

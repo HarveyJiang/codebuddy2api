@@ -422,7 +422,7 @@ class ModelRegistry:
                 if mid not in self._catalog:
                     continue
                 entry = dict(self._catalog[mid], id=mid, enabled=mid not in self._disabled,
-                             custom=mid in self._custom)
+                             custom=mid in self._custom, backend="workbuddy")
                 entry["source"] = normalize_source(entry.get("source"))
                 stored = entry.pop("_promo", None)
                 # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
