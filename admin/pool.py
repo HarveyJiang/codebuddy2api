@@ -1266,7 +1266,13 @@ class PoolMiddleware:
         # 放弃切换，否则客户端会收到重复输出。
         tried_accounts = []
         computed_models = set()   # 已经**算过候选**的模型（不等于试过该模型）
-        attempt_body = body
+        # attempt_body 必须始终是 **bytes**。它会被 _replay_receive 塞进 ASGI 的
+        # http.request.body 交给下游应用，下游（Starlette）用 b"".join(...) 收集请求体，
+        # 一旦这里传 dict 进去就会抛
+        #   TypeError: sequence item 0: expected a bytes-like object, dict found
+        # 客户端侧表现为一个莫名其妙的 400「bad json」。首次尝试直接复用原始字节
+        # （不重新序列化，避免无谓地改动客户端发出的字节）。
+        attempt_body = raw
         attempt_model = model_name
         last_outcome = None
         for attempt in range(max_tries):
@@ -1281,7 +1287,10 @@ class PoolMiddleware:
                         break
                     computed_models.add(attempt_model)
                     attempt_model = next_model
-                    attempt_body = dict(body, model=next_model) if isinstance(body, dict) else body
+                    # 换模型必须重新序列化（这里才第一次产生「改过的请求体」）。
+                    # 仍要是 bytes：见下面 attempt_body 的说明。
+                    attempt_body = (json.dumps(dict(body, model=next_model)).encode("utf-8")
+                                    if isinstance(body, dict) else raw)
                     # 换模型后账号可以重新从头试：新模型面对的是另一个上游队列。
                     tried_accounts = []
                     _logger.info("可用账号已试尽，降级到 %s 重试", next_model)
@@ -1635,14 +1644,27 @@ class PoolMiddleware:
 
 
 def _replay_receive(raw, original_receive):
-    """把已读进内存的请求体重放给下游应用（下游可能读多次）。"""
+    """把已读进内存的请求体重放给下游应用（下游可能读多次）。
+
+    ``raw`` 必须是 **bytes**。它会被原样放进 ASGI 的 ``http.request.body``，
+    而下游用 Starlette 的 ``Request.stream()`` 收集请求体，内部是
+    ``b"".join(chunks)``。传 dict 进去会抛
+    ``TypeError: sequence item 0: expected a bytes-like object, dict found``，
+    客户端侧表现为莫名其妙的 400「bad json」——所以这里显式挡住，别让它
+    再以「客户端请求体损坏」的形式冒出来（历史上就是这么漏到线上的）。
+    """
+    if not isinstance(raw, (bytes, bytearray)):
+        raise TypeError(
+            f"_replay_receive 需要 bytes，收到 {type(raw).__name__}；"
+            "下游应用会用 b''.join() 拼接请求体")
+
     delivered = False
 
     async def receive():
         nonlocal delivered
         if not delivered:
             delivered = True
-            return {"type": "http.request", "body": raw, "more_body": False}
+            return {"type": "http.request", "body": bytes(raw), "more_body": False}
         return await original_receive()
     return receive
 

@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from core import converter
 from admin.db import Database
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity, CN
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, _replay_receive, summarize_packages, request_affinity, CN
 try:
     from .test_admin_server import credential
 except ImportError:
@@ -958,6 +958,80 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         # 但**全部**都在让位期内时必须忽略标记，否则排队会把池子锁成 503。
         self.pool.mark_queued(self.b)
         self.assertIn(self.pool.select()[0], {self.a, self.b})
+
+    async def test_replayed_body_is_bytes_so_downstream_can_parse_it(self):
+        """回归：重放给下游的请求体必须是 bytes，下游能正常 json() 解析。
+
+        线上事故（2026-10-15）：排队切号开启时**所有**模型请求 400，消息是
+        「bad json: sequence item 0: expected a bytes-like object, dict found」。
+
+        原因：重放时把已解析的 dict 塞进了 ASGI 的 http.request.body。下游用
+        Starlette 的 Request.stream() 收请求体，内部是 b"".join(chunks)，
+        拿到 dict 就抛 TypeError；客户端侧则表现为「请求体损坏」。
+
+        之前的排队测试没能发现，恰恰是因为它们的 mock app 只 `await receive()`
+        就丢掉结果、从不解析请求体——真实下游第一件事就是 request.json()。
+        这个测试必须真的解析，否则同类回归还会再溜过去。
+        """
+        self._enable_failover()
+        parsed = []
+
+        async def app(scope, receive, send):
+            # 复刻真实下游：按 ASGI 规范收满请求体并解析。
+            chunks = []
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            parsed.append(json.loads(b"".join(chunks)))
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'OK'})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi', 'model': 'm'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, b'OK')
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0], {'input': 'hi', 'model': 'm'})
+
+    async def test_model_downgrade_replay_is_also_bytes(self):
+        """降级换模型时重放的是重新序列化后的 bytes，同样要能被解析。"""
+        self._enable_failover(queue_retry=2, queue_model_fallback=True)
+        parsed = []
+
+        async def app(scope, receive, send):
+            chunks = []
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            payload = json.loads(b"".join(chunks))
+            parsed.append(payload.get("model"))
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': json.dumps({
+                "code": "WAITING", "message": "排队中"}).encode()})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            await client.post('/v1/chat/completions',
+                              json={'model': 'm', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                              headers={'Authorization': 'Bearer api-test'})
+        # 发生过模型降级，且每次尝试的请求体都成功解析（没抛 bad json）。
+        self.assertGreater(len(parsed), 1, "应至少换过一次模型")
+        self.assertEqual(parsed[0], 'm')
+
+    async def test_replay_receive_rejects_non_bytes(self):
+        """防御：非 bytes 直接报错，而不是让下游以「请求体损坏」的形式炸。"""
+        async def original():
+            return {"type": "http.request", "body": b"", "more_body": False}
+        with self.assertRaises(TypeError):
+            _replay_receive({"model": "m"}, original)
 
     async def test_queue_hit_switches_account_and_is_transparent(self):
         self._enable_failover()
