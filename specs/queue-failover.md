@@ -151,7 +151,7 @@
 
 ## 7. 测试
 
-`tests/test_account_pool.py` 补：
+`tests/pool/test_account_pool.py` 补：
 
 - `WAITING`（字符串 code）与非 200 `429`/`503` 两种形态都判定为排队。
 - `USER_LIMIT` **不**判定为排队。

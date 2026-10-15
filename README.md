@@ -96,7 +96,7 @@ pip install -r requirements.lock.txt
 uv pip compile --universal --python-version 3.10 --no-strip-extras --no-annotate --upgrade requirements.txt -o requirements.lock.txt
 uv pip sync requirements.lock.txt
 uv pip install -c requirements.lock.txt pytest
-uv run python -m pytest tests/
+uv run python -m pytest
 ```
 
 > 注意：无论是启动服务，还是执行 `python3 -m core.converter --help`，都必须先装依赖。
@@ -614,7 +614,7 @@ workbuddy2api/
 │   ├── standalone/            # 独立转换器（Dockerfile + compose）
 │   ├── admin/                 # 管理后台（Dockerfile + compose + nginx 示例）
 │   └── one-click/             # 一键式部署（deploy.sh 自动生成密钥并启动）
-├── tests/                     # 单元测试（pytest）
+├── tests/                     # 单元测试（pytest），按功能域分目录（见 tests/README.md）
 ├── codex-codebuddy.example.toml
 ├── README.md                  # 本文件
 ├── ADMIN_README.md            # 管理后台详细说明
@@ -624,9 +624,15 @@ workbuddy2api/
 运行测试：
 
 ```bash
-python3 -m pytest tests/
+pytest                       # 全部（除标记为 slow 的）
+pytest tests/pool             # 只跑改动涉及的那一域
+pytest -m e2e                 # 只跑端到端链路
 ```
 
+测试按功能域分目录（`protocol/` `pool/` `persistence/` `admin/` `security/`
+`config/` `unit/`），并用 `core` / `slow` / `e2e` / `network` 标记分层——
+**改哪个模块就跑哪个目录**，不必每次全量回归。约定与「写测试的几条硬规矩」
+见 [`tests/README.md`](tests/README.md)。
 管理页前端还有一组不依赖浏览器、也不依赖第三方包的脚本（Node）：
 
 ```bash

@@ -236,7 +236,7 @@ if model not in registry.enabled_models() and model in registry.snapshot_ids():
 
 ## 6. 测试
 
-补到 `tests/test_db.py` 与 `tests/test_admin_server.py`：
+补到 `tests/persistence/test_database.py` 与 `tests/admin/test_server.py`：
 
 1. **自定义模型不被 `fetch()` 冲掉** —— `ModelRegistry` 上先 `add`，再走一次
    合并逻辑（可直接调用 `fetch` 的合并分支或注入假目录），断言 id 仍在

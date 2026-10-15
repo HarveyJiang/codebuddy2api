@@ -13,7 +13,7 @@
 `_snapshot`）：逐页复制并跟随写入者进度，**不阻塞业务读写**，产出的单文件本身就是
 一致快照，不需要配套的 `-wal`。
 
-`tests/test_backup.py::test_backup_captures_wal_data` 同时验证了两件事：备份里有
+`tests/persistence/test_backup.py::test_backup_captures_wal_data` 同时验证了两件事：备份里有
 WAL 中未 checkpoint 的数据，而同一时刻「直接拷主库」确实没有——这条路径是被真的
 测到的，不是靠推断。
 
@@ -95,5 +95,5 @@ WAL 中未 checkpoint 的数据，而同一时刻「直接拷主库」确实没�
 | `admin/db.py` | `settings` 表结构（v5 加 `backup_*` 五列）与迁移 |
 | `admin/server.py` | `Store.backup_now` / `backup_list`、四个备份接口、`backup_worker`、启动续跑 |
 | `admin/static/index.html` / `app.js` / `style.css` | 设置页的备份卡片与文件列表 |
-| `tests/test_backup.py` | 28 个用例：模块正确性 + 接口 + 恢复守卫 |
+| `tests/persistence/test_backup.py` | 28 个用例：模块正确性 + 接口 + 恢复守卫 |
 | `scripts/e2e_backup.py` | 手动端到端脚本：起真进程走一遍备份 → 改数据 → 恢复 |

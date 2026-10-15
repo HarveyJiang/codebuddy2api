@@ -209,7 +209,7 @@ ON CONFLICT(key_id, day) DO UPDATE SET
 
 ## 五、测试
 
-`tests/test_admin_server.py` 补：
+`tests/admin/test_server.py` 补：
 
 - `/admin/api/usage` 分页（`limit/offset` 与 `total` 一致）、时间过滤、账号过滤、非法参数 400。
 - `/admin/api/usage/report` 四种 `group_by` 各自返回分组且积分合计与明细一致；非法维度 400。
@@ -217,7 +217,7 @@ ON CONFLICT(key_id, day) DO UPDATE SET
 - 手动拉取**不写** `usage_synced_at`（后台同步仍会执行）。
 - `key_usage_daily` 换天写新行、同天覆盖。
 
-`tests/test_db.py` 补：
+`tests/persistence/test_database.py` 补：
 
 - `key_usage_daily` 往返、裁剪、覆盖语义（后写的更大值生效）。
 

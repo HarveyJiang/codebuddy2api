@@ -83,7 +83,7 @@
 - `pool.update()` 里的 `usage_history` 滚动采样（`admin/pool.py:130-139`）；
 - `pool.rows()` 的 `daily_rate`/`days_to_empty`/`expire_unused` 三个输出（`admin/pool.py:187, 190-194, 201-203`）；
 - 前端 `admin/static/app.js:127` 对应的三段展示文案；
-- `tests/test_account_pool.py:290-296` 附近构造 `usage_history` 的用例。
+- `tests/pool/test_account_pool.py:290-296` 附近构造 `usage_history` 的用例。
 
 `state()` 的 exhausted 判断只依赖 `packages`/`remaining`/`credits_updated`，不受影响。
 
@@ -343,7 +343,7 @@ MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5))   # 追加 (6, _v5
 
 ## 测试
 
-- `tests/test_db.py`：删除 `set_kv/get_kv` 用例，改为：settings 读写、accounts 全字段往返（金额 ×1e6 精度往返）、keys 三列 + 白名单数组 + 软删/停用/过期往返、binding 过期清理、models UPSERT 不删行、`available=0` 的模型不出现在 `enabled_models()` 且不进 registry、registry（catalog+禁用+promo）往返、v1→v2 迁移（造旧 kv + 旧 keys.usage JSON，断言新表存在且 `kv` 已删除、`account_status` 值全等、`manual` 路由被替换）、**迁移幂等且版本号不被无条件覆盖**（跑两次断言数据不重复、版本号正确）、上游 `requestTime` 无时区按 CN 解析。
+- `tests/persistence/test_database.py`：删除 `set_kv/get_kv` 用例，改为：settings 读写、accounts 全字段往返（金额 ×1e6 精度往返）、keys 三列 + 白名单数组 + 软删/停用/过期往返、binding 过期清理、models UPSERT 不删行、`available=0` 的模型不出现在 `enabled_models()` 且不进 registry、registry（catalog+禁用+promo）往返、v1→v2 迁移（造旧 kv + 旧 keys.usage JSON，断言新表存在且 `kv` 已删除、`account_status` 值全等、`manual` 路由被替换）、**迁移幂等且版本号不被无条件覆盖**（跑两次断言数据不重复、版本号正确）、上游 `requestTime` 无时区按 CN 解析。
 - 其余用例（原子性、并发、脏标记、坏库报错、明文不落盘）保留，改调新 API。
 - `test_account_pool / test_admin_server / test_model_registry`：行为断言不变，另补：`select(kid)` 白名单与重试分支、三档 routing、`request_logs` 一行一请求（test 请求不双写）、"最后一个有效密钥不可撤销"（已撤销的不计入计数）；删除 `usage_history`/`consumption` 相关用例。
 - 前端：`admin/static/*` 的 routing/sync_window/active 字段同步改。

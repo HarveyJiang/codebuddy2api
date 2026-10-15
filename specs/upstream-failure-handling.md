@@ -47,7 +47,7 @@
 
 ### 已验证
 
-`tests/test_reset_at.py` 24 例 + `tests/test_account_pool.py` 5 例，覆盖时区、
+`tests/pool/test_reset_at.py` 24 例 + `tests/pool/test_account_pool.py` 5 例，覆盖时区、
 相对量、HTTP-date、过期时刻（按「没有信息」处理而非「立刻恢复」，避免热循环）、
 header 三种容器（`httpx.Headers` / ASGI bytes 字典 / 普通字典）、脏数据夹取。
 

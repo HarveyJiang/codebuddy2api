@@ -182,9 +182,9 @@ IP 级状态只回答一个问题：**这一轮还要不要继续换号**。
 
 ## 测试
 
-- `tests/test_guards.py`：护栏阈值解析、四种挡下语义、未知计数放行、缓存 TTL 与
+- `tests/pool/test_guards.py`：护栏阈值解析、四种挡下语义、未知计数放行、缓存 TTL 与
   异常吞掉、WAF 判定、gate 状态机、退避与抖动。
-- `tests/test_account_pool.py`：`test_guards_are_inert_when_disabled`（关闭时不查库）、
+- `tests/pool/test_account_pool.py`：`test_guards_are_inert_when_disabled`（关闭时不查库）、
   日 token / 保留余额挡号、全部被挡下时的报错文案、未知计数放行、关闭时不写库、
   WAF gate 在排队路径上停手、单号反复被拦不误判。
-- `tests/test_admin_server.py`：护栏设置默认全关、非法值 400、重启后保留。
+- `tests/admin/test_server.py`：护栏设置默认全关、非法值 400、重启后保留。

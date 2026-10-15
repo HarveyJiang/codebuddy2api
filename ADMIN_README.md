@@ -23,15 +23,15 @@
 
 - `admin/server.py`：后台 API、会话与客户端鉴权、深度 `/health` 及转换器适配。
 - `admin/browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
-- `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到，以及容量队列自动切换（换号 / 降级模型）。`tests/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
+- `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到，以及容量队列自动切换（换号 / 降级模型）。`tests/pool/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
 - `admin/db.py`：SQLite 持久层，全部结构化表（无 kv 表），版本化迁移单事务执行。金额落库 `*_micro`，内存保持 float。
 - `admin/backup.py`：数据库备份与恢复。WAL 安全的在线备份、文件名白名单（防路径穿越）、完整性校验、保留策略、定时判定与中断续跑。
 - `admin/version.py`：部署版本标识（镜像 tag / 语义版本），供界面与 `/health` 显示。
 - `admin/models.py`：模型注册表，`/v3/config` 动态发现 + 内置兜底快照 + 上游/内置/自定义三档来源。
 - `admin/metrics.py`：进程内的在途请求数等实时指标；累计计数以 `request_logs` 为准。不存储请求正文、回复或密钥。
 - `admin/static/`：无外部 CDN 依赖的中文界面。
-- `tests/test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
-- `tests/test_backup.py`：备份模块与接口。含「备份确实带上了 WAL 中未 checkpoint 的数据（而直接拷主库会漏）」「文件名白名单挡住路径穿越」「空库/损坏文件被拒」「中断的恢复能续跑」等边界。
+- `tests/admin/test_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
+- `tests/persistence/test_backup.py`：备份模块与接口。含「备份确实带上了 WAL 中未 checkpoint 的数据（而直接拷主库会漏）」「文件名白名单挡住路径穿越」「空库/损坏文件被拒」「中断的恢复能续跑」等边界。
 - `deploy/admin/Dockerfile`：在已部署的转换器镜像上构建管理层，不修改模型转换逻辑。
 
 ## 配置与运行
@@ -111,12 +111,12 @@ User-Agent: CLI/2.63.2 CodeBuddy/2.63.2
 
 ### 测试
 
-`tests/test_model_registry.py` 覆盖拉取解析、三档路由附加、失败保留缓存、无凭据回落内置、启停持久化、内置列表与官方 cli 菜单对齐、折扣昼夜与有效期边界、快照折后价等。
+`tests/admin/test_model_registry.py` 覆盖拉取解析、三档路由附加、失败保留缓存、无凭据回落内置、启停持久化、内置列表与官方 cli 菜单对齐、折扣昼夜与有效期边界、快照折后价等。
 
 ## 验证
 
 ```bash
-python -m pytest tests/
+pytest                    # 分域与分层约定见 tests/README.md
 node --check admin/static/app.js
 ```
 

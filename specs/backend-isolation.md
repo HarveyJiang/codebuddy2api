@@ -8,7 +8,7 @@
 「串」不会表现为「用错账号」，而是表现为一个**莫名其妙的 4xx**。
 
 本文档记录必须成立的隔离不变量，以及每条不变量对应的代码位置与回归测试
-（`tests/test_backend_isolation.py`）。
+（`tests/pool/test_backend_isolation.py`）。
 
 ---
 
