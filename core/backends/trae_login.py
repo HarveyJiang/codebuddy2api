@@ -47,7 +47,13 @@ PLUGIN_VERSION = "2.3.62834"
 
 
 def build_login_url(machine_id: str, device_id: str, login_trace_id: str | None = None, callback: str | None = None) -> str:
-    """构造 TRAE 授权登录 URL（参数集来源 Go login.sh，缺一不可）。"""
+    """构造 TRAE 授权登录 URL（参数集来源 Go login.sh，缺一不可）。
+
+    redirect=1：授权页**不**把回调 fetch/跳转到 127.0.0.1（没有本机接收器时会报
+    "登录失败"），而是把完整回调地址（含 refreshToken）展示给用户复制，粘贴到
+    管理页完成绑定。注意 auth_callback_url 必须是 127.0.0.1 形态——公网回调
+    实测被授权页直接拒绝（2026-10-15，服务器从未收到任何请求）。
+    """
     params = {
         "login_version": "1",
         "auth_from": "solo",
@@ -55,7 +61,7 @@ def build_login_url(machine_id: str, device_id: str, login_trace_id: str | None 
         "plugin_version": PLUGIN_VERSION,
         "auth_type": "local",
         "client_id": T.CLIENT_ID,
-        "redirect": "0",
+        "redirect": "1",
         "login_trace_id": login_trace_id or secrets.token_hex(8),
         "auth_callback_url": callback or AUTH_CALLBACK,
         "machine_id": machine_id,

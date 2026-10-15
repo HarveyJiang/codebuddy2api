@@ -743,11 +743,10 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert r.status_code == 200
         data = r.json()
         assert data["url"].startswith("https://www.trae.cn/authorization?")
-        # 回调指向公网 /trae/callback/<fid>/<secret>（fetch 直接投递到服务器，免命令免粘贴）
+        # 回调必须是 127.0.0.1（公网回调实测被授权页拒绝）+ redirect=1（页面展示地址供复制）
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
-        callback = qs["auth_callback_url"][0]
-        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
-        assert callback.endswith(f"/trae/callback/{data['id']}/{secret}")
+        assert qs["auth_callback_url"][0] == "http://127.0.0.1:18080/authorize"
+        assert qs["redirect"] == ["1"]
         assert data["id"] in self.app.state.store.trae_flows
 
     async def test_trae_login_end_to_end_adds_account(self):
@@ -954,16 +953,14 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     # ---- 本机接收器（免复制粘贴） ----
 
-    async def test_authorize_returns_public_callback_only(self):
+    async def test_authorize_uses_local_callback_and_redirect1(self):
         headers = await self.login_admin()
         data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
-        # 公网回调是唯一路径：不再下发本机接收器命令 / 端口
+        # 127.0.0.1 回调 + redirect=1；不再下发本机接收器命令 / 端口
         assert "command" not in data and "port" not in data
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
-        callback = qs["auth_callback_url"][0]
-        secret = self.app.state.store.trae_flows[data["id"]]["secret"]
-        assert callback.endswith(f"/trae/callback/{data['id']}/{secret}")
-        assert callback.startswith("https://") or callback.startswith("http://")
+        assert qs["auth_callback_url"][0] == "http://127.0.0.1:18080/authorize"
+        assert qs["redirect"] == ["1"]
         flow = self.app.state.store.trae_flows[data["id"]]
         assert flow["status"] == "pending"
 

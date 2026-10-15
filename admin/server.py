@@ -714,11 +714,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         machine_id, device_id = secrets.token_hex(16), secrets.token_hex(16)
         now = time.time()
         # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），随 fid 服务端暂存。
-        # 回调指向公网 /trae/callback/<fid>/<secret>：授权页登录成功后把凭据 fetch 投递到服务器，
-        # 用户无需本机接收器、无需复制粘贴。fid/secret 放 path（不与上游 append 的 query 冲突），
-        # secret 同时是回调的鉴权凭据（防伪造回调注入凭据）。
-        callback = f"{_public_base(req)}/trae/callback/{fid}/{secret}"
-        url = build_login_url(machine_id, device_id, callback=callback)
+        # auth_callback_url 必须是 127.0.0.1 形态——公网回调实测被授权页直接拒绝
+        # （2026-10-15：授权页报"登录失败"，服务器从未收到任何请求）。
+        # 配合 redirect=1：授权页不 fetch 该地址，而是把完整回调地址（含 refreshToken）
+        # 展示给用户复制，粘贴到管理页完成绑定；本机接收器（若在监听）同样兼容。
+        port = _trae_port()
+        url = build_login_url(machine_id, device_id, callback=f"http://127.0.0.1:{port}/authorize")
         with store.lock:
             store.trae_flows = {k: v for k, v in store.trae_flows.items() if v["expires"] > now}
             if len(store.trae_flows) >= 20:
