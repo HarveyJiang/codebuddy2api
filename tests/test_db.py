@@ -74,14 +74,23 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual((s["queue_failover"], s["queue_retry"], s["queue_cooldown"]), (1, 5, 77))
         self.assertEqual((s["queue_hold_ms"], s["queue_model_fallback"]), (2500, 0))
         self.assertEqual(s["queue_fallback_model"], "fast-model")
+        # 备份设置同样往返（默认关自动备份，last_at 记录上次成功时间）。
+        db.update_settings({"backup_enabled": 1, "backup_interval_hours": 12,
+                            "backup_keep": 5, "backup_last_at": 1770000000,
+                            "backup_last_name": "state-20260101-000000.db"})
+        s = db.get_settings()
+        self.assertEqual((s["backup_enabled"], s["backup_interval_hours"], s["backup_keep"]), (1, 12, 5))
+        self.assertEqual(s["backup_last_at"], 1770000000)
+        self.assertEqual(s["backup_last_name"], "state-20260101-000000.db")
         db.close()
         reopened = Database(self.root / "t.db")
         self.assertEqual(reopened.get_settings()["checkin_time"], "08:30")
         self.assertEqual(reopened.get_settings()["queue_retry"], 5)
+        self.assertEqual(reopened.get_settings()["backup_interval_hours"], 12)
         reopened.close()
 
     def test_v3_database_migrates_to_v4(self):
-        """v3 老库升到 v4：补出 queued_until 与 queue_* 设置列，老数据不丢。"""
+        """v3 老库一路升到当前版本：补出队列与备份设置列，老数据不丢。"""
         import sqlite3
         path = self.root / "old.db"
         # 手工造一个 v3 库：只有老列，版本号写 3。
@@ -114,6 +123,13 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(settings["queue_retry"], 3)
         self.assertEqual(settings["queue_hold_ms"], 3000)
         self.assertEqual(settings["queue_fallback_model"], "fast-model")
+        # v4→v5 的备份列也被补出来，且默认「不开自动备份」。
+        # 这是刻意的：定时备份持续占磁盘，不能因为升级就替用户打开。
+        self.assertEqual(settings["backup_enabled"], 0)
+        self.assertEqual(settings["backup_interval_hours"], 24)
+        self.assertEqual(settings["backup_keep"], 10)
+        self.assertEqual(settings["backup_last_at"], 0)
+        self.assertEqual(settings["backup_last_name"], "")
         # 老数据保留。
         self.assertEqual(db.load_accounts()["a1"]["name"], "旧账号")
         # 迁移可重复执行（幂等），重开不再报 duplicate column。

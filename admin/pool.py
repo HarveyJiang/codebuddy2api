@@ -128,7 +128,27 @@ class AccountPool:
                      "queue_cooldown": 120,
                      "queue_hold_ms": 3000,
                      "queue_model_fallback": True,
-                     "queue_fallback_model": "fast-model"}
+                     "queue_fallback_model": "fast-model",
+                     # 数据库备份（admin/backup.py）。默认关闭：定时备份持续占磁盘，
+                     # 开不开由用户决定，不因升级替人做主。
+                     "backup_enabled": False,
+                     "backup_interval_hours": 24,
+                     "backup_keep": 10,
+                     "backup_last_at": 0,
+                     "backup_last_name": ""}
+
+    # 设置项分类：管理页据此把「通用/全局」的设置搬到独立设置页，账号池页只留
+    # 与账号列表直接相关的。放在这里而不是前端，是因为校验与默认值都在后端，
+    # 分类口径跟着走才不会两头对不上。
+    SETTING_GROUPS = {
+        "checkin": ("auto_checkin", "checkin_time", "batch_spread",
+                    "credit_min_interval", "sync_start", "sync_end"),
+        "queue": ("queue_failover", "queue_model_fallback", "queue_retry",
+                  "queue_cooldown", "queue_hold_ms", "queue_fallback_model"),
+        "routing": ("default_routing",),
+        "backup": ("backup_enabled", "backup_interval_hours", "backup_keep",
+                   "backup_last_at", "backup_last_name"),
+    }
 
     def __init__(self, store, clock=time.time, client_factory=None, model_registry=None):
         self.store, self.clock = store, clock

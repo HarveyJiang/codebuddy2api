@@ -132,6 +132,17 @@
 | sync_end | TEXT | 否 | '20:00' | 原 `sync_window[1]` |
 | batch_spread | INTEGER | 否 | 90 | 秒，批量错峰 |
 | default_routing | TEXT | 否 | 'round_robin' | 新建 key 的默认轮转策略；`keys.routing=NULL` 的 key 动态跟随此值 |
+| queue_failover | INTEGER | 否 | 0 | v4 加。容量队列自动切换总开关，**默认关闭**（唯一会重放请求的功能） |
+| queue_retry | INTEGER | 否 | 3 | v4 加。单次请求最多尝试几次（含首次） |
+| queue_cooldown | INTEGER | 否 | 120 | v4 加。命中排队的账号被优先跳过的秒数 |
+| queue_hold_ms | INTEGER | 否 | 3000 | v4 加。扣留响应头等首个分片的上限（毫秒） |
+| queue_model_fallback | INTEGER | 否 | 1 | v4 加。是否允许降级到同价位模型 |
+| queue_fallback_model | TEXT | 否 | 'fast-model' | v4 加。最终兜底的智能路由模型 |
+| backup_enabled | INTEGER | 否 | 0 | v5 加。自动备份总开关，**默认关闭**（定时备份持续占磁盘） |
+| backup_interval_hours | INTEGER | 否 | 24 | v5 加。自动备份间隔（1-720） |
+| backup_keep | INTEGER | 否 | 10 | v5 加。保留份数，超出部分在每次备份后清理（1-100） |
+| backup_last_at | INTEGER | 否 | 0 | v5 加。上次成功备份的 unix 秒；定时器判断「该不该跑」的唯一依据 |
+| backup_last_name | TEXT | 否 | '' | v5 加。上次成功备份的文件名，用于在列表里标出「最近一次」 |
 | models_updated | INTEGER | 否 | 0 | 模型目录更新时间戳，原 `model_registry.updated` |
 
 原 `kv.active` 随 `pool.routing` 一起下沉：全局 `pool.routing` 落成 `default_routing`，每 key 的策略进 `keys.routing`。其余默认值沿用 `AccountPool.POOL_DEFAULTS`（`admin/pool.py:87`）——改造后 `POOL_DEFAULTS` 里**删掉 `routing` 键**（默认值改由本表 `default_routing` 提供），并同步 `Store._load` 的合并逻辑（`server.py:128`）。
@@ -275,8 +286,8 @@
 采用版本化迁移列表，后续加列只追加不重写。**编号约定：每个元素的第一个值是"目标版本"**，即 `(2, _v1_to_v2)` 表示把库升到版本 2：
 
 ```python
-SCHEMA_VERSION = 2
-MIGRATIONS = ((2, _v1_to_v2),)   # 追加 (3, _v2_to_v3)
+SCHEMA_VERSION = 5
+MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5))   # 追加 (6, _v5_to_v6)
 ```
 
 启动顺序（顺序不可颠倒）：
@@ -288,7 +299,12 @@ MIGRATIONS = ((2, _v1_to_v2),)   # 追加 (3, _v2_to_v3)
 
 **两个必须注意的点**：
 
-- **不能沿用现有的无条件覆盖写法**：当前 `db.py:63` 每次启动都 `INSERT OR REPLACE ... 'version', SCHEMA_VERSION`，若照搬会把刚执行的迁移立刻标记为已完成，迁移等于没做。
+- **加 `settings` 列的硬性要求**：这是单行表，新列必须 `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT <值>`。
+原因是 `Store._load` 的默认值合并是 `{**POOL_DEFAULTS, **settings}`——只补**字典里缺的键**，
+列存在但值为 NULL 时不算缺键，`None` 会一路传到 `int()` 上。所以 `ALTER` 必须带默认值
+（`_v3_to_v4` / `_v4_to_v5` 都照此写）。
+
+**不能沿用现有的无条件覆盖写法**：当前 `db.py:63` 每次启动都 `INSERT OR REPLACE ... 'version', SCHEMA_VERSION`，若照搬会把刚执行的迁移立刻标记为已完成，迁移等于没做。
 - **不要写"每步单独事务 + 失败只重跑失败的步"**：step1 已提交、step2 失败时版本号仍是旧值，下次启动是从 step1 重跑，不是从 step2。用单事务整体回滚规避，并额外要求每步 DDL 带 `IF NOT EXISTS`、导入用 UPSERT 作双保险。
 
 ### v1 → v2 的映射（逐个 key 写死）

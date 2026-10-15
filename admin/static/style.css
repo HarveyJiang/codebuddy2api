@@ -31,5 +31,22 @@
 .toolbar-actions{display:flex;gap:10px;align-items:center}
 #models-body .danger{color:#a46762;background:none;padding:6px 8px;border-radius:5px;font-size:11px}
 #models-body .danger:hover:not(:disabled){background:#fbefed}
+/* 设置页：分区卡片。沿用 .pool-settings 的淡绿底与 .pool-controls 的排布，
+   只把「一张大表单」拆成几块，避免所有设置挤在一起找不到。 */
+.settings-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px;align-items:start}
+.pool-settings .settings-groups{margin-bottom:20px}
+.settings-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px;margin:0}
+.settings-card h3{font-size:16px;color:#416c54;margin:0 0 9px}
+.settings-card>p{font-size:11px;color:#809789;line-height:1.9;margin:0 0 18px}
+.settings-card .pool-controls{flex-direction:column;align-items:stretch;gap:0}
+.settings-card .pool-controls label{min-width:0;width:100%;margin:0 0 15px}
+.settings-card .pool-controls .inline-checkbox{align-self:flex-start;width:auto}
+.settings-card .pool-controls button{margin:4px 0 0;align-self:flex-start}
+.settings-actions{display:flex;justify-content:flex-end}
+#backup-card{margin:34px 0 22px}
+#backup-body .danger{color:#a46762;background:none;padding:6px 8px;border-radius:5px;font-size:11px}
+#backup-body .danger:hover:not(:disabled){background:#fbefed}
+#backup-card code{font-size:11px;background:#f4f6f3;padding:1px 5px;border-radius:4px}
+@media(max-width:760px){.settings-groups{grid-template-columns:1fr}.settings-card{padding:18px}}
 .check-row{display:flex;align-items:center;gap:9px;font-size:12px;margin:19px 0 7px;font-weight:600}
 .check-row input{width:16px;height:16px;flex-shrink:0}

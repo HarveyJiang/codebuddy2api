@@ -66,7 +66,28 @@ def _v3_to_v4(db):
             db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
 
 
-SCHEMA_VERSION = 4
+def _v4_to_v5(db):
+    """v4 → v5：加数据库备份设置（settings 的 backup_* 五项）。
+
+    和 v3→v4 同理：settings 是单行表，加列必须 ALTER 且带默认值，否则已存在
+    的那行读出 NULL，而 POOL_DEFAULTS 的合并只补「字典里缺的键」——列在但值为
+    NULL 时不算缺键，None 会一路传到 int() 上。
+
+    默认**关闭自动备份**：定时备份会持续占用磁盘，什么时候开、开多久由用户定，
+    不能因为升级就默认替人做决定。``backup_last_at`` 记录上次成功时间，
+    是定时器判断「该不该跑」的唯一依据，必须落库（进程重启不能重置计时）。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    for name, ddl in (("backup_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                      ("backup_interval_hours", "INTEGER NOT NULL DEFAULT 24"),
+                      ("backup_keep", "INTEGER NOT NULL DEFAULT 10"),
+                      ("backup_last_at", "INTEGER NOT NULL DEFAULT 0"),
+                      ("backup_last_name", "TEXT NOT NULL DEFAULT ''")):
+        if name not in columns:
+            db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
+
+
+SCHEMA_VERSION = 5
 
 MICRO = 1_000_000
 
@@ -225,6 +246,11 @@ class Database:
             queue_hold_ms INTEGER NOT NULL DEFAULT 3000,
             queue_model_fallback INTEGER NOT NULL DEFAULT 1,
             queue_fallback_model TEXT NOT NULL DEFAULT 'fast-model',
+            backup_enabled INTEGER NOT NULL DEFAULT 0,
+            backup_interval_hours INTEGER NOT NULL DEFAULT 24,
+            backup_keep INTEGER NOT NULL DEFAULT 10,
+            backup_last_at INTEGER NOT NULL DEFAULT 0,
+            backup_last_name TEXT NOT NULL DEFAULT '',
             models_updated INTEGER NOT NULL DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS session_bindings (
             affinity_key TEXT PRIMARY KEY, account_id TEXT NOT NULL,
@@ -392,7 +418,7 @@ class Database:
 
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
-    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4))
+    MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -426,6 +452,8 @@ class Database:
         "sync_start", "sync_end", "batch_spread", "default_routing",
         "queue_failover", "queue_retry", "queue_cooldown", "queue_hold_ms",
         "queue_model_fallback", "queue_fallback_model", "models_updated",
+        "backup_enabled", "backup_interval_hours", "backup_keep",
+        "backup_last_at", "backup_last_name",
     )
 
     def get_settings(self, defaults=None):
