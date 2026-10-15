@@ -15,7 +15,15 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from admin.cost_ledger import CostLedger
+from admin.guards import (
+    DailyUsage,
+    DailyUsageCache,
+    any_enabled,
+    guard_block_reason,
+    parse_guard_limits,
+)
 from admin.reset_at import earliest_deadline, parse_reset_at, parse_retry_after
+from admin.rotation import WAF_IP_WINDOW, WafIpGate, backoff_after, is_waf_error
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 # 池中间件观察到的路由信息，交由外层 MetricsMiddleware 合并成一行 request_logs。
@@ -115,6 +123,26 @@ class BillingError(Exception):
 FREE_TIER_CEILING = 0.10
 
 
+CREDIT_FIELDS = ("credit", "credits", "total_credit", "credit_used", "cost")
+
+
+def _credits_of(usage):
+    """从 usage 里取实测 credit；取不到返回 0.0（护栏按「没花钱」计）。
+
+    字段名逐个试、试不到就当 0：护栏的 credit 计数是**辅助**维度，
+    拿到 0 不会让护栏放行本该拦下的请求（token 计数仍然可靠）。
+    """
+    if not isinstance(usage, dict):
+        return 0.0
+    for field in CREDIT_FIELDS:
+        if field in usage:
+            try:
+                return float(usage[field])
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
 class AccountPool:
     # 池设置默认值。Store._load 用它们补齐旧数据缺失的字段，
     # 这里保留 setdefault 兼容直接构造 Store 的老用法。
@@ -138,7 +166,13 @@ class AccountPool:
                      "backup_interval_hours": 24,
                      "backup_keep": 10,
                      "backup_last_at": 0,
-                     "backup_last_name": ""}
+                     "backup_last_name": "",
+                     # 账号级限额护栏（admin/guards.py）。**默认全 0 = 关闭**：
+                     # 护栏会主动拒绝请求，是「替用户做决定」的功能，默认必须无为。
+                     "guard_reserve_credits": 0,
+                     "guard_daily_token_limit": 0,
+                     "guard_daily_credit_limit": 0,
+                     "guard_model_daily_token_limit": 0}
 
     # 设置项分类：管理页据此把「通用/全局」的设置搬到独立设置页，账号池页只留
     # 与账号列表直接相关的。放在这里而不是前端，是因为校验与默认值都在后端，
@@ -149,6 +183,8 @@ class AccountPool:
         "queue": ("queue_failover", "queue_model_fallback", "queue_retry",
                   "queue_cooldown", "queue_hold_ms", "queue_fallback_model"),
         "routing": ("default_routing",),
+        "guards": ("guard_reserve_credits", "guard_daily_token_limit",
+                   "guard_daily_credit_limit", "guard_model_daily_token_limit"),
         "backup": ("backup_enabled", "backup_interval_hours", "backup_keep",
                    "backup_last_at", "backup_last_name"),
     }
@@ -168,6 +204,10 @@ class AccountPool:
         self.last_flush = 0
         # 实测成本账本（admin/cost_ledger.py）。观测不到上游价就完全不生效。
         self.cost_ledger = CostLedger(clock=clock)
+        # 账号级限额护栏的用量缓存（admin/guards.py）。护栏全关时不查库。
+        self.guard_usage = DailyUsageCache(clock=clock)
+        # WAF IP 级拦截状态机（admin/rotation.py）。进程内状态，窗口 60 秒。
+        self.waf_gate = WafIpGate(clock=clock)
         self._usage_manual_at = {}   # aid -> 上次手动拉取时间戳，进程内节流
         with store.lock:
             store.data.setdefault("pool", dict(self.POOL_DEFAULTS))
@@ -407,6 +447,14 @@ class AccountPool:
             if model:
                 candidates = self.cost_ledger.prefer_free(
                     candidates, model, lambda row: row["id"])
+            # 账号级限额护栏（admin/guards.py）。默认全关时这里是恒等变换。
+            # 全部候选都被挡下时**不**改写成 503——护栏挡下的号仍然是可用账号，
+            # 上报「护栏」比上报「暂无可用账号」有用得多（后者会让人去查登录态）。
+            if candidates:
+                candidates, blocked = self._apply_guards(candidates, model)
+                if not candidates and blocked:
+                    raise HTTPException(
+                        503, f"账号已达本地限额（{blocked[0]}），请调整设置或等待次日重置")
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             bindings = self.store.data["session_bindings"]
@@ -443,6 +491,73 @@ class AccountPool:
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
 
+    def _apply_guards(self, candidates, model):
+        """按账号级护栏筛掉候选，返回 (留下的, 被挡下的原因列表)。
+
+        护栏全部关闭时直接返回原列表，**一次库都不查**——这是热路径，
+        默认配置下不该有任何额外开销。
+        """
+        limits = parse_guard_limits(self.store.data.get("pool"))
+        if not any_enabled(limits):
+            return candidates, []
+
+        usage = self.guard_usage.get(self._load_daily_usage)
+        status_of = self.store.data["account_status"]
+        kept, blocked = [], []
+        for row in candidates:
+            aid = row["id"]
+            status = status_of.get(aid, {})
+            daily_tokens = daily_credits = model_tokens = None
+            if usage is not None:
+                daily_tokens = usage.tokens_for(aid)
+                daily_credits = usage.credits_for(aid)
+                model_tokens = usage.models.get(str(aid)) or {}
+            # 免费判据来自**实测账本**：没观测过的模型按付费处理——
+            # 「不确定是否免费」不该被当成免费放行，否则 daily_credit_limit 形同虚设。
+            is_free = model is not None and self.cost_ledger.is_free(aid, model) is True
+            reason = guard_block_reason(
+                limits,
+                credits=status.get("remaining"),
+                daily_tokens=daily_tokens,
+                daily_credits=daily_credits,
+                model=model,
+                model_daily_tokens=model_tokens,
+                is_free_model=is_free,
+            )
+            if reason:
+                blocked.append(reason)
+                _logger.debug("账号 %s 被限额护栏挡下：%s", aid, reason)
+            else:
+                kept.append(row)
+        return kept, blocked
+
+    def _load_daily_usage(self):
+        """从库里读当天账号用量；读不到返回 None（护栏据此放行）。"""
+        rows = self.store.db.account_usage_today()
+        usage = DailyUsage()
+        for aid, bucket in rows.items():
+            usage.tokens[aid] = bucket["tokens"]
+            usage.credits[aid] = bucket["credits"]
+            usage.models[aid] = dict(bucket.get("models") or {})
+        return usage
+
+    def note_usage(self, aid, model, tokens, credits=0.0):
+        """记一次完成的请求用量，供护栏统计。
+
+        护栏全关时直接返回，不写库——默认配置下不该产生任何额外写入。
+        """
+        if not aid:
+            return
+        limits = parse_guard_limits(self.store.data.get("pool"))
+        if not any_enabled(limits):
+            return
+        try:
+            self.store.db.add_account_usage(aid, model, tokens, credits)
+        except Exception:  # 记不上账不该影响请求本身
+            _logger.exception("账号 %s 用量落库失败，护栏计数将偏低", aid)
+        # 立刻失效缓存：否则刚用完额度的号在 TTL 内仍会被判为可用。
+        self.guard_usage.invalidate()
+
     def try_select(self, affinity_key, kid, exclude, model=None):
         """尝试选一个没试过的账号；没有候选时返回 None，不抛异常。
 
@@ -466,7 +581,7 @@ class AccountPool:
         if not isinstance(usage, dict):
             return
         credits = None
-        for field in ("credit", "credits", "total_credit", "credit_used", "cost"):
+        for field in CREDIT_FIELDS:
             if field in usage:
                 credits = usage[field]
                 break
@@ -1106,8 +1221,14 @@ class PoolMiddleware:
                                  hint_text=outcome.get("error_text"),
                                  hint_headers=outcome.get("error_headers"),
                                  usage=outcome.get("usage"), model=attempt_model)
+                self.pool.note_usage(aid, attempt_model, outcome.get("tokens") or 0,
+                                     _credits_of(outcome.get("usage")))
                 if kid is not None:
                     self.pool.store.record_key_usage(kid, tokens=outcome["tokens"] or None)
+                # WAF 判定必须在收工**之前**：403/11128 也走 kind="done"（响应已由
+                # _attempt 转交给客户端，判为 done 是对的），但它是出口 IP 级信号，
+                # 不记账就等于把这条线索整个丢掉。见 admin/rotation.py。
+                self._note_waf_if_any(aid, outcome)
                 self.pool.flush()
                 return
             # 命中排队：标记让位。决策顺序见 spec 4.4——先换号，候选耗尽再降级模型。
@@ -1117,7 +1238,22 @@ class PoolMiddleware:
             _logger.info("账号 %s 命中容量队列（%s），让位 %s 秒", aid,
                          outcome.get("code") or "WAITING",
                          pool_cfg.get("queue_cooldown", 120))
+            # WAF/通道拦截是**出口 IP 级**的，换号无用（实测换遍全池仍被拦）。
+            # 识别出来就立刻停手：继续轮转只会把一次客户端请求放大成 N 次上游
+            # 请求，把一个已经触发的风控推得更重。见 admin/rotation.py。
+            if self._note_waf_if_any(aid, outcome):
+                _logger.warning(
+                    "上游 WAF 拦截疑似出口 IP 级（%d 秒内多个账号被拦），"
+                    "停止本次轮转以免放大：%s", WAF_IP_WINDOW,
+                    self._text_of(outcome))
+                break
             self.pool.flush()
+            # 轮转退避：换号零间隔本身就是可被统计的节奏特征，抖动用于打散
+            # 多请求的相位（固定周期会让它们再次聚团）。最后一次尝试后不必等。
+            if attempt + 1 < max_tries:
+                delay = backoff_after(attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
         # 尝试用尽：把最后一次的原始上游响应**原样**返回给客户端，让它按
         # data.retry_after 自行轮询（spec 4.4 第 4 条）。**不是** 503——
         # 503 会掩盖真实原因。last_outcome 为 None 说明连一次上游都没打到。
@@ -1134,6 +1270,17 @@ class PoolMiddleware:
             return await JSONResponse(
                 {"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
         self.pool.flush()
+
+    def _note_waf_if_any(self, aid, outcome):
+        """这次结果是否算 WAF/通道拦截？是则记账，返回 IP 级拦截是否已激活。
+
+        判据见 admin/rotation.py：结构化 code（11128）为主，403 需配合通道文案。
+        记账口径是「短窗内**不同账号**」，所以单个坏号反复被拦永远不会停掉轮转。
+        """
+        text = self._text_of(outcome) or outcome.get("error_text")
+        if not is_waf_error(outcome.get("status"), text, outcome.get("code")):
+            return False
+        return self.pool.waf_gate.note_waf(aid)
 
     def _next_model(self, pool_cfg, current_model, computed_models):
         """挑下一个该试的模型；没有则返回 None（表示该收工了）。
@@ -1223,6 +1370,8 @@ class PoolMiddleware:
             if state["held"] and state["first_body"] is None:
                 state["first_body"] = payload
                 is_queue, code, has_content = sniff(payload)
+                if code is not None:
+                    state["error_code"] = code
                 if is_queue and not has_content:
                     state["queue"] = True
                     state["code"] = code
@@ -1280,9 +1429,13 @@ class PoolMiddleware:
             REQUEST_CREDENTIAL.reset(token)
         # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
         # 采信上游明示的恢复时刻（见 admin/reset_at.py）。
+        # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
+        # 采信上游明示的恢复时刻（见 admin/reset_at.py）。error_code 供 WAF
+        # 判定（见 admin/rotation.py）。
         return {"kind": "done", "status": state["status"], "tokens": state["tokens"],
                 "usage": state.get("usage"),
                 "error_text": " ".join(err_texts) or None,
+                "error_code": state.get("error_code"),
                 "error_headers": state["headers"]}
 
     @staticmethod
@@ -1386,6 +1539,8 @@ class PoolMiddleware:
                              hint_text=" ".join(err_texts) or None,
                              hint_headers=resp_headers,
                              usage=nonlocal_last_usage[0], model=model)
+            self.pool.note_usage(aid, model, usage_tokens or 0,
+                                 _credits_of(nonlocal_last_usage[0]))
             if kid is not None:
                 self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
             self.pool.flush()

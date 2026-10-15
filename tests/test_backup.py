@@ -466,7 +466,7 @@ class BackupApiTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         payload = (await self.client.get("/admin/api/overview")).json()
         groups = payload["pool_groups"]
-        self.assertEqual(set(groups), {"checkin", "queue", "routing", "backup"})
+        self.assertEqual(set(groups), {"checkin", "queue", "routing", "guards", "backup"})
         # 分组必须覆盖 POOL_DEFAULTS 里除内部字段外的全部键，否则会有设置
         # 在页面上找不到位置（改了默认值却忘了归组）。
         grouped = {key for keys in groups.values() for key in keys}

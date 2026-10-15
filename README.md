@@ -755,7 +755,7 @@ startup log prints one aggregated line telling you the new name.
 
 ### Database
 
-All admin state lives in SQLite (`management/state.db`), fully structured — no generic kv table: `accounts`, `keys`, `settings`, `models`, `request_logs` (93-day retention), `upstream_request_usage`, `key_usage_daily`, `session_bindings`, `schema_meta`. Money is stored as `*_micro` integers (×1e6) and exposed as float; timestamps are integer unix seconds; calendar bucketing is Beijing time. Migrations are versioned and applied in a single transaction, so a failure rolls back and leaves the version number untouched. See `specs/db-redesign.md`.
+All admin state lives in SQLite (`management/state.db`), fully structured — no generic kv table: `accounts`, `keys`, `settings`, `models`, `request_logs` (93-day retention), `upstream_request_usage`, `key_usage_daily`, `account_usage_daily`, `session_bindings`, `schema_meta`. Money is stored as `*_micro` integers (×1e6) and exposed as float; timestamps are integer unix seconds; calendar bucketing is Beijing time. Migrations are versioned and applied in a single transaction, so a failure rolls back and leaves the version number untouched. See `specs/db-redesign.md`.
 
 ### Capacity Queue Failover (optional, off by default)
 
@@ -768,7 +768,6 @@ is treated as a slow upstream and passed through, never waited on indefinitely. 
 already contains real content is never replayed. See `specs/queue-failover.md`.
 
 ### Upstream Failure Handling
-
 Three small modules on the account-pool failure path: cooldown deadlines are taken from the
 upstream's **stated** reset time when it provides one (falling back to bounded local backoff),
 transport errors are classified as replay-safe vs. possibly-already-billed (never replay after the
@@ -783,6 +782,18 @@ promotions and trials only show up in the response). Observations expire after 6
 the ledger is **inert until observed**: if the upstream never returns a `credit` field, it records
 nothing and selection behaves exactly as before. `observed` in `overview.metrics.cost_ledger` is
 how you tell whether it is doing anything. See `specs/upstream-failure-handling.md`.
+
+### Account Quota Guards & WAF Fail-fast (optional, off by default)
+
+Four local guards stop requests that would burn an upstream account dry — upstream tells you
+the remaining balance but will not stop you from spending it. All four default to `0`
+(disabled), and when disabled nothing extra is read or written. The two load-bearing rules:
+**`0` means off**, and **an unknown count never blocks** (if usage cannot be read, the guard
+lets the request through rather than disabling the account — passing one request is far better
+than killing the pool because a read failed). Rotation between accounts is backed off with
+±25% jitter so retries do not re-cluster, and a `403`/`11128` seen on **two different accounts
+within 60s** is treated as an egress-IP-level block, stopping rotation before it amplifies the
+risk. See `specs/account-guards.md`.
 
 ### Capability Notes (Measured)
 

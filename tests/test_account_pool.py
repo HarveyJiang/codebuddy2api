@@ -351,6 +351,79 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(until - self.now, 1800)
         self.assertIn('本地退避', self.store.data['account_status'][self.a]['last_error'])
 
+    def test_guards_are_inert_when_disabled(self):
+        """护栏全关（默认）时选号行为与没这功能时一致，且不查库。"""
+        calls = []
+        original = self.store.db.account_usage_today
+        self.store.db.account_usage_today = lambda *a, **k: (calls.append(1), original())[1]
+        try:
+            aid, _ = self.pool.select(None, None, model="glm-5.2")
+        finally:
+            self.store.db.account_usage_today = original
+        self.assertIn(aid, {self.a, self.b})
+        self.assertEqual(calls, [], "护栏关闭时不该查用量表")
+
+    def test_guard_blocks_account_over_daily_token_limit(self):
+        """日 token 达到上限的账号被挡下，另一个照常可用。"""
+        self.store.data["pool"]["guard_daily_token_limit"] = 1000
+        self.store.db.add_account_usage(self.a, "glm-5.2", 1000)
+        self.pool.guard_usage.invalidate()
+        for _ in range(4):
+            aid, _ = self.pool.select(None, None, model="glm-5.2")
+            self.assertEqual(aid, self.b, "超限账号不该再被选中")
+
+    def test_guard_reserve_credits_blocks_low_balance(self):
+        self.store.data["pool"]["guard_reserve_credits"] = 100
+        self.pool.update(self.a, remaining=50)
+        self.pool.update(self.b, remaining=5000)
+        aid, _ = self.pool.select(None, None, model="glm-5.2")
+        self.assertEqual(aid, self.b)
+
+    def test_all_accounts_guarded_says_so_instead_of_pool_empty(self):
+        """全被护栏挡下时要指明是限额，不能误导成「没有可用账号」。"""
+        self.store.data["pool"]["guard_reserve_credits"] = 10**6
+        self.pool.update(self.a, remaining=50)
+        self.pool.update(self.b, remaining=50)
+        with self.assertRaises(HTTPException) as ctx:
+            self.pool.select(None, None, model="glm-5.2")
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn("限额", str(ctx.exception.detail))
+        self.assertNotIn("暂无可用账号", str(ctx.exception.detail))
+
+    def test_unknown_usage_never_blocks(self):
+        """用量读不出来时放行——把账号全停掉比被烧穿严重得多。"""
+        self.store.data["pool"]["guard_daily_token_limit"] = 1
+        original = self.store.db.account_usage_today
+        self.store.db.account_usage_today = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down"))
+        try:
+            self.pool.guard_usage.invalidate()
+            aid, _ = self.pool.select(None, None, model="glm-5.2")
+            self.assertIn(aid, {self.a, self.b})
+        finally:
+            self.store.db.account_usage_today = original
+
+    def test_note_usage_writes_only_when_guards_enabled(self):
+        """护栏关闭时不产生任何额外写库。"""
+        writes = []
+        original = self.store.db.add_account_usage
+        self.store.db.add_account_usage = lambda *a, **k: writes.append(a)
+        try:
+            self.pool.note_usage(self.a, "glm-5.2", 100)
+            self.assertEqual(writes, [], "护栏关闭时不该写用量表")
+            self.store.data["pool"]["guard_daily_token_limit"] = 100
+            self.pool.note_usage(self.a, "glm-5.2", 100)
+            self.assertEqual(len(writes), 1)
+        finally:
+            self.store.db.add_account_usage = original
+
+    def test_waf_gate_stops_rotation_across_accounts(self):
+        """两个不同账号接连命中 WAF → 判为出口 IP 级，立刻停手不放大。"""
+        now = self.now
+        self.pool.waf_gate = type(self.pool.waf_gate)(clock=lambda: now)
+        self.assertFalse(self.pool.waf_gate.note_waf(self.a))
+        self.assertTrue(self.pool.waf_gate.note_waf(self.b))
+        self.assertTrue(self.pool.waf_gate.active())
+
     def test_flush_debounce_and_force(self):
         self.pool.update(self.a, last_error=None)
         self.assertTrue(self.pool.dirty)
@@ -779,6 +852,88 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         cfg = {"queue_failover": True}
         cfg.update(overrides)
         self.store.data["pool"].update(cfg)
+
+    async def test_waf_block_stops_rotation_before_amplifying(self):
+        """WAF 拦截疑似出口 IP 级时立刻停手，不再换号放大风控。
+
+        11128 是「通道未授权」类拦截，实测换遍全池账号都被拦——它拦的是
+        网关出口 IP。这里模拟上游把 WAF 码放在**可轮转的响应**里
+        （非 200 + 代码），第一次尝试就该记账，第二次触及阈值后停手。
+
+        判定口径是「短窗内**不同账号**接连被拦」，所以必须走到第二个账号。
+        """
+        self._enable_failover(queue_retry=5, queue_model_fallback=False)
+        # 预付一次「已有另一个账号被拦」：这样第二次命中就到阈值 2。
+        self.pool.waf_gate.note_waf("pre-existing-other-account")
+        calls = []
+
+        async def app(scope, receive, send):
+            calls.append(1)
+            await receive()
+            await send({'type': 'http.response.start', 'status': 403,
+                        'headers': [(b'content-type', b'application/json')]})
+            await send({'type': 'http.response.body', 'body': json.dumps({
+                "code": "11128",
+                "message": "Illegal API invocation from an unapproved channel"}).encode()})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'hi'},
+                                         headers={'Authorization': 'Bearer api-test'})
+        # 第二个账号被拦后 gate 激活。403 本身不轮转（kind=done），
+        # 所以这里断言的是「gate 被记上账」而非放大。
+        self.assertTrue(self.pool.waf_gate.active())
+        self.assertEqual(response.status_code, 403)     # 上游的失败原样透传
+
+    async def test_waf_code_on_queue_response_stops_rotation(self):
+        """排队响应里带 WAF 码时：记账并停手，不再换号放大。
+
+        这是 gate 真正起作用的地方——排队路径**会**轮转，而 WAF 拦截是
+        出口 IP 级的，换号无用。两个不同账号接连被拦即判 IP 级。
+        """
+        self._enable_failover(queue_retry=5, queue_model_fallback=False)
+        self.pool.waf_gate.note_waf("pre-existing-other-account")  # 已有一个号被拦
+        calls = []
+
+        async def app(scope, receive, send):
+            calls.append(1)
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'application/json')]})
+            await send({'type': 'http.response.body', 'body': json.dumps({
+                "code": "11128", "message": "请等候，前方约 7859 位用户排队"}).encode()})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            await client.post('/v1/responses', json={'input': 'hi'},
+                              headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(len(calls), 1, "WAF 判定激活后必须立刻停手，不再试下一个号")
+        self.assertTrue(self.pool.waf_gate.active())
+
+    async def test_single_account_waf_block_does_not_stop_rotation(self):
+        """同一账号反复被拦属账号级偶发，不该判成 IP 级、不该停掉轮转。
+
+        判定口径是「短窗内**不同账号**数」：这里把池子缩到只剩一个账号，
+        即使它被拦多次，不同账号数仍是 1，gate 不该激活。
+        """
+        self._enable_failover(queue_retry=4, queue_model_fallback=False)
+        # 只留一个账号：否则轮转会打到第二个号，反而正确地触发 IP 级判定。
+        self.store.data["accounts"].pop(self.b)
+        self.store.data["account_status"].pop(self.b, None)
+        calls = []
+
+        async def app(scope, receive, send):
+            calls.append(1)
+            await receive()
+            await send({'type': 'http.response.start', 'status': 403,
+                        'headers': [(b'content-type', b'application/json')]})
+            await send({'type': 'http.response.body', 'body': json.dumps({
+                "code": "11128",
+                "message": "Illegal API invocation from an unapproved channel"}).encode()})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            await client.post('/v1/responses', json={'input': 'hi'},
+                              headers={'Authorization': 'Bearer api-test'})
+        self.assertFalse(self.pool.waf_gate.active(), "单号反复被拦不该判成 IP 级")
+        self.assertEqual(self.pool.waf_gate.snapshot()["threshold"], 2)
 
     def test_queue_error_detection_accepts_both_shapes(self):
         # 结构化 code（用户实测的 WAITING）与 HTTP 限流码都必须判定为排队。

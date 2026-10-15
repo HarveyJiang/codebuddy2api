@@ -840,7 +840,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                       "recent": recent, "affinity_hits": pool.affinity_hits, "affinity_rebinds": pool.affinity_rebinds,
                       # 实测成本账本规模。上游若从不返回 credit，这里会长期是 0——
                       # 这个数字就是判断「账本到底有没有在用」的唯一依据。
-                      "cost_ledger": pool.cost_ledger.stats()}
+                      "cost_ledger": pool.cost_ledger.stats(),
+                      # WAF IP 级拦截状态。激活期间轮转会提前收手，不放大风控。
+                      "waf_gate": pool.waf_gate.snapshot()}
             return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "pool_groups": {k: list(v) for k, v in AccountPool.SETTING_GROUPS.items()}, "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "version": app_version.snapshot(), "events": list(store.events)}
 
     @app.get("/admin/api/logs")
@@ -1119,6 +1121,22 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(fallback, str) or not fallback.strip() or len(fallback) > 100:
                     raise HTTPException(400, "兜底模型名无效")
                 settings["queue_fallback_model"] = fallback.strip()
+            # 账号级限额护栏（admin/guards.py）。上界给得宽，但要挡住明显误输入
+            # （把 token 上限填成 1e9 等于没开，填成负数会绕过 0=关闭 的语义）。
+            for field, label, upper in (
+                    ("guard_reserve_credits", "保留余额", 100_000_000),
+                    ("guard_daily_token_limit", "单账号日 token 上限", 10_000_000_000),
+                    ("guard_daily_credit_limit", "单账号日积分上限", 100_000_000),
+                    ("guard_model_daily_token_limit", "单账号单模型日 token 上限", 10_000_000_000)):
+                if field not in body:
+                    continue
+                try:
+                    value = int(body[field])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{label}需为整数")
+                if not 0 <= value <= upper:
+                    raise HTTPException(400, f"{label}需在 0-{upper} 之间（0 = 关闭）")
+                settings[field] = value
             if "backup_enabled" in body:
                 if type(body["backup_enabled"]) is not bool:
                     raise HTTPException(400, "自动备份开关无效")

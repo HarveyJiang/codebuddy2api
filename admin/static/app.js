@@ -230,7 +230,7 @@ $("refresh").addEventListener("click", async () => {
   } else { refresh().catch(e=>toast(e.message)); }
 });
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim()}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value)}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 
 // ── 数据库备份 ──────────────────────────────────────────────────────────
@@ -240,6 +240,11 @@ function paintSettings() {
   $("backup-enabled").checked = !!pool.backup_enabled;
   $("backup-interval").value = pool.backup_interval_hours ?? 24;
   $("backup-keep").value = pool.backup_keep ?? 10;
+  // 账号限额护栏。0 = 关闭，是默认值。
+  $("guard-reserve-credits").value = pool.guard_reserve_credits ?? 0;
+  $("guard-daily-token-limit").value = pool.guard_daily_token_limit ?? 0;
+  $("guard-daily-credit-limit").value = pool.guard_daily_credit_limit ?? 0;
+  $("guard-model-daily-token-limit").value = pool.guard_model_daily_token_limit ?? 0;
 }
 async function loadBackups() {
   const data = await api("backups");

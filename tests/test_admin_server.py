@@ -336,6 +336,36 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["queue_retry"], 4)
         self.assertEqual(again["queue_hold_ms"], 1500)
 
+    async def test_guard_settings_default_off_and_validated(self):
+        """账号限额护栏：默认全关、可开启、非法值拒绝、重启保留。"""
+        await self.login()
+        overview = (await self.client.get("/admin/api/overview")).json()
+        # 默认全 0 = 关闭。护栏会主动拒绝请求，默认必须无为。
+        for field in ("guard_reserve_credits", "guard_daily_token_limit",
+                      "guard_daily_credit_limit", "guard_model_daily_token_limit"):
+            self.assertEqual(overview["pool"][field], 0, field)
+        saved = await self.client.patch("/admin/api/pool/settings", json={
+            "guard_reserve_credits": 100, "guard_daily_token_limit": 5000,
+            "guard_daily_credit_limit": 50, "guard_model_daily_token_limit": 2000})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        pool = saved.json()["pool"]
+        self.assertEqual(pool["guard_reserve_credits"], 100)
+        self.assertEqual(pool["guard_daily_token_limit"], 5000)
+        self.assertEqual(pool["guard_daily_credit_limit"], 50)
+        self.assertEqual(pool["guard_model_daily_token_limit"], 2000)
+        # 非法值一律 400：负数会绕过 0=关闭 的语义，必须挡在入口。
+        for bad in ({"guard_reserve_credits": -1}, {"guard_daily_token_limit": "abc"},
+                    {"guard_daily_credit_limit": 10**12},
+                    {"guard_model_daily_token_limit": -100}):
+            response = await self.client.patch("/admin/api/pool/settings", json=bad)
+            self.assertEqual(response.status_code, 400, f"{bad} 应被拒绝")
+        # 重启后设置仍在。
+        self.make_app()
+        await self.login()
+        again = (await self.client.get("/admin/api/overview")).json()["pool"]
+        self.assertEqual(again["guard_reserve_credits"], 100)
+        self.assertEqual(again["guard_model_daily_token_limit"], 2000)
+
     async def test_custom_model_add_hide_and_callable(self):
         """手动添加模型：能保存、不被拉取冲掉、来源区分上游与自定义。"""
         await self.login()
