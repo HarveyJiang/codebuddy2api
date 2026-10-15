@@ -569,16 +569,20 @@ class AccountPool:
         # 立刻失效缓存：否则刚用完额度的号在 TTL 内仍会被判为可用。
         self.guard_usage.invalidate()
 
-    def try_select(self, affinity_key, kid, exclude, model=None):
+    def try_select(self, affinity_key, kid, exclude, model=None, backend=None):
         """尝试选一个没试过的账号；没有候选时返回 None，不抛异常。
 
         排队切号专用：候选耗尽时我们要把上游的排队响应**原样**返回给客户端，
         而不是抛 503——那样客户端会看到一个与真实原因（排队）无关的错误。
         把「有没有候选」和「选到谁」合成一次调用，也顺带消掉了原先
         「先探测候选集、再选号」两步之间的竞态窗口。
+
+        backend 必须原样传给 select：漏掉它就等于在重试时丢掉后端隔离，
+        腾讯请求会拿到字节账号（反之亦然）——凭据格式、上游域名、模型目录
+        全都不兼容，等于把一次排队变成一个莫名其妙的 4xx。
         """
         try:
-            return self.select(affinity_key, kid, exclude=exclude, model=model)
+            return self.select(affinity_key, kid, exclude=exclude, model=model, backend=backend)
         except HTTPException:
             return None
 
@@ -910,6 +914,14 @@ class AccountPool:
                         self.update(aid, checkin_fails=fails)
                     except HTTPException:
                         pass
+                    except Exception:
+                        # 关键隔离点：operate 对 Trae 账号会抛 TraeAPIError / JSON /
+                        # 网络错误等任意异常。若只 catch HTTPException，一个坏掉的
+                        # 字节账号会把**整轮 tick 打断**，排在其后的腾讯账号这轮既不
+                        # 签到也不刷新——「加了字节不该影响腾讯」在这里被打破。
+                        # 逐账号兜住并留痕，让其余账号照常推进。
+                        _logger.exception("账号 %s 自动签到异常，已跳过（不影响其它账号）", aid)
+                        self.update(aid, checkin_fails=self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) + 1)
         # 低峰凭据预刷新：expiresAt 2 小时内到期的账号提前刷新，避免请求撞上 401 再冷却。
         # 凭据预刷新：分散到白天时段，每个账号每天随机一个时刻，模拟正常使用时刷新，
         # 避免半夜集中刷新。仅在 access token 两小时内到期时才动作。
@@ -940,6 +952,9 @@ class AccountPool:
                         await asyncio.to_thread(self.operate, aid, "refresh")
                     except HTTPException:
                         pass
+                    except Exception:
+                        # 同上：逐账号兜住，否则一个坏账号会让本轮后续账号都刷不到。
+                        _logger.exception("账号 %s 凭据预刷新异常，已跳过（不影响其它账号）", aid)
         self.flush()
         # 上游用量明细：每账号每天一次，失败只留痕不影响其它账号。
         await self.sync_upstream_usage_batch()
@@ -1278,7 +1293,7 @@ class PoolMiddleware:
         for attempt in range(max_tries):
             # 第一次尝试用调用方已选好的账号；之后每次重新选号。
             if attempt:
-                picked = self.pool.try_select(affinity_key, kid, tried_accounts, model=attempt_model)
+                picked = self.pool.try_select(affinity_key, kid, tried_accounts, model=attempt_model, backend=backend)
                 if picked is None:
                     # 候选账号已试尽。先看能不能换个模型再继续，否则收工，
                     # 把上游最后一次的排队响应原样返回。
@@ -1294,7 +1309,7 @@ class PoolMiddleware:
                     # 换模型后账号可以重新从头试：新模型面对的是另一个上游队列。
                     tried_accounts = []
                     _logger.info("可用账号已试尽，降级到 %s 重试", next_model)
-                    picked = self.pool.try_select(affinity_key, kid, tried_accounts, model=attempt_model)
+                    picked = self.pool.try_select(affinity_key, kid, tried_accounts, model=attempt_model, backend=backend)
                     if picked is None:
                         break
                 aid, manager = picked
@@ -1325,7 +1340,7 @@ class PoolMiddleware:
                 # WAF 判定必须在收工**之前**：403/11128 也走 kind="done"（响应已由
                 # _attempt 转交给客户端，判为 done 是对的），但它是出口 IP 级信号，
                 # 不记账就等于把这条线索整个丢掉。见 admin/rotation.py。
-                self._note_waf_if_any(aid, outcome)
+                self._note_waf_if_any(aid, outcome, backend=backend)
                 self.pool.flush()
                 return
             # 命中排队：标记让位。决策顺序见 spec 4.4——先换号，候选耗尽再降级模型。
@@ -1338,7 +1353,7 @@ class PoolMiddleware:
             # WAF/通道拦截是**出口 IP 级**的，换号无用（实测换遍全池仍被拦）。
             # 识别出来就立刻停手：继续轮转只会把一次客户端请求放大成 N 次上游
             # 请求，把一个已经触发的风控推得更重。见 admin/rotation.py。
-            if self._note_waf_if_any(aid, outcome):
+            if self._note_waf_if_any(aid, outcome, backend=backend):
                 _logger.warning(
                     "上游 WAF 拦截疑似出口 IP 级（%d 秒内多个账号被拦），"
                     "停止本次轮转以免放大：%s", WAF_IP_WINDOW,
@@ -1368,16 +1383,17 @@ class PoolMiddleware:
                 {"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
         self.pool.flush()
 
-    def _note_waf_if_any(self, aid, outcome):
-        """这次结果是否算 WAF/通道拦截？是则记账，返回 IP 级拦截是否已激活。
+    def _note_waf_if_any(self, aid, outcome, backend="workbuddy"):
+        """这次结果是否算 WAF/通道拦截？是则记账，返回该后端是否已激活。
 
         判据见 admin/rotation.py：结构化 code（11128）为主，403 需配合通道文案。
-        记账口径是「短窗内**不同账号**」，所以单个坏号反复被拦永远不会停掉轮转。
+        记账口径是「短窗内**不同账号**」，所以单个坏号反复被拦永远不会停掉轮转；
+        按 backend 分桶，所以字节被拦不会停掉腾讯的轮转。
         """
         text = self._text_of(outcome) or outcome.get("error_text")
         if not is_waf_error(outcome.get("status"), text, outcome.get("code")):
             return False
-        return self.pool.waf_gate.note_waf(aid)
+        return self.pool.waf_gate.note_waf(aid, backend=backend)
 
     def _next_model(self, pool_cfg, current_model, computed_models):
         """挑下一个该试的模型；没有则返回 None（表示该收工了）。

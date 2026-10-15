@@ -56,6 +56,10 @@ WAF_IP_THRESHOLD = 2
 # channel"，实测换遍全池所有账号都被拦，与账号无关。
 WAF_CODES = frozenset({"11128"})
 
+# 已知后端名。snapshot() 恒定列出这几个桶，好让管理页拿到**稳定**的结构——
+# 只列「碰巧出现过」的后端，前端就得处理桶随时出现/消失的情况。
+KNOWN_BACKENDS = ("workbuddy", "trae")
+
 # WAF 拦截的文案兜底。**只作兜底**：主判据是结构化 code，上游改文案时
 # 结构化码还在；反过来只靠文案会在编解码差异下漏判。
 WAF_PATTERNS = (
@@ -108,10 +112,15 @@ def backoff_after(n: int, base: float = BACKOFF_BASE, cap: float = BACKOFF_CAP) 
 
 
 class WafIpGate:
-    """WAF IP 级拦截状态机。
+    """WAF IP 级拦截状态机（按出口 IP 分桶）。
 
     进程内状态，重启清零——窗口只有 60 秒，重建成本极低，落库反而会带来
     「重启后继承一个可能早已过期的封锁」的风险。
+
+    **按 backend 分桶**：判定依据是「同一个出口 IP 被不同账号接连拦」，而
+    两个后端用的是完全不同的凭据体系与上游域名。把它们混在一个桶里，字节
+    的 403 会把腾讯的轮转也一起停掉——这正是「加了字节就不该影响腾讯」的
+    反面。分桶后互不干扰。
     """
 
     def __init__(self, *, window: float = WAF_IP_WINDOW,
@@ -119,12 +128,14 @@ class WafIpGate:
         self.window = float(window)
         self.threshold = max(1, int(threshold))
         self._clock = clock or (lambda: __import__("time").time())
-        self._hits: dict[str, float] = {}
-        self._until = 0.0
+        # backend -> {account_id: 命中时刻}
+        self._hits: dict[str, dict[str, float]] = {}
+        # backend -> 解除时刻
+        self._until: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def note_waf(self, account_id, now=None) -> bool:
-        """记一次某账号的 WAF 拦截；返回记账后 IP 级拦截**是否激活**。
+    def note_waf(self, account_id, now=None, backend="workbuddy") -> bool:
+        """记一次某账号的 WAF 拦截；返回记账后该后端的 IP 级拦截是否激活。
 
         调用方据此 fail-fast 终止轮转（优先于退避等待）。
 
@@ -133,42 +144,59 @@ class WafIpGate:
         - 未激活：记下这个账号，剪掉窗外的过期命中，然后数**不同账号数**。
           同一个账号重复命中只覆盖时间、不增加计数，因为判定口径是
           「有几个不同的号被打」而不是「被打了几次」。
-        - 达到阈值才激活，并清空窗口：解除后需要全新的一批命中才能再次判定，
-          不会拿旧账立刻重新触发。
+        - 达到阈值才激活，并清空该桶的窗口：解除后需要全新的一批命中才能
+          再次判定，不会拿旧账立刻重新触发。
         """
+        bucket = str(backend or "workbuddy")
         current = float(now if now is not None else self._clock())
         with self._lock:
-            if current < self._until:
+            if current < self._until.get(bucket, 0.0):
                 return True
-            self._hits[str(account_id)] = current
-            for other, at in list(self._hits.items()):
+            hits = self._hits.setdefault(bucket, {})
+            hits[str(account_id)] = current
+            for other, at in list(hits.items()):
                 if current - at > self.window:
-                    del self._hits[other]
-            if len(self._hits) >= self.threshold:
-                self._until = current + self.window
-                self._hits.clear()
+                    del hits[other]
+            if len(hits) >= self.threshold:
+                self._until[bucket] = current + self.window
+                self._hits[bucket] = {}
                 return True
             return False
 
-    def active(self, now=None) -> bool:
-        """IP 级拦截是否处于激活期。"""
+    def active(self, now=None, backend="workbuddy") -> bool:
+        """该后端的 IP 级拦截是否处于激活期。"""
+        current = float(now if now is not None else self._clock())
+        bucket = str(backend or "workbuddy")
+        with self._lock:
+            return current < self._until.get(bucket, 0.0)
+
+    def reset(self, backend=None) -> None:
+        """清空状态。``backend=None`` 清空全部（管理页手动解除或测试用）。"""
+        with self._lock:
+            if backend is None:
+                self._hits.clear()
+                self._until.clear()
+                return
+            bucket = str(backend)
+            self._hits.pop(bucket, None)
+            self._until.pop(bucket, None)
+
+    def snapshot(self, now=None, backend=None) -> dict:
+        """供后台透出：还剩多久、窗口里有几个号。
+
+        ``backend=None`` 时返回**按后端分列**的汇总——两个后端的状态要能
+        各自独立判断，不能只看到一个总数。
+        """
         current = float(now if now is not None else self._clock())
         with self._lock:
-            return current < self._until
-
-    def reset(self) -> None:
-        """清空状态（管理页手动解除，或测试用）。"""
-        with self._lock:
-            self._hits.clear()
-            self._until = 0.0
-
-    def snapshot(self, now=None) -> dict:
-        """供后台透出：还剩多久、窗口里有几个号。"""
-        current = float(now if now is not None else self._clock())
-        with self._lock:
-            remaining = max(0.0, self._until - current)
-            return {"active": current < self._until,
-                    "remaining_seconds": int(remaining),
-                    "accounts_in_window": len(self._hits),
+            def one(bucket):
+                return {"active": current < self._until.get(bucket, 0.0),
+                        "remaining_seconds": int(max(0.0, self._until.get(bucket, 0.0) - current)),
+                        "accounts_in_window": len(self._hits.get(bucket, {})),
+                        "threshold": self.threshold,
+                        "window_seconds": int(self.window)}
+            if backend is not None:
+                return one(str(backend))
+            return {"by_backend": {b: one(b) for b in KNOWN_BACKENDS},
                     "threshold": self.threshold,
                     "window_seconds": int(self.window)}

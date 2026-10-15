@@ -768,10 +768,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             while True:
                 try:
                     # 收养 CLI 新落盘的 .info（如 trae-{uid}.info），再跑 tick。
-                    await asyncio.to_thread(store.adopt_auth_files)
+                    #
+                    # 收养与 tick 分开兜底：收养读的是**所有**后端的凭据文件，
+                    # 一个坏文件抛异常若不单独接住，tick 根本不会跑——于是两个
+                    # 后端的签到与凭据刷新一起停摆。字节加进来之后，这个风险
+                    # 才真正成立。
+                    try:
+                        await asyncio.to_thread(store.adopt_auth_files)
+                    except Exception:
+                        logging.getLogger("admin.pool").exception("收养凭据文件异常（不影响本轮 tick）")
                     await pool.tick()
                 except Exception:
-                    pass  # Per-account errors are persisted without credential data.
+                    logging.getLogger("admin.pool").exception("账号池 tick 异常（不影响下一轮）")
                 await asyncio.sleep(60)
         pool_task = asyncio.create_task(pool_worker())
         async def backup_worker():

@@ -767,6 +767,21 @@ window is hard-bounded by `queue_hold_ms` (default 3000ms) — if no first chunk
 is treated as a slow upstream and passed through, never waited on indefinitely. A response that
 already contains real content is never replayed. See `specs/queue-failover.md`.
 
+### Backend Isolation: Tencent vs. ByteDance
+
+Tencent (CodeBuddy) and ByteDance (Trae) share **one** account pool, separated by
+`accounts.backend`. Per-account state (cooldown, queue yield, quota guards, cost ledger) is
+already isolated by construction, but the separation only holds if every account-selection call
+passes the backend through — a single omission hands one backend's request the other backend's
+account, which surfaces as a baffling 4xx rather than a wrong-account retry. Four invariants are
+enforced and regression-tested: selection always filters by backend (including the queue-failover
+retry, the easiest place to leak); `try_select` passes it through and never borrows an account
+from the other side; the WAF fail-fast gate is bucketed per backend so a ByteDance block cannot
+stall Tencent rotation; and the pool tick traps errors per account so one broken ByteDance
+account cannot starve Tencent accounts of check-in and credential refresh. To detach ByteDance
+entirely, set `CODEBUDDY_ENABLE_TRAE=0` rather than disabling accounts.
+See `specs/backend-isolation.md`.
+
 ### Upstream Failure Handling
 Three small modules on the account-pool failure path: cooldown deadlines are taken from the
 upstream's **stated** reset time when it provides one (falling back to bounded local backoff),

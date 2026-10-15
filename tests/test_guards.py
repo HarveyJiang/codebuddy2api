@@ -243,10 +243,21 @@ class WafIpGateTests(unittest.TestCase):
     def test_snapshot(self):
         self.gate.note_waf("a1")
         self.gate.note_waf("a2")
-        snap = self.gate.snapshot()
+        snap = self.gate.snapshot(backend="workbuddy")
         self.assertTrue(snap["active"])
         self.assertGreater(snap["remaining_seconds"], 0)
         self.assertEqual(snap["threshold"], 2)
+
+    def test_snapshot_aggregates_both_backends_by_default(self):
+        """不指定 backend 时按后端分列：两个后端要能各自独立判断。"""
+        self.gate.note_waf("a1")
+        self.gate.note_waf("a2")
+        snap = self.gate.snapshot()
+        self.assertIn("by_backend", snap)
+        # 恒定列出两个已知后端，结构稳定，前端不用处理「桶时有时无」。
+        self.assertEqual(set(snap["by_backend"]), {"workbuddy", "trae"})
+        self.assertTrue(snap["by_backend"]["workbuddy"]["active"])
+        self.assertFalse(snap["by_backend"]["trae"]["active"])
 
 
 class BackoffTests(unittest.TestCase):
