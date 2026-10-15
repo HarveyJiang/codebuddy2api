@@ -32,6 +32,8 @@ def test_build_login_url_params():
     assert qs["login_trace_id"] == ["t" * 16]
     assert qs["login_channel"] == ["native_ide"]
     assert qs["x_app_version"] == [L.T.IDE_VERSION]
+    # redirect=0 是登录表单出现的前提（=1 会让授权页直接渲染"登录成功"终态）。
+    assert qs["redirect"] == ["0"]
 
 
 def test_parse_callback_direct_refresh_token():

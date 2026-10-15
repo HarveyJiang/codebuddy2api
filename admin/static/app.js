@@ -249,7 +249,7 @@ $("trae-start").addEventListener("click", async () => {
     traeFlow = flow;
     $("trae-open").href = flow.url; $("trae-link-box").hidden = false;
     $("trae-start").textContent = "重新生成链接";
-    $("trae-status").textContent = "登录链接已就绪。在浏览器完成登录后，复制页面显示的回调地址，粘贴到下方完成绑定。";
+    $("trae-status").textContent = "登录链接已就绪。在浏览器用手机号／验证码登录后，浏览器会跳到打不开的 127.0.0.1 地址——复制地址栏的完整链接，粘贴到下方完成绑定。";
     traeTimer = setTimeout(pollTrae, 4000);
   } catch (e) { $("account-error").textContent = e.message; }
   finally { $("trae-start").disabled = false; }

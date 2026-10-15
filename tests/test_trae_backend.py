@@ -749,10 +749,11 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert r.status_code == 200
         data = r.json()
         assert data["url"].startswith("https://www.trae.cn/authorization?")
-        # 回调必须是 127.0.0.1（公网回调实测被授权页拒绝）+ redirect=1（页面展示地址供复制）
+        # 回调必须是 127.0.0.1（公网回调实测被授权页拒绝）+ redirect=0
+        # （授权页据此跳 /login 出登录表单；redirect=1 会直接渲染"登录成功"终态）。
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
         assert qs["auth_callback_url"][0] == "http://127.0.0.1:18080/authorize"
-        assert qs["redirect"] == ["1"]
+        assert qs["redirect"] == ["0"]
         assert data["id"] in self.app.state.store.trae_flows
 
     async def test_trae_login_end_to_end_adds_account(self):
@@ -959,14 +960,14 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     # ---- 本机接收器（免复制粘贴） ----
 
-    async def test_authorize_uses_local_callback_and_redirect1(self):
+    async def test_authorize_uses_local_callback_and_redirect0(self):
         headers = await self.login_admin()
         data = (await self.client.post("/admin/api/trae/authorize", headers=headers)).json()
-        # 127.0.0.1 回调 + redirect=1；不再下发本机接收器命令 / 端口
+        # 127.0.0.1 回调 + redirect=0；不再下发本机接收器命令 / 端口
         assert "command" not in data and "port" not in data
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
         assert qs["auth_callback_url"][0] == "http://127.0.0.1:18080/authorize"
-        assert qs["redirect"] == ["1"]
+        assert qs["redirect"] == ["0"]
         flow = self.app.state.store.trae_flows[data["id"]]
         assert flow["status"] == "pending"
 

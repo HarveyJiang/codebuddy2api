@@ -705,8 +705,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），随 fid 服务端暂存。
         # auth_callback_url 必须是 127.0.0.1 形态——公网回调实测被授权页直接拒绝
         # （2026-10-15：授权页报"登录失败"，服务器从未收到任何请求）。
-        # 配合 redirect=1：授权页不 fetch 该地址，而是把完整回调地址（含 refreshToken）
-        # 展示给用户复制，粘贴到管理页完成绑定；本机接收器（若在监听）同样兼容。
+        # 配合 redirect=0：授权页跳 /login 出登录表单，登录后浏览器导航到该 127.0.0.1
+        # 地址（无接收器时连接失败）——地址栏即含 refreshToken 的完整回调地址，供复制粘贴。
+        # （redirect=1 实测会让授权页直接渲染"登录成功"终态、不出登录表单。）
         port = _trae_port()
         url = build_login_url(machine_id, device_id, callback=f"http://127.0.0.1:{port}/authorize")
         with store.lock:
