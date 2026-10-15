@@ -708,14 +708,17 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.post("/admin/api/trae/authorize")
     async def trae_authorize(req: Request):
         store.require_admin(req)
-        from core.backends.trae_login import build_login_url, local_command
+        from core.backends.trae_login import build_login_url
 
         fid, secret = secrets.token_hex(8), secrets.token_urlsafe(24)
         machine_id, device_id = secrets.token_hex(16), secrets.token_hex(16)
-        port = _trae_port()
         now = time.time()
-        # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），随 fid 服务端暂存
-        url = build_login_url(machine_id, device_id, callback=f"http://127.0.0.1:{port}/authorize")
+        # machine_id/device_id 必须与登录 URL 一致（上游把会话绑定到该设备对），随 fid 服务端暂存。
+        # 回调指向公网 /trae/callback/<fid>/<secret>：授权页登录成功后把凭据 fetch 投递到服务器，
+        # 用户无需本机接收器、无需复制粘贴。fid/secret 放 path（不与上游 append 的 query 冲突），
+        # secret 同时是回调的鉴权凭据（防伪造回调注入凭据）。
+        callback = f"{_public_base(req)}/trae/callback/{fid}/{secret}"
+        url = build_login_url(machine_id, device_id, callback=callback)
         with store.lock:
             store.trae_flows = {k: v for k, v in store.trae_flows.items() if v["expires"] > now}
             if len(store.trae_flows) >= 20:
@@ -723,9 +726,61 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             store.trae_flows[fid] = {"machine_id": machine_id, "device_id": device_id, "secret": secret,
                                      "url": url, "expires": now + 600, "status": "pending",
                                      "message": None, "uid": None, "nickname": None}
-        base = _public_base(req)
-        return {"id": fid, "url": url, "expires_at": int((now + 600) * 1000),
-                "port": port, "command": local_command(base, fid, secret)}
+        return {"id": fid, "url": url, "expires_at": int((now + 600) * 1000)}
+
+    _TRAE_CALLBACK_CORS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    }
+
+    @app.api_route("/trae/callback/{fid}/{secret}", methods=["GET", "POST", "OPTIONS"])
+    async def trae_public_callback(fid: str, secret: str, req: Request):
+        """Trae 授权页 fetch 投递的公网回调：免命令免粘贴完成登录。
+
+        凭 path 里的 flow secret 鉴权（不校验管理会话）；授权页是跨域 fetch，
+        必须回 CORS 头，否则浏览器拦截响应、授权页误报"网络错误"。
+        """
+        from core.backends import trae_login as trae_login_mod
+
+        if req.method == "OPTIONS":
+            return Response(status_code=204, headers=_TRAE_CALLBACK_CORS)
+        flow, error = _trae_flow(fid, secret)
+        if error:
+            return JSONResponse({"ok": False, "error": error}, status_code=404, headers=_TRAE_CALLBACK_CORS)
+        if flow["status"] == "done":
+            return JSONResponse({"ok": True, "uid": flow.get("uid"), "nickname": flow.get("nickname"),
+                                 "message": "该账号已完成登录"}, headers=_TRAE_CALLBACK_CORS)
+        query = str(req.url.query)
+        raw_body = (await req.body()).decode("utf-8", "replace")
+        parsed = trae_login_mod.parse_received(req.method, str(req.url.path), query, raw_body)
+
+        def _fail(message, status_code=400):
+            with store.lock:
+                current = store.trae_flows.get(fid)
+                if current and current["status"] == "pending":
+                    current.update(status="error", message=message)
+            return JSONResponse({"ok": False, "error": message}, status_code=status_code,
+                                headers=_TRAE_CALLBACK_CORS)
+
+        if not parsed["refresh_token"] and not parsed["jwt_token"]:
+            fields = ", ".join(trae_login_mod.received_fields(query=query, body=raw_body)[:20])
+            return _fail(f"未从回调中识别到凭据（收到字段：{fields or '空'}）")
+        try:
+            summary = await asyncio.to_thread(
+                trae_login_mod.login, parsed, flow["machine_id"], flow["device_id"], store.auth_dir
+            )
+        except (RuntimeError, ValueError, httpx.HTTPError) as e:
+            return _fail(f"登录失败：{e}")
+        added = await asyncio.to_thread(store.adopt_auth_files)
+        with store.lock:
+            current = store.trae_flows.get(fid)
+            if current:
+                current.update(status="done", message="登录成功", uid=summary["uid"],
+                               nickname=summary["nickname"], url=None)
+        return JSONResponse({"ok": True, "uid": summary["uid"], "nickname": summary["nickname"],
+                             "updated": summary["updated"], "adopted": added, "message": "登录成功"},
+                            headers=_TRAE_CALLBACK_CORS)
 
     @app.get("/trae/local.py")
     async def trae_local_script(req: Request, f: str = "", t: str = ""):
