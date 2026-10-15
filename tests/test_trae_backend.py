@@ -831,6 +831,40 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert status["checkin_date"] == today
         assert "/trae/api/v2/ug/checkin_credits/claim" in calls
 
+    async def test_trae_checkin_retries_until_upstream_confirms(self):
+        # 回归：claim 返回 200 后 status 未立即刷新（上游异步生效），
+        # 应有界重试确认而非误报"签到已提交，但上游尚未确认"。
+        headers = await self.login_admin()
+        aid = self.trae_aid()
+        state = {"claimed": False, "status_after_claim": 0}
+
+        def handler(req):
+            if req.url.path.endswith("/checkin_credits/status"):
+                if not state["claimed"]:
+                    return httpx.Response(200, json={"checked_in": False, "credits": 0, "enable": True})
+                # claim 后第 1 次仍未确认，第 2 次才确认（模拟异步生效）
+                state["status_after_claim"] += 1
+                confirmed = state["status_after_claim"] >= 2
+                return httpx.Response(200, json={"checked_in": confirmed, "credits": 50, "enable": True})
+            if req.url.path.endswith("/checkin_credits/claim"):
+                state["claimed"] = True
+                return httpx.Response(200, json={})
+            if req.url.path.endswith("/ide_user_ent_usage"):
+                return httpx.Response(200, json={"user_entitlement_pack_list": [{"entitlement_base_info": {"quota": {"credits_limit": 120}}}]})
+            return httpx.Response(404)
+
+        real = _REAL_SYNC_CLIENT
+        self.admin_server.httpx.Client = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        try:
+            r = await self.client.post(f"/admin/api/accounts/{aid}/actions/checkin", headers=headers)
+        finally:
+            self.admin_server.httpx.Client = real
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True, body
+        assert body["message"] == "签到成功"
+        assert state["status_after_claim"] >= 2  # 确实重试了
+
     async def test_trae_account_status_pulls_credits_without_checkin(self):
         # action=status：只查状态 + 积分，不执行签到。
         headers = await self.login_admin()

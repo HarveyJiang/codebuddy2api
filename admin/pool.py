@@ -422,8 +422,17 @@ class AccountPool:
                         message = "当前没有可参与的签到活动"
                     else:
                         manager.checkin_claim(client)
-                        ci = manager.checkin_status(client)
-                        if not ci["checked"]:
+                        # 上游签到为异步生效：claim 返回 200 后，status 接口的 checked_in
+                        # 可能仍未刷新。做有界重试（短退避）确认，避免把"刚生效"误判成"尚未确认"。
+                        confirmed = False
+                        for attempt in range(4):
+                            ci = manager.checkin_status(client)
+                            if ci["checked"]:
+                                confirmed = True
+                                break
+                            if attempt < 3:
+                                time.sleep(1.5)
+                        if not confirmed:
                             raise BillingError("签到已提交，但上游尚未确认；请刷新状态")
                         self.update(aid, checkin_date=today)
                         message = "签到成功"
