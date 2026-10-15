@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import random
 import threading
 import time
@@ -19,6 +20,7 @@ REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 # 会先于外层读取执行，ContextVar 到外层就变回默认值了（实测确认）。
 # scope 是同一条链上共享的可变对象，不受 finally 时序影响。
 REQUEST_LOG_CONTEXT = "codebuddy.request_log"
+_logger = logging.getLogger("admin.pool")
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
 # 上游用量明细接口在另一个域、且没有 /v2 前缀，不能复用 BILLING 常量。
@@ -299,7 +301,17 @@ class AccountPool:
                 data.update(cooldown_until=self.clock() + cooldown, last_error=f"{label}，已冷却 {cooldown // 60} 分钟")
                 if status == 402:
                     data["credits_updated"] = 0  # 触发下个周期立即重新查询积分
+                # 认证类失败是要人介入的状态（重新授权），必须留痕——
+                # 否则只能靠主动打开管理页才看得到「需重新授权」的红标。
+                if status in (401, 403):
+                    _logger.warning("账号 %s 上游认证被拒（HTTP %s），冷却 %d 分钟，可能需要重新授权",
+                                    aid, status, cooldown // 60)
+                else:
+                    _logger.info("账号 %s 触发上游限流（HTTP %s），冷却 %d 分钟",
+                                 aid, status, cooldown // 60)
             else:
+                if data.get("consecutive_fails"):
+                    _logger.info("账号 %s 请求恢复正常", aid)
                 data["consecutive_fails"] = 0
             self.dirty = True
 

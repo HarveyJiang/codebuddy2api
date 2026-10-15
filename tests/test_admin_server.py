@@ -46,7 +46,12 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get("/admin/api/overview", headers={"Authorization": "Bearer " + API})).status_code, 401)
         self.assertEqual((await self.client.get("/v1/models")).status_code, 401)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})).status_code, 200)
-        self.assertEqual((await self.client.get("/health")).json(), {"status": "ok"})
+        # /health 是深度检查：status 字段保留，另带账号可用性明细（加字段不改字段）。
+        health = (await self.client.get("/health")).json()
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["accounts"]["usable"], 1)
+        # 默认响应不含账号名，避免未鉴权端点泄露信息。
+        self.assertNotIn("detail", health["accounts"])
         await self.login()
         self.client.headers.pop("X-CSRF-Token")
         self.assertEqual((await self.client.post("/admin/api/keys", json={"name": "bad"})).status_code, 403)

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 import re
@@ -23,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
+from . import config, logging_setup
 from .browser_login import BrowserLogin
 from .db import UPSTREAM_GROUPS, Database
 from .pool import AccountPool, PoolMiddleware, ROUTING_POLICIES
@@ -320,6 +322,31 @@ class Store:
             result.append(row)
         return result
 
+    def health_detail(self):
+        """深度健康检查的判据来源。
+
+        「可用」= 启用 + 凭据文件存在且可解析 + 未被标 auth_invalid。
+        注意这里**不打上游接口**：health 必须廉价，不能每次调用都产生外部请求。
+        """
+        rows = self.account_rows()
+        by_id = {row["id"]: row for row in rows}
+        total = enabled = usable = 0
+        auth_invalid = 0
+        for aid, item in self.data["accounts"].items():
+            total += 1
+            if not item["enabled"]:
+                continue
+            enabled += 1
+            row = by_id.get(aid) or {}
+            status = (self.data["account_status"].get(aid) or {}).get("status")
+            if status == "auth_invalid":
+                auth_invalid += 1
+                continue
+            if row.get("status") == "ready":
+                usable += 1
+        return {"total": total, "enabled": enabled, "usable": usable,
+                "auth_invalid": auth_invalid, "rows": rows}
+
     def add_key(self, name, daily_limit=None, models=None, accounts=None, value=None):
         """创建客户端密钥。models/accounts 为空列表表示不限制（全部可用）。
 
@@ -470,9 +497,13 @@ def _stale_catalog(registry):
 
 
 def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=True):
-    store = Store(root or os.environ.get("MANAGEMENT_DATA_DIR", "/data/management"), auth_dir or os.environ.get("CODEBUDDY_AUTH_DIR", "/data/auth"), initial_key if initial_key is not None else os.environ.get("CODEBUDDY2OPENAI_KEY", ""), admin_key or os.environ.get("ADMIN_KEY", ""))
+    cfg = config.get()
+    store = Store(root or cfg.data_dir, auth_dir or cfg.auth_dir, initial_key if initial_key is not None else cfg.api_key, admin_key or cfg.admin_key)
     converter._check_auth = store.check_api
-    converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
+    # 以前这里把 log_path 硬覆盖成 None，导致设了 WORKBUDDY_LOG/CODEBUDDY2OPENAI_LOG
+    # 也不记日志。现在日志由 setup_logging 统一管，这里不再插手。
+    converter.CONFIG.update({"desensitize": cfg.desensitize, "no_compact": cfg.no_compact,
+                             "log_path": cfg.log_path})
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
     metrics = RequestMetrics()
@@ -562,8 +593,39 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         return RedirectResponse("/admin/", 302)
 
     @app.get("/health")
-    async def health():
-        return {"status": "ok"}
+    async def health(verbose: int = 0):
+        """深度健康检查：区分「进程活着」与「真的能服务」。
+
+        - ok：有可用账号且库可读
+        - degraded：库可读但一个可用账号都没有（凭据全失效/全暂停）
+        - down：状态无法判定（库坏了），HTTP 503
+
+        degraded **仍返回 200**：重启修不好凭据失效（要人重新授权），把它标成
+        unhealthy 会让容器进入重启循环，反而更难观察。只有进程已无法正常工作才用 503。
+        """
+        try:
+            detail = store.health_detail()
+        except Exception as exc:  # 库不可读等：进程已不能服务
+            logging.getLogger("admin.server").error("健康检查失败：%s", exc)
+            return JSONResponse({"status": "down", "checks": {"db": "error"}}, 503)
+
+        usable = detail["usable"]
+        status = "ok" if usable else "degraded"
+        body = {
+            "status": status,
+            "uptime_s": int(time.time() - store.started),
+            "accounts": {"total": detail["total"], "enabled": detail["enabled"],
+                         "usable": usable, "auth_invalid": detail["auth_invalid"]},
+            "checks": {"db": "ok", "accounts": status},
+        }
+        if verbose:
+            # 默认不返回账号名/uid，避免未鉴权端点泄露信息；排查时用 ?verbose=1。
+            body["accounts"]["detail"] = [
+                {"id": r["id"], "name": r["name"], "enabled": bool(r["enabled"]),
+                 "status": r.get("status"), "expired": bool(r.get("expired"))}
+                for r in detail["rows"]
+            ]
+        return body
 
     @app.get("/admin")
     async def redirect_admin():
@@ -1092,8 +1154,19 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             return output
 
     app.mount("/", converter.app)
+    logging.getLogger("admin.server").info(
+        "管理服务已启动：账号 %d 个（启用 %d）、密钥 %d 个、模型 %d 个",
+        len(store.data["accounts"]),
+        sum(1 for a in store.data["accounts"].values() if a["enabled"]),
+        len(store.data["keys"]), len(model_registry.snapshot_ids()),
+    )
     return app
 
 
 if __name__ == "__main__":
-    uvicorn.run(create_app(), host="0.0.0.0", port=8787, log_level="warning", proxy_headers=True, forwarded_allow_ips="*")
+    cfg = config.get()
+    logging_setup.setup_logging(cfg.log_level, cfg.log_path)
+    logging_setup.configure_uvicorn_access(False)
+    uvicorn.run(create_app(), host=cfg.host or "0.0.0.0", port=cfg.port,
+                log_level=logging_setup.uvicorn_level(),
+                proxy_headers=True, forwarded_allow_ips="*")

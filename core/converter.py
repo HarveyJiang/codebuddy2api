@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import threading
@@ -32,6 +33,8 @@ from pathlib import Path
 
 import httpx
 import uvicorn
+
+from admin import config, logging_setup
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -80,10 +83,13 @@ DEFAULT_DOMAIN = "www.codebuddy.cn"
 #   值写 WorkBuddy → 上游记录 client="WorkBuddy"（目标）
 # 其余头保持「已验证能出值」的组合（见 git 历史 FULL 实验）。
 # 桌面端真实 UA 形如 WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0。
-# 本网关支持 CLIENT_INFO_* 环境变量覆盖。
-_PRODUCT_NAME = os.environ.get("CLIENT_INFO_PRODUCT_NAME") or "WorkBuddy"
-_PRODUCT_VERSION = os.environ.get("CLIENT_INFO_PRODUCT_VERSION") or "5.8.2"
-_UA_EXTENSION = os.environ.get("CLIENT_INFO_USER_AGENT_EXTENSION") or "CLI/2.161.0"
+# 本网关支持 WORKBUDDY_PRODUCT_* 环境变量覆盖（旧名 CLIENT_INFO_* 仍兼容）。
+_PRODUCT_NAME = config.raw("WORKBUDDY_PRODUCT_NAME", "WorkBuddy")
+_PRODUCT_VERSION = config.raw("WORKBUDDY_PRODUCT_VERSION", "5.8.2")
+_UA_EXTENSION = config.raw("WORKBUDDY_UA_EXTENSION", "CLI/2.161.0")
+# 这两个开关是模块级常量（导入时求值），与其它配置一致的语义：改配置即重启。
+_RESPONSES_DESENSITIZE = config.raw("WORKBUDDY_DESENSITIZE", "0") == "1"
+_LOSSY_PROJECTION = config.raw("WORKBUDDY_LOSSY_PROJECTION", "0") == "1"
 # client 字段的取值来源（大写 WorkBuddy 为目标值）。
 IDE_TYPE = _PRODUCT_NAME
 USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
@@ -94,7 +100,7 @@ USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
 
 
 def auth_dirs() -> list[Path]:
-    env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
+    env_dir = config.raw("WORKBUDDY_AUTH_DIR")
     if env_dir:
         return [Path(env_dir)]
     home = Path.home()
@@ -465,23 +471,30 @@ CONFIG: dict = {
 
 
 # ---------------------------------------------------------------------------
-# 日志（写文件）
+# 日志
 # ---------------------------------------------------------------------------
 
-_LOG_LOCK = threading.Lock()
+_logger = logging.getLogger("core.converter")
 
 
 def _log(msg: str):
-    """写一行日志到 CONFIG['log_path'] 指定的文件（追加，带时间戳）。未设置则丢弃。"""
-    path = CONFIG.get("log_path")
-    if not path:
-        return
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
-    try:
-        with _LOG_LOCK, open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        pass  # 日志失败不应影响主流程
+    """记一条运行日志。
+
+    以前这里只在 ``CONFIG['log_path']`` 设了才写文件、否则整个丢弃——容器里不传
+    ``--log`` 就等于没有任何输出，排障时 ``docker logs`` 是空的。现在统一走 logging，
+    恒有 stderr 输出（由容器收集），``log_path`` 只决定是否**额外**落文件。
+
+    带完整请求/响应报文的调用用 ``_log_debug``，避免默认级别下把敏感内容刷到标准流。
+    """
+    _logger.info("%s", msg)
+
+
+def _log_debug(msg: str):
+    """DEBUG 级日志：完整 prompt/响应/上游原始 SSE。
+
+    默认级别（INFO）下不输出，需要时用 ``WORKBUDDY_LOG_LEVEL=DEBUG`` 打开。
+    """
+    _logger.debug("%s", msg)
 
 
 def _truncate(s: str, n: int = 80) -> str:
@@ -638,7 +651,7 @@ async def chat_completions(
         + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else "")
     )
     # 完整请求体（发往后端的实际内容；若启用脱敏，这里已是脱敏后）
-    _log(
+    _log_debug(
         f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}"
     )
 
@@ -873,7 +886,7 @@ async def _stream_upstream(
                     _log(
                         f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                     )
-                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
+                    _log_debug(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
@@ -894,7 +907,7 @@ async def _stream_upstream(
         + f" | tokens={usage.get('total_tokens', '?')}"
     )
     # 完整原始 SSE（后端返回的全部内容）
-    _log(
+    _log_debug(
         f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8', 'replace')}"
     )
 
@@ -971,7 +984,7 @@ async def _post_backend_with_filter_retry(
         and _looks_like_content_filter_text(text)
         and CONFIG.get("desensitize")
         and CONFIG.get("no_compact")
-        and os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1"
+        and _RESPONSES_DESENSITIZE
     ):
         retry_body = _chat_body_desensitize(body, force_compact=True)
         _log(
@@ -1033,14 +1046,14 @@ async def create_response(
 
     chat_body = filter_system_identity(chat_body)
     chat_body, projection_stats = project_responses_chat_body(
-        chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
+        chat_body, preserve=not _LOSSY_PROJECTION
     )
     chat_body.setdefault("model", "auto")
     chat_body["stream"] = True
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    if os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
+    if _RESPONSES_DESENSITIZE:
         chat_body = _chat_body_desensitize(chat_body)
 
     client_wants_stream = bool(payload.get("stream", False))
@@ -1155,7 +1168,7 @@ async def _stream_responses(
 
     elapsed = time.time() - t0 if t0 else 0
     _log(f"{prefix}◀ RESPONSES {model_name} | {elapsed:.1f}s | stream done")
-    _log(f"{prefix}── RESPONSES RAW SSE ──\n" + "\n".join(raw_sse_lines[-30:]))
+    _log_debug(f"{prefix}── RESPONSES RAW SSE ──\n" + "\n".join(raw_sse_lines[-30:]))
 
 
 # ---------------------------------------------------------------------------
@@ -1535,19 +1548,19 @@ def main():
     ap = argparse.ArgumentParser(
         description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
     )
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
+    cfg = config.get()
+    ap.add_argument("--host", default=cfg.host or "127.0.0.1")
+    ap.add_argument("--port", type=int, default=cfg.port)
     ap.add_argument(
         "--api-key",
-        default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
+        default=cfg.api_key,
         help="可选：要求客户端携带的 API key（默认不校验）",
     )
     ap.add_argument(
         "--log",
-        default=None,
+        default=cfg.log_path,
         metavar="PATH",
-        help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
-        "不传则不记日志。",
+        help="额外把日志写到该文件（如 --log converter.log）。不传则只输出到 stderr。",
     )
     ap.add_argument(
         "--desensitize",
@@ -1566,12 +1579,12 @@ def main():
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
-    CONFIG["desensitize"] = args.desensitize
-    CONFIG["no_compact"] = args.no_compact
-    # --log 直接指定文件路径即开启；不传则不记
-    CONFIG["log_path"] = (
-        args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
-    )
+    # 命令行开关是「或」的关系：配置开了就开，命令行也开就开，两者都没有才关。
+    CONFIG["desensitize"] = args.desensitize or cfg.desensitize
+    CONFIG["no_compact"] = args.no_compact or cfg.no_compact
+    CONFIG["log_path"] = args.log
+    # 日志最早初始化：之后的启动信息与请求日志才有出口。
+    logging_setup.setup_logging(cfg.log_level, args.log)
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 
@@ -1602,7 +1615,8 @@ def main():
     # 启动时写一条标记
     _log("==== converter 启动 ====")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port,
+                log_level=logging_setup.uvicorn_level())
 
 
 if __name__ == "__main__":
