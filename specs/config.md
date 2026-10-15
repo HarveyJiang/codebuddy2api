@@ -42,7 +42,7 @@
 
 ## 目标
 
-1. **单一读取入口**：新增 `admin/config.py`，所有配置项在这里定义、读取、校验。
+1. **单一读取入口**：新增 `core/runtime_config.py`，所有配置项在这里定义、读取、校验。
    其它模块不再直接 `os.environ.get`（平台变量 `LOCALAPPDATA`/`XDG_DATA_HOME` 除外）。
 2. **支持 `.env`**：启动时读 `.env`（不覆盖已存在的真实环境变量——环境变量优先级更高，
    这是 docker 场景的正确语义）。
@@ -59,7 +59,11 @@
 
 ## 设计
 
-### 一、`admin/config.py`
+### 一、`core/runtime_config.py`
+
+**放在 core 而不是 admin**：`deploy/standalone` 的 Dockerfile 只 `COPY core ./core`，
+独立转换器镜像必须能只用 core 起得来，所以 core 不能反向依赖 admin。`admin/config.py`
+保留为同名转发垫片，让既有的 `from admin import config` 导入继续可用。
 
 统一命名规范：`WORKBUDDY_*` 前缀（与项目对外名 `workbuddy2api` 一致）。
 

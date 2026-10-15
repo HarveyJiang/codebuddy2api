@@ -36,7 +36,7 @@
 
 ### 一、日志
 
-**单一入口**：新增 `admin/logging_setup.py`，暴露 `setup_logging(level, path=None)`，
+**单一入口**：新增 `core/runtime_logging.py`，暴露 `setup_logging(level, path=None)`，
 用标准库 `logging` 配置根 logger：
 
 - 格式：`2026-10-15 07:49:27 [INFO] admin.pool: 消息`（时间用北京时间，与项目其它处一致）。
@@ -113,3 +113,17 @@
 - `/health`：注入造好的账号状态，断言 `ok`/`degraded`/`down` 三态与 HTTP 码。
 - `/health` 不泄露：默认响应不含账号名。
 - 凭据不落日志：用一个含敏感串的凭据跑一次失败路径，断言日志内容里没有该串。
+
+## 实现后修正（评审发现）
+
+- **认证失效判据必须与账号池一致**。初版查的是 `status == "auth_invalid"` 字符串，
+  但生产代码标记认证失效用的是布尔字段 `auth_invalid`（`admin/pool.py:183`），
+  该字符串从不被写入。后果是单个账号认证失效时 `usable` 仍算 1、健康检查报 `ok`——
+  恰恰是最该被发现的故障反而不报。现与 `pool.py` 用完全相同的判据。
+- **`degraded` 用 200 已按现网核实**。`deploy/*/docker-compose.yml` 的 healthcheck
+  只看 HTTP 码，且 `restart: unless-stopped`——503 会触发重启循环，而重启修不好
+  凭据失效（要人重新授权）。决策成立。
+- **访问日志用 `uvicorn.run(..., access_log=False)` 关**，不是改 `uvicorn.access`
+  的 level：`uvicorn.run()` 内部会 `dictConfig` 把它重置回去。
+- 完整报文（请求体/响应体/原始 SSE/上游错误正文）一律走 `_log_debug`，默认
+  `INFO` 级不输出——初版只降级了流式路径，非流式路径的 5 处仍在 `INFO`。

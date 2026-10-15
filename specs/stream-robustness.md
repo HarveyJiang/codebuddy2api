@@ -102,3 +102,18 @@ async def _iter_with_idle_timeout(aiter, idle_seconds, on_timeout):
 - 正常流不变：收到 `[DONE]` 的流**不**补发错误事件。
 - 截断可观测：上游 `Content-Length` 承诺 100 字节但只发 50 就断，断言客户端收到错误事件。
 - 指标联动：截断场景下 `outcome != "success"`。
+
+## 实现后修正（评审发现）
+
+- **末帧无尾随换行会误报截断**。行缓冲解析只在「缓冲里有 `\n`」时切行，而上游
+  flush 边界、或连接正好在帧尾关闭时，最后一帧常常不带 `\n`，其中的
+  `finish_reason`/`[DONE]` 会被漏掉——用户明明收全了答案，却额外收到
+  `stream_truncated`，后台也记成失败请求。现在流结束时用 `_feed(b"", flush=True)`
+  解析残留行。对应测试 3 条：`finish_reason` 无换行、`[DONE]` 无换行、
+  确实无终止信号仍要报（防「修成永不报」）。
+- **超时上限的划分**：不给整个流设总超时（LLM 长响应合法），而是连接/写入设上限
+  （`connect=15` / `write=30`）、读保持 `None`，另由 `_iter_with_idle_timeout`
+  逐分片判空闲。已实测：超时后会正确关闭上游生成器与 httpx 客户端，无连接泄漏。
+- **`completed` 不能看 `message_stop`**：`AnthropicStreamConverter.finish()` 无论
+  上游是否正常收尾都会补发 `message_stop`（保证客户端循环能退出），所以新增
+  `completed` 属性，以 `finish_reason` / `[DONE]` 为准。
