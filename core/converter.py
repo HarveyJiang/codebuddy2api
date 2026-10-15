@@ -22,15 +22,20 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
 import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
 import uvicorn
+
+from . import runtime_config as config, runtime_logging as logging_setup
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -77,7 +82,26 @@ from .system_identity import filter_system_identity
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
+# 与官方 CLI 一致（admin/models.py 同值）：上游按 UA 识别客户端，
+# 自定 UA 会导致用量接口 client 为空。
+# ── 调用方身份（决定上游用量接口的 client 字段）────────────────────────────
+# 上游用量接口的 client 字段直接取自请求头 X-IDE-Type / X-IDE-Name 的值：
+#   值写 workbuddy → 上游记录 client="workbuddy"
+#   值写 WorkBuddy → 上游记录 client="WorkBuddy"（目标）
+# 其余头保持「已验证能出值」的组合（见 git 历史 FULL 实验）。
+# 桌面端真实 UA 形如 WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0。
+# 本网关支持 WORKBUDDY_PRODUCT_* 环境变量覆盖（旧名 CLIENT_INFO_* 仍兼容）。
+_PRODUCT_NAME = config.raw("WORKBUDDY_PRODUCT_NAME", "WorkBuddy")
+_PRODUCT_VERSION = config.raw("WORKBUDDY_PRODUCT_VERSION", "5.8.2")
+_UA_EXTENSION = config.raw("WORKBUDDY_UA_EXTENSION", "CLI/2.161.0")
+# 这两个开关是模块级常量（导入时求值），与其它配置一致的语义：改配置即重启。
+# 必须走 config.get() 的布尔解析（认 1/true/yes/on），不要自己写 `== "1"`——
+# 两套解析器会让 WORKBUDDY_DESENSITIZE=true 只影响 chat 路径、Responses 路径静默失效。
+_RESPONSES_DESENSITIZE = config.get().desensitize
+_LOSSY_PROJECTION = config.get().lossy_projection
+# client 字段的取值来源（大写 WorkBuddy 为目标值）。
+IDE_TYPE = _PRODUCT_NAME
+USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -85,7 +109,7 @@ USER_AGENT = "codebuddy2openai/2.0"
 
 
 def auth_dirs() -> list[Path]:
-    env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
+    env_dir = config.raw("WORKBUDDY_AUTH_DIR")
     if env_dir:
         return [Path(env_dir)]
     home = Path.home()
@@ -222,6 +246,12 @@ class CredentialManager:
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
+            "X-IDE-Type": IDE_TYPE,
+            "X-IDE-Name": IDE_TYPE,
+            "X-IDE-Version": _PRODUCT_VERSION,
+            "X-Product": "SaaS",
+            "X-Product-Version": _PRODUCT_VERSION,
+            "X-Request-ID": uuid.uuid4().hex,
             "User-Agent": USER_AGENT,
         }
         return h
@@ -453,23 +483,30 @@ CONFIG: dict = {
 
 
 # ---------------------------------------------------------------------------
-# 日志（写文件）
+# 日志
 # ---------------------------------------------------------------------------
 
-_LOG_LOCK = threading.Lock()
+_logger = logging.getLogger("core.converter")
 
 
 def _log(msg: str):
-    """写一行日志到 CONFIG['log_path'] 指定的文件（追加，带时间戳）。未设置则丢弃。"""
-    path = CONFIG.get("log_path")
-    if not path:
-        return
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
-    try:
-        with _LOG_LOCK, open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        pass  # 日志失败不应影响主流程
+    """记一条运行日志。
+
+    以前这里只在 ``CONFIG['log_path']`` 设了才写文件、否则整个丢弃——容器里不传
+    ``--log`` 就等于没有任何输出，排障时 ``docker logs`` 是空的。现在统一走 logging，
+    恒有 stderr 输出（由容器收集），``log_path`` 只决定是否**额外**落文件。
+
+    带完整请求/响应报文的调用用 ``_log_debug``，避免默认级别下把敏感内容刷到标准流。
+    """
+    _logger.info("%s", msg)
+
+
+def _log_debug(msg: str):
+    """DEBUG 级日志：完整 prompt/响应/上游原始 SSE。
+
+    默认级别（INFO）下不输出，需要时用 ``WORKBUDDY_LOG_LEVEL=DEBUG`` 打开。
+    """
+    _logger.debug("%s", msg)
 
 
 def _truncate(s: str, n: int = 80) -> str:
@@ -660,7 +697,7 @@ async def chat_completions(
         + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else "")
     )
     # 完整请求体（发往后端的实际内容；若启用脱敏，这里已是脱敏后）
-    _log(
+    _log_debug(
         f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}"
     )
 
@@ -684,7 +721,7 @@ async def chat_completions(
         _log(
             f"[{rid}] ✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
         )
-        _log(f"[{rid}] ── ERROR BODY ──\n{e.body.decode('utf-8', 'replace')}")
+        _log_debug(f"[{rid}] ── ERROR BODY ──\n{e.body.decode('utf-8', 'replace')}")
         raise HTTPException(
             status_code=e.status,
             detail=_safe_err_raw(e.body, e.status),
@@ -726,8 +763,8 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
         + (f" | tool_calls={tc_names}" if tc_names else "")
         + f" | tokens={usage.get('total_tokens', '?')}"
     )
-    # 完整响应体
-    _log(
+    # 完整响应体（含模型回答全文，只在 DEBUG 级输出）
+    _log_debug(
         f"{prefix}── RESPONSE BODY ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
     )
 
@@ -888,14 +925,23 @@ async def _stream_upstream(
     tool_names: list[str] = []
     usage: dict = {}
     saw_filter = False
+    saw_done = False  # 是否观察到 [DONE]：判「正常结束」还是「被截断」的依据
     buf = b""
     raw_parts: list[bytes] = []  # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
 
-    def _feed(chunk: bytes):
-        nonlocal finish_reason, saw_filter, buf
+    def _feed(chunk: bytes, flush: bool = False):
+        """解析累计数据里的完整 data: 行。
+
+        flush=True 表示这是流的最后一帧：把残留的不完整行也当作一行处理。
+        上游的最后一帧（finish_reason / [DONE]）不一定带尾随换行——连接正好在
+        帧尾关闭时很常见——不 flush 就会漏掉终止信号，把正常结束误判成截断。
+        """
+        nonlocal finish_reason, saw_filter, saw_done, buf
         # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
         buf += chunk
+        if flush:
+            buf += b"\n"
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             line = line.strip()
@@ -903,6 +949,7 @@ async def _stream_upstream(
                 continue
             data = line[5:].strip()
             if data == b"[DONE]":
+                saw_done = True
                 continue
             try:
                 obj = json.loads(data)
@@ -930,7 +977,13 @@ async def _stream_upstream(
                 saw_filter = True
 
     try:
-        async for chunk in backend.astream(headers, body, timeout=None):
+        # 空闲超时包在 backend.astream 外层：约束的是分片间隔而非总时长，
+        # 长推理/长输出的正常流不受影响；上游卡死时 wait_for 取消本次读取，
+        # 由下面的 except 补发截断事件。
+        async for chunk in _iter_with_idle_timeout(
+            backend.astream(headers, body, timeout=None),
+            config.get().stream_idle_timeout, model_name
+        ):
             if chunk:
                 raw_parts.append(chunk)
                 _feed(chunk)
@@ -946,9 +999,26 @@ async def _stream_upstream(
         _log(
             f"{prefix}✗ HTTP {e.status} | {model_name} | {_truncate(e.body.decode('utf-8', 'replace'), 200)}"
         )
-        _log(f"{prefix}── ERROR BODY ──\n{e.body.decode('utf-8', 'replace')}")
+        _log_debug(f"{prefix}── ERROR BODY ──\n{e.body.decode('utf-8', 'replace')}")
         yield _err_event(e.body, e.status)
         return
+    except (TimeoutError, asyncio.TimeoutError):
+        # 空闲超时：客户端拿到明确错误，而不是一条永久挂起的连接。
+        _log(f"{prefix}✗ 流空闲超时 | {model_name} | 上游 {config.get().stream_idle_timeout}s 无数据")
+        yield _truncated_event(
+            f"上游 {config.get().stream_idle_timeout} 秒无数据，连接已中止"
+        )
+        return
+
+    # 收尾：把缓冲区里残留的不完整行（无尾随换行）也解析掉，否则会漏掉
+    # 最后一帧里的 finish_reason / [DONE]，把正常结束误判成截断。
+    _feed(b"", flush=True)
+
+    # 上游在没有终止信号的情况下关闭：补一个明确事件，避免客户端把截断当正常结束。
+    # finish_reason 与 [DONE] 任一出现都算正常收尾——不同上游的终止信号不完全一致。
+    if finish_reason is None and not saw_done:
+        _log(f"{prefix}✗ 流被截断 | {model_name} | 未观察到终止事件")
+        yield _truncated_event("上游连接在完成前关闭，响应可能不完整")
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
@@ -959,7 +1029,7 @@ async def _stream_upstream(
         + f" | tokens={usage.get('total_tokens', '?')}"
     )
     # 完整原始 SSE（后端返回的全部内容）
-    _log(
+    _log_debug(
         f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8', 'replace')}"
     )
 
@@ -989,6 +1059,35 @@ def _err_event(msg: bytes, status: int) -> bytes:
         },
     }
     return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+
+
+def _truncated_event(reason: str) -> bytes:
+    """流被截断时补发的 OpenAI SSE 错误 chunk。
+
+    与 _err_event 分开：类型是 stream_truncated，客户端可据此区分「上游报错」
+    与「流中途断了」，而不必把截断当成正常结束。
+    """
+    chunk = {"error": {"message": reason[:500], "type": "stream_truncated"}}
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+
+
+async def _iter_with_idle_timeout(aiter, idle_seconds, label=""):
+    """逐个 yield 上游分片；相邻两个分片间隔超过 idle_seconds 就抛 TimeoutError。
+
+    约束的是**间隔**而不是总时长：用 asyncio.wait_for 包每一次 __anext__，
+    计时随每个分片重置，因此长推理、长输出的正常流不会被掐断。
+    上游卡死不关连接（TCP 还在但不发数据）时才会触发——那种情况下若用
+    timeout=None，请求会永远挂着，一直占着账号的 in-flight 名额。
+    """
+    iterator = aiter.__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=idle_seconds)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"上游 {idle_seconds} 秒无数据{('（' + label + '）') if label else ''}") from None
+        yield chunk
 
 
 def _looks_like_content_filter_text(text: str) -> bool:
@@ -1043,13 +1142,13 @@ async def _post_backend_with_filter_retry(
         and _looks_like_content_filter_text(text)
         and CONFIG.get("desensitize")
         and CONFIG.get("no_compact")
-        and os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1"
+        and _RESPONSES_DESENSITIZE
     ):
         retry_body = _chat_body_desensitize(body, force_compact=True)
         _log(
             f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
         )
-        _log(
+        _log_debug(
             f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
         )
         retry_status, retry_raw = await _post_backend_once(backend, headers, retry_body)
@@ -1109,7 +1208,7 @@ async def create_response(
     if backend.tencent_policies:
         chat_body = filter_system_identity(chat_body)
         chat_body, projection_stats = project_responses_chat_body(
-            chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
+            chat_body, preserve=not _LOSSY_PROJECTION
         )
     else:
         # Trae：跳过腾讯投影（上游是私有协议），日志用 passthrough 占位
@@ -1120,7 +1219,7 @@ async def create_response(
     if backend.tencent_policies and "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    if backend.tencent_policies and os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
+    if backend.tencent_policies and _RESPONSES_DESENSITIZE:
         chat_body = _chat_body_desensitize(chat_body)
 
     client_wants_stream = bool(payload.get("stream", False))
@@ -1140,7 +1239,7 @@ async def create_response(
         f"| dropped_harness={projection_stats.get('dropped_harness_messages', 0)} "
         f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
     )
-    _log(
+    _log_debug(
         f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
@@ -1178,7 +1277,7 @@ async def create_response(
         response_status = int(code) if str(code).isdigit() and 400 <= int(code) <= 599 else 502
     elapsed = time.time() - t0
     _log(f"[{rid}] ◀ RESPONSES {model_name} | {elapsed:.1f}s")
-    _log(
+    _log_debug(
         f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
     )
     return JSONResponse(content=result, status_code=response_status)
@@ -1225,7 +1324,7 @@ async def _stream_responses(
 
     elapsed = time.time() - t0 if t0 else 0
     _log(f"{prefix}◀ RESPONSES {model_name} | {elapsed:.1f}s | stream done")
-    _log(f"{prefix}── RESPONSES RAW SSE ──\n" + "\n".join(raw_sse_lines[-30:]))
+    _log_debug(f"{prefix}── RESPONSES RAW SSE ──\n" + "\n".join(raw_sse_lines[-30:]))
 
 
 # ---------------------------------------------------------------------------
@@ -1314,7 +1413,7 @@ async def create_message(
     _log(
         f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)} | user_stream={user_stream}"
     )
-    _log(
+    _log_debug(
         f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
@@ -1388,7 +1487,10 @@ async def _stream_anthropic(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async for line in _aiter_sse_lines(backend.astream(headers, body, timeout=None)):
+        async for line in _iter_with_idle_timeout(
+            _aiter_sse_lines(backend.astream(headers, body, timeout=None)),
+            config.get().stream_idle_timeout, model_name
+        ):
             events = converter.feed_line(line)
             if events:
                 yield events.encode("utf-8")
@@ -1408,6 +1510,27 @@ async def _stream_anthropic(
         }
         yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
         return
+    except (TimeoutError, asyncio.TimeoutError):
+        _log(f"{prefix}✗ 流空闲超时 | {model_name} | 上游 {config.get().stream_idle_timeout}s 无数据")
+        error_evt = {
+            "type": "error",
+            "error": {
+                "message": f"上游 {config.get().stream_idle_timeout} 秒无数据，连接已中止",
+                "type": "api_error",
+            },
+        }
+        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+        return
+
+    # 上游未发出终止信号就结束：补一个 error 事件，客户端才不会把截断当正常结束。
+    if not converter.completed:
+        _log(f"{prefix}✗ 流被截断 | {model_name} | 未观察到终止事件")
+        error_evt = {
+            "type": "error",
+            "error": {"message": "上游连接在完成前关闭，响应可能不完整",
+                      "type": "api_error"},
+        }
+        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
 
     finish_events = converter.finish()
     if finish_events:
@@ -1587,19 +1710,19 @@ def main():
     ap = argparse.ArgumentParser(
         description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
     )
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
+    cfg = config.get()
+    ap.add_argument("--host", default=cfg.host or "127.0.0.1")
+    ap.add_argument("--port", type=int, default=cfg.port)
     ap.add_argument(
         "--api-key",
-        default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
+        default=cfg.api_key,
         help="可选：要求客户端携带的 API key（默认不校验）",
     )
     ap.add_argument(
         "--log",
-        default=None,
+        default=cfg.log_path,
         metavar="PATH",
-        help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
-        "不传则不记日志。",
+        help="额外把日志写到该文件（如 --log converter.log）。不传则只输出到 stderr。",
     )
     ap.add_argument(
         "--desensitize",
@@ -1618,12 +1741,18 @@ def main():
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
-    CONFIG["desensitize"] = args.desensitize
-    CONFIG["no_compact"] = args.no_compact
-    # --log 直接指定文件路径即开启；不传则不记
-    CONFIG["log_path"] = (
-        args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
-    )
+    # 命令行开关是「或」的关系：配置开了就开，命令行也开就开，两者都没有才关。
+    CONFIG["desensitize"] = args.desensitize or cfg.desensitize
+    CONFIG["no_compact"] = args.no_compact or cfg.no_compact
+    CONFIG["log_path"] = args.log
+    # 日志最早初始化：之后的启动信息与请求日志才有出口。
+    logging_setup.setup_logging(cfg.log_level, args.log)
+    _legacy = config.legacy_used()
+    if _legacy:
+        logging.getLogger("core.converter").info(
+            "以下配置使用旧名，仍生效，建议改为规范名：%s",
+            "、".join(f"{old}→{new}" for old, new in _legacy),
+        )
     af = find_auth_file()
     CONFIG["cred"] = make_credential(af) if af else None
 
@@ -1654,7 +1783,8 @@ def main():
     # 启动时写一条标记
     _log("==== converter 启动 ====")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port,
+                log_level=logging_setup.uvicorn_level(), access_log=False)
 
 
 if __name__ == "__main__":

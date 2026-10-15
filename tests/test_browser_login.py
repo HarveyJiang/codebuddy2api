@@ -92,14 +92,15 @@ class BrowserAccountTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = admin_tests.AdminTests.asyncTearDown
     make_app = admin_tests.AdminTests.make_app
     login = admin_tests.AdminTests.login
-    async def test_browser_account_deduplicates_and_updates(self):
+    async def test_browser_account_deduplicates(self):
         store = self.app.state.store
+        before = len(store.data['accounts'])
         r = store.save_browser_account(credential('two'), 'Browser account')
         self.assertFalse(r['updated'])
         r2 = store.save_browser_account(credential('two', 'Updated'), None)
         self.assertTrue(r2['updated'])
         self.assertEqual(r['account_id'], r2['account_id'])
-        self.assertEqual(len(store.data['accounts']), 2)
+        self.assertEqual(len(store.data['accounts']), before + 1)
 
     async def test_oauth_routes_enforce_session_and_csrf(self):
         self.assertEqual((await self.client.post('/admin/api/oauth/start', json={})).status_code, 401)

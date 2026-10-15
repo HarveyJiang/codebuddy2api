@@ -89,7 +89,7 @@ class ModelRegistryTests(unittest.TestCase):
             client_cls.return_value.__enter__.return_value.get.return_value = response
             self.assertTrue(registry.fetch())
             # 未登录时上游只返回空壳，必须带账号凭据（Authorization）请求；
-            # 账号凭据里的 codebuddy2openai UA 必须让位，否则上游 400 check ua。
+            # 账号凭据里的 UA 必须让位给 CLI UA，否则上游 400 check ua。
             sent = client_cls.return_value.__enter__.return_value.get.call_args.kwargs["headers"]
             self.assertEqual(sent.get("Authorization"), "Bearer token")
             self.assertEqual(sent.get("User-Agent"), USER_AGENT)
@@ -188,6 +188,52 @@ class ModelRegistryTests(unittest.TestCase):
         registry.ensure_builtin()
         self.assertEqual(registry.enabled_models(), BUILTIN_ORDER)
 
+    def test_custom_model_persists_across_restart(self):
+        """手动添加的模型要落库、重启后仍在。
+
+        available=0 时若只按 available=1 加载，重启后用户保存的模型会消失——
+        这正是 load_models 需要 include_custom 的原因。
+        """
+        import tempfile
+        from admin.db import Database
+        root = tempfile.mkdtemp()
+        path = Path(root) / "state.db"
+        db = Database(path)
+        registry = ModelRegistry(get_credential=lambda: None)
+        registry.ensure_builtin()
+        registry.add("ghost-model", name="幽灵", credits=0.25, max_input_tokens=64000)
+        registry.persist(db)
+        row = db.query("SELECT source, available, enabled FROM models WHERE model_id='ghost-model'")[0]
+        self.assertEqual((row["source"], row["available"], row["enabled"]), ("custom", 1, 1))
+        db.close()
+
+        # 模拟重启：新连接 + 新 registry。
+        db2 = Database(path)
+        restored = ModelRegistry(get_credential=lambda: None)
+        restored.load(db2)
+        self.assertTrue(restored.is_custom("ghost-model"))
+        self.assertIn("ghost-model", restored.enabled_models())
+        self.assertIn("ghost-model", restored.snapshot_ids())
+        entry = next(m for m in restored.snapshot()["models"] if m["id"] == "ghost-model")
+        self.assertEqual(entry["name"], "幽灵")
+        self.assertEqual(entry["credits"], 0.25)
+        self.assertTrue(entry["custom"])
+        db2.close()
+
+    def test_custom_model_loads_when_available_zero(self):
+        """上游没返回（available=0）的自定义行也必须被加载进来。"""
+        import tempfile
+        from admin.db import Database
+        root = tempfile.mkdtemp()
+        path = Path(root) / "state.db"
+        db = Database(path)
+        db.save_models({"ghost-model": {"name": "幽灵", "source": "custom",
+                                        "available": 0, "enabled": 1}})
+        registry = ModelRegistry(get_credential=lambda: None)
+        registry.load(db)
+        self.assertIn("ghost-model", registry.enabled_models())
+        db.close()
+
     def test_disable_and_persist_state(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         response = unittest.mock.Mock(status_code=200)
@@ -195,13 +241,19 @@ class ModelRegistryTests(unittest.TestCase):
         with patch("admin.models.httpx.Client") as client_cls:
             client_cls.return_value.__enter__.return_value.get.return_value = response
             registry.fetch()
-        state = registry.set_enabled("step-5-preview", False)
+        registry.set_enabled("step-5-preview", False)
         self.assertEqual(registry.enabled_models(),
                          ["glm-5.2", "space-bunny", "fast-model", "balanced-model", "deep-model"])
         self.assertIn("step-5-preview", registry.snapshot_ids())
-        # 重新导入状态后禁用保留。
+        # 落库后由新实例读回，禁用状态保留（走真实的持久化路径）。
+        import tempfile
+        from admin.db import Database
+        root = tempfile.mkdtemp()
+        db = Database(Path(root) / "state.db")
+        registry.persist(db)
         restored = ModelRegistry(get_credential=lambda: FakeManager())
-        restored.import_state(json.loads(json.dumps(state)))
+        restored.load(db)
+        db.close()
         self.assertEqual(restored.enabled_models(),
                          ["glm-5.2", "space-bunny", "fast-model", "balanced-model", "deep-model"])
         # 再拉取时禁用跟随仍存在的模型。
@@ -210,6 +262,107 @@ class ModelRegistryTests(unittest.TestCase):
             restored.fetch()
         self.assertEqual(restored.enabled_models(),
                          ["glm-5.2", "space-bunny", "fast-model", "balanced-model", "deep-model"])
+
+    def test_custom_model_survives_fetch(self):
+        """手动添加的模型必须活过每次自动拉取（启动 + 每 6 小时）。
+
+        fetch() 原来是整体替换 _catalog/_available，用户加的模型会被直接冲掉——
+        这是本功能最容易写错的地方，所以单独钉一条。
+        """
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = upstream_payload()
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+            registry.add("ghost-model", name="幽灵模型", credits=0.25,
+                         max_input_tokens=64000, description="上游菜单没列出")
+            self.assertEqual(registry.snapshot_ids() & {"ghost-model"}, {"ghost-model"})
+            # 再拉一次：上游仍然不返回它，但它必须还在。
+            registry.fetch()
+        self.assertIn("ghost-model", registry.snapshot_ids())
+        entry = next(m for m in registry.snapshot()["models"] if m["id"] == "ghost-model")
+        self.assertTrue(entry["custom"])
+        self.assertEqual(entry["source"], "custom")
+        self.assertEqual(entry["name"], "幽灵模型")
+        self.assertEqual(entry["credits"], 0.25)
+        self.assertTrue(entry["enabled"])
+        # _available 里自定义项追加在末尾，不打乱上游按单价排好的顺序
+        # （snapshot() 展示时会再按单价重排，所以这里查内部顺序）。
+        self.assertEqual(registry._available[-1], "ghost-model")
+
+    def test_custom_model_kept_when_upstream_later_lists_it(self):
+        """上游后来也返回了同一 id：元数据以上游为准，但来源仍是自定义。
+
+        否则下一次拉取时 _custom 就断了，用户保存的项会「变成上游的」而被冲掉。
+        """
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        # 一个上游目录与内置列表里都没有的 id：必须走「新建为自定义」分支。
+        registry.add("ghost-model", name="我自己起的名字", credits=9.9)
+        self.assertTrue(registry.is_custom("ghost-model"))
+        response = unittest.mock.Mock(status_code=200)
+        payload = upstream_payload()
+        payload["models"] = [{"id": "ghost-model", "name": "上游的名字",
+                              "credits": "x0.79", "maxInputTokens": 1000000}]
+        payload["agents"][0]["models"] = ["ghost-model"]
+        response.json.return_value = payload
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+        entry = next(m for m in registry.snapshot()["models"] if m["id"] == "ghost-model")
+        self.assertTrue(entry["custom"])
+        self.assertEqual(entry["source"], "custom")
+        # 上游的元数据生效（以上游为准），而不是用户填的。
+        self.assertEqual(entry["name"], "上游的名字")
+        self.assertEqual(entry["credits"], 0.79)
+        self.assertEqual(entry["max_input_tokens"], 1000000)
+
+    def test_add_existing_upstream_model_stays_upstream(self):
+        """给上游已有的模型改名字不会把它变成自定义，否则它就不跟着上游刷新了。"""
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        self.assertEqual(registry.add("hy3", name="新名字"), "builtin")
+        self.assertFalse(registry.is_custom("hy3"))
+        self.assertEqual(registry.info("hy3")["name"], "新名字")
+        self.assertIn("hy3", registry.snapshot_ids())
+
+    def test_remove_only_allows_custom(self):
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        registry.add("mine", name="我的模型")
+        registry.remove("mine")
+        self.assertNotIn("mine", registry.snapshot_ids())
+        self.assertFalse(registry.is_custom("mine"))
+        # 上游/内置模型只能禁用，不能删。
+        with self.assertRaises(ValueError):
+            registry.remove("hy3")
+        with self.assertRaises(KeyError):
+            registry.remove("never-existed")
+
+    def test_removed_custom_model_does_not_come_back_on_fetch(self):
+        """删除必须同时清掉 _custom，否则下一次合并又把它加回来。"""
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = upstream_payload()
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+            registry.add("temp-model", name="临时")
+            registry.remove("temp-model")
+            registry.fetch()
+        self.assertNotIn("temp-model", registry.snapshot_ids())
+
+    def test_custom_model_available_even_when_upstream_absent(self):
+        """自定义模型 enable 即可调用，不看 available —— 上游没返回它就是它的定义。"""
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        registry.add("hidden-one", name="隐藏模型")
+        self.assertIn("hidden-one", registry.enabled_models())
+        registry.set_enabled("hidden-one", False)
+        self.assertNotIn("hidden-one", registry.enabled_models())
+        # 但仍是「已知」：PoolMiddleware 靠这个把它判成「已禁用」而不是「未知」。
+        self.assertIn("hidden-one", registry.snapshot_ids())
 
     def test_set_enabled_unknown_model_raises(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())

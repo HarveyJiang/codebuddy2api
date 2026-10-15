@@ -562,8 +562,8 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     async def test_pool_select_filters_backend(self):
         pool = self.app.state.pool
-        aid_trae, _ = pool.select("k1", "trae")
-        aid_wb, _ = pool.select("k1", "workbuddy")
+        aid_trae, _ = pool.select("k1", backend="trae")
+        aid_wb, _ = pool.select("k1", backend="workbuddy")
         assert self.app.state.store.data["accounts"][aid_trae]["backend"] == "trae"
         assert self.app.state.store.data["accounts"][aid_wb]["backend"] == "workbuddy"
 
@@ -614,9 +614,9 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_api_test_routes_trae_via_pool(self):
         """回归：/admin/api/test 内部调用须走账号池，按模型后端选账号。
-        管理部署下不再有"当前账号"（CONFIG["cred"]=None）；即便残留一个
-        workbuddy 固定凭据（旧 active 机制的触发条件），测 trae 模型仍应由池
-        选中 trae 账号成功返回，而非被后端一致性闸门挡成 503。"""
+        管理部署下 CONFIG["cred"] 仅指向「任一启用账号」用于可用性判断，
+        不再代表"当前账号"；即便它指向一个 workbuddy 固定凭据（旧 active 机制的
+        触发条件），测 trae 模型仍应由池选中 trae 账号成功返回，而非被后端一致性闸门挡成 503。"""
         from core.backends import trae as T
         from core.backends.registry import make_credential
         await self.client.post("/admin/api/login", json={"key": ADMIN})
@@ -625,7 +625,6 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         # 复现旧 bug 触发条件：固定凭据指向 workbuddy，与 trae 后端不匹配。
         stale = make_credential(self.auth / "wb.info")
         orig_cred = self.admin_server.converter.CONFIG["cred"]
-        assert orig_cred is None
         self.admin_server.converter.CONFIG["cred"] = stale
         try:
             # 直接 mock TraeBackend.astream 产出标准 SOLO SSE，避开真实上游与 httpx patch 冲突。
@@ -1645,12 +1644,18 @@ def test_registry_trae_builtin_seed_and_disable():
     trae_rows = [m for m in snap if m.get("backend") == "trae"]
     assert len(trae_rows) == 20 and all(m["enabled"] for m in trae_rows)
     # 禁用 trae/glm-5.2
-    state = reg.set_enabled("trae/glm-5.2", False)
+    reg.set_enabled("trae/glm-5.2", False)
     assert "trae/glm-5.2" not in reg.enabled_models()
     assert "trae/glm-5.2" in reg.snapshot_ids()  # 仍「已知」→ 中间件报禁用而非未知
-    # 导出/导入往返保留禁用态
+    # 落库 / 重启加载往返保留禁用态
+    import tempfile
+    from pathlib import Path
+    from admin.db import Database
+    db = Database(Path(tempfile.mkdtemp()) / "state.db")
+    reg.persist(db)
     reg2 = _registry()
-    reg2.import_state(state)
+    reg2.load(db)
+    db.close()
     assert "trae/glm-5.2" not in reg2.enabled_models()
     # 未知 trae 模型 → KeyError
     with pytest.raises(KeyError):

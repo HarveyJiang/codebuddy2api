@@ -1,10 +1,15 @@
-"""Bounded process-lifetime counters; never store prompts, responses or keys."""
+"""Bounded process-lifetime counters; never store prompts, responses or keys.
+
+计数与内存 recent 仍是进程级的；request_logs 的落库在 MetricsMiddleware（单一观察点）
+组装成一行后交给 Store 的批量缓冲，由 5 秒防抖统一写库。
+"""
 import json
 import threading
 import time
-from collections import deque
 
-PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages"}
+from admin.pool import REQUEST_LOG_CONTEXT
+
+PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}
 
 
 class RequestMetrics:
@@ -14,7 +19,6 @@ class RequestMetrics:
         self.in_flight = self.total = self.success = self.http_success = 0
         self.duration_sum = 0
         self.api_count = self.test_count = 0
-        self.recent = deque(maxlen=100)
 
     def begin(self):
         with self.lock:
@@ -29,8 +33,6 @@ class RequestMetrics:
             self.duration_sum += duration
             self.api_count += int(source == "api")
             self.test_count += int(source == "test")
-            self.recent.appendleft({"time": int(time.time()), "path": path, "source": source,
-                                    "status": status, "ok": ok, "duration_ms": round(duration), "outcome": outcome})
 
     def snapshot(self):
         with self.lock:
@@ -39,12 +41,12 @@ class RequestMetrics:
                     "success_rate": round(100*self.success/self.total, 1) if self.total else None,
                     "http_success_rate": round(100*self.http_success/self.total, 1) if self.total else None,
                     "avg_duration_ms": round(self.duration_sum/self.total) if self.total else None,
-                    "api_count": self.api_count, "test_count": self.test_count, "recent": list(self.recent)}
+                    "api_count": self.api_count, "test_count": self.test_count}
 
 
 class MetricsMiddleware:
-    def __init__(self, app, metrics, source="api"):
-        self.app, self.metrics, self.source = app, metrics, source
+    def __init__(self, app, metrics, source="api", store=None):
+        self.app, self.metrics, self.source, self.store = app, metrics, source, store
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path")
@@ -125,4 +127,25 @@ class MetricsMiddleware:
             http_ok = status is not None and 200 <= status < 300
             ok = http_ok and completed and not disconnected and not failed and (not streaming or terminal)
             outcome = "success" if ok else "stream_error" if failed and streaming else "interrupted" if not completed or disconnected or (streaming and not terminal) else "http_error"
-            self.metrics.finish(path, self.source, status, ok, (time.monotonic()-start)*1000, outcome)
+            duration = (time.monotonic() - start) * 1000
+            self.metrics.finish(path, self.source, status, ok, duration, outcome)
+            if self.store is not None:
+                self._record_request_log(scope, path, status, outcome, duration)
+
+    def _record_request_log(self, scope, path, status, outcome, duration):
+        """一行日志只在这里写。
+
+        PoolMiddleware（内层）把 key/account/model 与 SSE 内的 error.code 挂在 scope 上；
+        生效状态码在此统一：HTTP 非 2xx 用 HTTP 码，SSE 内带的 401/402/403/429 优先，
+        两者都没有时（正常 2xx）仍落 HTTP 状态码，避免成功请求在库里 status 为 NULL。
+        落库走 Store 的批量缓冲，不每请求写一次库。
+        """
+        context = scope.get(REQUEST_LOG_CONTEXT) or {}
+        effective = context.get("error_code") or status
+        self.store.queue_request_log({
+            "time": int(time.time()), "source": self.source, "path": path,
+            "status": effective, "outcome": outcome, "duration_ms": round(duration),
+            "key_id": context.get("key_id"), "account_id": context.get("account_id"),
+            "account_name": context.get("account_name"), "model_id": context.get("model_id"),
+            "model_name": context.get("model_name"), "upstream_request_id": None,
+        })

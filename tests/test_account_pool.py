@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import tempfile
 import time
@@ -12,6 +13,7 @@ import httpx
 from fastapi import HTTPException
 
 from core import converter
+from admin.db import Database
 from admin.server import Store
 from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity, CN
 try:
@@ -30,10 +32,10 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.now = 1800000000
         self.checked = False
         self.checkin_posts = 0
-        self.fail = False
+        self.fail_mode = False
         self.pages = []
         def respond(req):
-            if self.fail:
+            if self.fail_mode:
                 return httpx.Response(500)
             if req.url.path.endswith('checkin-activity-status'):
                 return httpx.Response(200,json={'code':0,'data':{'active':True,'today_checked_in':self.checked}})
@@ -195,7 +197,8 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             return {'id': aid, 'ok': True}
         self.pool.operate = fake_operate
         self.store.data['pool']['auto_checkin'] = False
-        self.store.data['pool']['sync_window'] = ['10:00', '20:00']
+        self.store.data['pool']['sync_start'] = '10:00'
+        self.store.data['pool']['sync_end'] = '20:00'
         for aid, slot in ((self.a, '10:30'), (self.b, '15:00')):
             self.store.data['account_status'].setdefault(aid, {}).update(
                 refresh_slot=slot, refresh_slot_date='2026-10-14')
@@ -252,7 +255,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError): summarize_packages([{}])
         self.assertEqual(self.pool.state(self.store.account_rows()[0]),'available')
 
-    def test_round_robin_paused_cooling_and_exhausted(self):
+    def test_round_robin_paused_cooling_exhausted(self):
         self.assertEqual([self.pool.select()[0] for _ in range(4)],[self.a,self.b,self.a,self.b])
         self.store.data['accounts'][self.a]['enabled']=False
         self.assertEqual(self.pool.select()[0],self.b)
@@ -278,32 +281,14 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.pool.select()
         self.assertNotIn(key, self.store.data['session_bindings'])
 
-    def test_consumption_rate_and_expire_unused(self):
-        # 模拟 3 天内余额 300 → 150：日耗 50。
+    def test_consumption_fields_are_gone(self):
+        # 按 db-redesign spec：不建 usage_history，消耗速率展示整体删除。
+        row = self.pool.rows(self.store.account_rows())[0]
+        for field in ('daily_rate', 'days_to_empty', 'expire_unused'):
+            self.assertNotIn(field, row, f"{field} 应已从 rows() 输出移除")
+        self.assertFalse(hasattr(self.pool, 'consumption'))
         status = self.store.data['account_status'].setdefault(self.a, {})
-        day0 = self.now - 3 * 86400
-        status['usage_history'] = [{'date': 'd0', 'samples': [[day0, 100], [day0 + 3600, 50]]},
-                                   {'date': 'd1', 'samples': [[self.now - 86400, 50]]}]
-        status['remaining'] = 150
-        consumption = self.pool.consumption(status)
-        self.assertAlmostEqual(consumption['daily_rate'], 100, delta=5)  # 200 消耗 / 2 天跨度
-        # 余额上涨样本（签到）不 计入消耗。
-        status['usage_history'][0]['samples'].append([day0 + 7200, -100])
-        self.assertAlmostEqual(self.pool.consumption(status)['daily_rate'], 100, delta=5)
-        # 最早过期 2 天后：按速率能烧 200，剩 150 → 无浪费。
-        status['earliest_expiry'] = self.now + 2 * 86400
-        row = self.pool.rows(self.store.account_rows())[0]
-        self.assertEqual(row['daily_rate'], consumption['daily_rate'])
-        self.assertEqual(row['expire_unused'], 0)
-        self.assertAlmostEqual(row['days_to_empty'], 1.5, delta=0.2)
-        # 快过期（1 天）时：只能烧 100 → 预计 50 浪费。
-        status['earliest_expiry'] = self.now + 86400
-        row = self.pool.rows(self.store.account_rows())[0]
-        self.assertAlmostEqual(row['expire_unused'], 50, delta=5)
-        # 无历史则字段为空。
-        row_b = self.pool.rows(self.store.account_rows())[1]
-        self.assertIsNone(row_b['daily_rate'])
-        self.assertIsNone(row_b['expire_unused'])
+        self.assertNotIn('usage_history', status)
 
     def test_record_exponential_backoff_and_reset(self):
         self.pool.record(self.a, 429)
@@ -398,9 +383,118 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         a,b=await asyncio.gather(asyncio.to_thread(self.pool.operate,self.a,'checkin'),asyncio.to_thread(self.pool.operate,self.a,'checkin'))
         self.assertTrue(a['ok'] and b['ok']);self.assertEqual(self.checkin_posts,1)
         self.assertEqual(self.store.data['account_status'][self.a]['remaining'],479.59)
-        self.fail=True
+        self.fail_mode=True
         result=await asyncio.to_thread(self.pool.operate,self.a,'status')
         self.assertFalse(result['ok']);self.assertEqual(self.store.data['account_status'][self.a]['remaining'],479.59)
+
+    def test_per_key_account_whitelist(self):
+        # 按 key 路由：白名单收窄候选集。
+        kid, _ = self.store.add_key("限定", accounts=[self.b])
+        self.assertEqual([self.pool.select(None, kid)[0] for _ in range(2)], [self.b, self.b])
+        # 空白名单 = 不限制。
+        kid2, _ = self.store.add_key("不限定")
+        self.assertIn(self.pool.select(None, kid2)[0], (self.a, self.b))
+        # kid=None（管理页测试请求）不施加白名单。
+        self.assertIn(self.pool.select()[0], (self.a, self.b))
+
+    def test_whitelisted_account_exhausted_raises(self):
+        kid, _ = self.store.add_key("限定", accounts=[self.b])
+        self.pool.record(self.b, 429)
+        with self.assertRaises(HTTPException):
+            self.pool.select(None, kid)
+
+    def test_routing_policies(self):
+        self.pool.update(self.a, weight=1, earliest_expiry=self.now + 30 * 86400)
+        self.pool.update(self.b, weight=0, earliest_expiry=self.now + 86400)
+        kid, _ = self.store.add_key("rr")
+        self.store.data["keys"][kid]["routing"] = "round_robin"
+        # round_robin：权重高的 a 先（游标从 0 起）。
+        self.pool.cursor = 0
+        self.assertEqual(self.pool.select(None, kid)[0], self.a)
+        # expiry_first：只看最早过期，b 先（b 权重低但 1 天后到期，a 要 30 天）。
+        kid2, _ = self.store.add_key("ef")
+        self.store.data["keys"][kid2]["routing"] = "expiry_first"
+        self.pool.cursor = 0
+        self.assertEqual(self.pool.select(None, kid2)[0], self.b)
+        # random：多次选择都落在候选集内。
+        kid3, _ = self.store.add_key("rand")
+        self.store.data["keys"][kid3]["routing"] = "random"
+        for _ in range(6):
+            self.assertIn(self.pool.select(None, kid3)[0], (self.a, self.b))
+
+    def test_routing_follows_default_when_null(self):
+        kid, _ = self.store.add_key("跟随")
+        self.assertIsNone(self.store.data["keys"][kid]["routing"])  # NULL = 动态跟随
+        self.store.data["pool"]["default_routing"] = "expiry_first"
+        self.assertEqual(self.pool._routing_for(kid), "expiry_first")
+        # 显式设置后不再跟随。
+        self.store.data["keys"][kid]["routing"] = "round_robin"
+        self.assertEqual(self.pool._routing_for(kid), "round_robin")
+
+    def test_key_soft_delete_and_last_key_guard(self):
+        kid1, value1 = self.store.add_key("A")
+        self.store.add_key("B")
+        # 撤销 kid1：软删保留行，revoked_at 置位、enabled 归零。
+        self.store.data["keys"][kid1]["revoked_at"] = 1
+        self.store.data["keys"][kid1]["enabled"] = 0
+        # 行还在（审计链不断），但鉴权必须拒绝。
+        self.assertIn(kid1, self.store.data["keys"])
+        self.assertEqual(self.store.key_unusable(self.store.data["keys"][kid1]), "该密钥已被撤销")
+        self.assertEqual(self.store.data["keys"][kid1]["hash"],
+                         hashlib.sha256(value1.encode()).hexdigest())
+        # 「最后一枚不可撤销」只数未撤销的：撤销 kid1 后还剩初始 key + B 两枚有效。
+        active = [k for k, v in self.store.data["keys"].items() if not v.get("revoked_at")]
+        self.assertEqual(len(active), 2)
+        # 再把 B 也撤销，就只剩 1 枚有效 → 此时撤销它会被 400 拦下。
+        for k in list(active)[1:]:
+            self.store.data["keys"][k]["revoked_at"] = 1
+        self.assertEqual(len([k for k, v in self.store.data["keys"].items()
+                              if not v.get("revoked_at")]), 1)
+
+    def test_disabled_and_expired_key_rejected(self):
+        kid, value = self.store.add_key("临时")
+        # 停用
+        self.store.data["keys"][kid]["enabled"] = 0
+        self.assertEqual(self.store.key_unusable(self.store.data["keys"][kid]), "该密钥已停用")
+        self.store.data["keys"][kid]["enabled"] = 1
+        # 过期
+        self.store.data["keys"][kid]["expires_at"] = 1  # 已过去
+        self.assertEqual(self.store.key_unusable(self.store.data["keys"][kid]), "该密钥已过期")
+
+    async def test_middleware_select_passes_key_to_retry(self):
+        # 凭据准备失败后重试必须仍传同一个 kid，否则可能选到白名单外的账号。
+        calls = []
+        original_select = self.pool.select
+        state = {"first": True}
+
+        def spy(affinity_key=None, kid=None, backend=None):
+            calls.append(kid)
+            if state["first"]:
+                # 第一次返回一个 get_headers 会抛的 manager，触发重试分支。
+                bad = self.store.manager_for(self.a, self.store.data["accounts"][self.a])
+                return self.a, bad
+            return original_select(affinity_key, kid, backend)
+        self.pool.select = spy
+        # 让 a 的 get_headers 抛错，重试才会发生。
+        manager = self.store.manager_for(self.a, self.store.data["accounts"][self.a])
+        manager.get_headers = Mock(side_effect=RuntimeError("凭据坏了"))
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ok'})
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+                await client.post('/v1/responses', json={'input': 'x'}, headers={'Authorization': 'Bearer api-test'})
+        finally:
+            self.pool.select = original_select
+        # 两次 select 都收到了同一个非 None kid（默认 api-test key）。
+        kid = self.store.check_api("Bearer api-test", "")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[0], kid)
+        self.assertEqual(calls[1], kid)
+
+
 
     async def test_paused_excluded_from_batch_and_schedule_persists(self):
         self.store.data['accounts'][self.b]['enabled']=False
@@ -417,8 +511,184 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         restarted=AccountPool(self.store,clock=lambda:self.now,client_factory=self.pool.client_factory)
         await restarted.tick()
         self.assertGreaterEqual(self.checkin_posts, 1)
-        data=json.loads(self.store.path.read_text(encoding='utf-8'))
-        self.assertTrue(data['account_status'][self.a]['checkin_date'])
+        # 持久化到 SQLite：重新加载后状态仍在。
+        reloaded = Store(self.store.root, self.store.auth_dir, '', 'admin-long-enough-test-key')
+        try:
+            self.assertTrue(reloaded.data['account_status'][self.a]['checkin_date'])
+            self.assertIn(self.b, reloaded.data['account_status'])
+        finally:
+            # 关掉这条额外连接：否则它与 self.store 各持一条写连接，
+            # 且 reloaded 构造时的 sync_any_enabled() 会污染全局 converter.CONFIG。
+            reloaded.db.close()
+
+    def test_upstream_usage_sync_paginates_parses_time_and_upserts(self):
+        from admin.db import MICRO
+        pages = []
+
+        def respond(req):
+            # 参数名必须是驼峰 pageNum/pageSize（与同域 get-user-resource 的 PageNumber/PageSize 不同）。
+            body = json.loads(req.content)
+            self.assertIn("pageNum", body)
+            self.assertIn("pageSize", body)
+            pages.append(body["pageNum"])
+            if body["pageNum"] == 1:
+                rows = [{"requestId": "crb-1", "credit": "0", "model": "step-5-preview",
+                         "client": "WorkBuddy", "requestTime": "2026-10-14 09:30:00",
+                         "agentPurpose": "chat"},
+                        {"requestId": "crb-2", "credit": "12.5", "model": "hy3",
+                         "client": "WorkBuddy", "requestTime": "2026-10-14 10:00:00"}]
+                total = 3   # 总数 3 > 本页 2，必须继续翻页
+            else:
+                rows = [{"requestId": "crb-3", "credit": "1", "model": "hy3",
+                         "client": "WorkBuddy", "requestTime": "2026-10-14 11:00:00"}]
+                total = 3
+            return httpx.Response(200, json={"code": 0, "msg": "OK", "requestId": "trace-1",
+                                             "data": {"total": total, "data": rows}})
+        pool = AccountPool(self.store, clock=lambda: self.now,
+                           client_factory=lambda: httpx.Client(transport=httpx.MockTransport(respond)))
+        with self.store.lock:
+            manager = self.store.manager_for(self.a, self.store.data["accounts"][self.a])
+        manager.get_headers = lambda: {"X-Domain": "www.codebuddy.cn"}
+        self.assertEqual(pool.sync_upstream_usage(self.a), 3)
+        self.assertEqual(pages, [1, 2])   # 按 total 翻到第二页即停
+        rows = {r["request_id"]: r for r in self.store.db.load_upstream_usage(self.a)}
+        self.assertEqual(set(rows), {"crb-1", "crb-2", "crb-3"})
+        # requestTime 无时区标记，必须按北京时间解析。
+        expected = int(datetime(2026, 10, 14, 9, 30, tzinfo=CN).timestamp())
+        self.assertEqual(rows["crb-1"]["request_time"], expected)
+        self.assertEqual(rows["crb-1"]["model"], "step-5-preview")
+        self.assertEqual(rows["crb-1"]["agent_purpose"], "chat")
+        self.assertAlmostEqual(rows["crb-2"]["credit"], 12.5, places=4)
+        # 同步成功写 usage_synced_at 并清掉旧的错误留痕。
+        self.assertEqual(self.store.data["account_status"][self.a]["usage_synced_at"], int(self.now))
+        self.assertIsNone(self.store.data["account_status"][self.a].get("usage_sync_error"))
+
+    def test_upstream_usage_credit_can_be_corrected(self):
+        # credit 可能不是终值：第二次同步用新值覆盖，而不是被 OR IGNORE 钉死。
+        def respond(req):
+            credit = "0" if pages_seen == [] else "7.5"
+            return httpx.Response(200, json={"code": 0, "data": {"total": 1, "data": [
+                {"requestId": "crb-9", "credit": credit, "model": "hy3",
+                 "requestTime": "2026-10-14 12:00:00"}]}})
+        pages_seen = []
+        pool = AccountPool(self.store, clock=lambda: self.now,
+                           client_factory=lambda: httpx.Client(transport=httpx.MockTransport(respond)))
+        with self.store.lock:
+            manager = self.store.manager_for(self.a, self.store.data["accounts"][self.a])
+        manager.get_headers = lambda: {"X-Domain": "www.codebuddy.cn"}
+        pool.sync_upstream_usage(self.a)
+        pages_seen.append(1)
+        pool.sync_upstream_usage(self.a)
+        rows = self.store.db.load_upstream_usage(self.a)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["credit"], 7.5, places=4)
+
+    async def test_usage_sync_batch_marks_failure_and_skips_same_day(self):
+        calls = []
+
+        def respond(req):
+            calls.append(req.url.path)
+            return httpx.Response(500)
+        pool = AccountPool(self.store, clock=lambda: self.now,
+                           client_factory=lambda: httpx.Client(transport=httpx.MockTransport(respond)))
+        result = await pool.sync_upstream_usage_batch()
+        self.assertEqual(result, {"synced": 0, "failed": 2})
+        self.assertEqual(len(calls), 2)   # 两个账号各试一次
+        # 失败留痕：带当天日期前缀，且 usage_synced_at 保持不变（语义是「成功时间」）。
+        today = datetime.fromtimestamp(self.now, CN).strftime("%Y-%m-%d")
+        for aid in (self.a, self.b):
+            status = self.store.data["account_status"][aid]
+            self.assertTrue(status["usage_sync_error"].startswith(today), status["usage_sync_error"])
+            self.assertNotIn("usage_synced_at", status)
+        # 同一天再跑不重复打上游。
+        again = await pool.sync_upstream_usage_batch()
+        self.assertTrue(again.get("skipped"))
+        self.assertEqual(len(calls), 2)
+        # 留痕必须出现在 overview 里，否则「留痕」没人看得到、机制无法验证。
+        rows = {r["id"]: r for r in pool.rows(self.store.account_rows())}
+        for aid in (self.a, self.b):
+            self.assertTrue(rows[aid]["usage_sync_error"].startswith(today))
+            self.assertIsNone(rows[aid]["usage_synced_at"])
+
+    async def test_request_log_carries_route_dimensions_through_full_stack(self):
+        """回归：Metrics(外) + Pool(内) 全链路要能拿到 key/account/model 并落库。
+
+        这曾经是断的——Pool 在 finally 里 reset ContextVar，外层 Metrics 读取时
+        已恢复默认值，所有路由维度恒为 NULL。只测 Pool 或只测 Metrics 都发现不了，
+        必须把两层叠起来跑。
+        """
+        from admin.metrics import MetricsMiddleware, RequestMetrics
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ok', 'more_body': False})
+
+        # Pool 在内、Metrics 在外：先包 Pool，再用 Metrics 包住它。
+        inner = PoolMiddleware(app, self.pool)
+        stack = MetricsMiddleware(inner, RequestMetrics(), source="api", store=self.store)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'model': 'hy3', 'input': 'x'},
+                                         headers={'Authorization': 'Bearer api-test'})
+            self.assertEqual(response.status_code, 200)
+        self.store.save()   # 把缓冲落库
+        logs = self.store.db.recent_request_logs(10)
+        self.assertEqual(len(logs), 1)
+        row = logs[0]
+        self.assertEqual(row["path"], "/v1/responses")
+        self.assertEqual(row["source"], "api")
+        # 成功请求也要落到真实的 HTTP 状态码，不是 NULL。
+        self.assertEqual(row["status"], 200)
+        self.assertEqual(row["outcome"], "success")
+        # 关键：路由维度必须都在。
+        self.assertEqual(row["key_id"], self.store.check_api("Bearer api-test", ""))
+        self.assertIn(row["account_id"], (self.a, self.b))
+        self.assertEqual(row["account_name"], self.store.data["accounts"][row["account_id"]]["name"])
+        self.assertEqual(row["model_id"], "hy3")
+        self.assertEqual(row["model_name"], "hy3")
+
+    async def test_request_log_records_sse_error_code_as_status(self):
+        """回归：SSE 内带的 429 要以状态码入库，才能和客户端断连区分开。"""
+        from admin.metrics import MetricsMiddleware, RequestMetrics
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body',
+                        'body': b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"429"}}}\n\n',
+                        'more_body': False})
+
+        inner = PoolMiddleware(app, self.pool)
+        stack = MetricsMiddleware(inner, RequestMetrics(), source="api", store=self.store)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack), base_url='http://test') as client:
+            await client.post('/v1/responses', json={'input': 'x'},
+                              headers={'Authorization': 'Bearer api-test'})
+        self.store.save()
+        row = self.store.db.recent_request_logs(1)[0]
+        # HTTP 层是 200，但生效状态码必须是 SSE 里的 429。
+        self.assertEqual(row["status"], 429)
+        self.assertEqual(row["outcome"], "stream_error")
+
+    def test_request_log_survives_failed_commit(self):
+        """回归：提交失败时缓冲不能丢——否则这批日志永久消失且无提示。"""
+        self.store.queue_request_log({"time": int(time.time()), "source": "api",
+                                      "path": "/v1/messages", "status": 200,
+                                      "outcome": "success", "duration_ms": 1})
+        original = Database.save_keys
+
+        def boom(self, keys):
+            raise KeyboardInterrupt("提交前崩")
+        Database.save_keys = boom
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.save()
+        finally:
+            Database.save_keys = original
+        # 缓冲已还原，而不是被清空。
+        self.assertEqual(len(self.store.log_buffer), 1)
+        self.store.save()
+        self.assertEqual(len(self.store.db.recent_request_logs(10)), 1)
 
     async def test_context_isolation_concurrent_requests_and_auth(self):
         async def app(scope,receive,send):

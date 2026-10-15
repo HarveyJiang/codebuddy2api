@@ -271,8 +271,18 @@ class AnthropicStreamConverter:
 
         # 结束信息
         self._finish_reason: str | None = None
+        self._saw_done: bool = False  # 收到 [DONE]：判「正常结束」还是「被截断」
         self._usage: dict | None = None
         self._content_filter: bool = False
+
+    @property
+    def completed(self) -> bool:
+        """上游是否发出了终止信号。
+
+        finish() 无论上游是否正常收尾都会补发 message_stop（保证客户端循环能退出），
+        所以不能用「有没有 message_stop」判断——必须看上游自己的 finish_reason 或 [DONE]。
+        """
+        return self._finish_reason is not None or self._saw_done
 
     # ---- 公开接口 ----
 
@@ -283,6 +293,7 @@ class AnthropicStreamConverter:
             return ""
         data = line[5:].strip()
         if data == "[DONE]":
+            self._saw_done = True
             return ""
         try:
             chunk = json.loads(data)
