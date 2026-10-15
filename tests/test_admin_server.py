@@ -217,6 +217,48 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         metrics = (await self.client.get("/admin/api/overview")).json()["metrics"]
         self.assertEqual(metrics["completed"], 25)
 
+    async def test_logs_filter_by_key(self):
+        """按 key_id 过滤请求记录：需求「点 API Key 查看该 key 的最近请求」。
+
+        分页与总数必须都受限（total 算错会让前端画错页码）；不存在的 key 返回空而不是报错。
+        """
+        await self.login()
+        store = self.app.state.store
+        now = int(time.time())
+        store.db.append_request_logs([
+            {"time": now - i, "source": "api", "path": "/v1/chat/completions",
+             "status": 200, "outcome": "success", "duration_ms": 100 + i,
+             # 每 3 条一条属于 k2，其余 k1；最后 2 条无 key（管理页测试路径）。
+             "key_id": ("k2" if i % 3 == 0 else "k1") if i < 23 else None,
+             "account_id": "a1", "account_name": "账号",
+             "model_id": "deepseek-v4-flash", "model_name": "V4", "upstream_request_id": None}
+            for i in range(25)])
+
+        p1 = (await self.client.get("/admin/api/logs?key_id=k1&limit=50")).json()
+        self.assertTrue(p1["rows"], "k1 应当有记录")
+        self.assertTrue(all(r["key_id"] == "k1" for r in p1["rows"]), "不得混入其它 key 的记录")
+        self.assertEqual(p1["total"], len(p1["rows"]))
+
+        p2 = (await self.client.get("/admin/api/logs?key_id=k2&limit=50")).json()
+        self.assertTrue(all(r["key_id"] == "k2" for r in p2["rows"]))
+        # 两个 key 的记录数加起来不应超过总数，且互不重叠。
+        self.assertEqual(p1["total"] + p2["total"], 23)
+
+        # 分页时 total 仍是「不带 limit/offset 的同条件总数」，不能退化成整表总数。
+        page = (await self.client.get("/admin/api/logs?key_id=k1&limit=5&offset=0")).json()
+        self.assertEqual(len(page["rows"]), 5)
+        self.assertEqual(page["total"], p1["total"])
+
+        # 不存在的 key：空结果，不是 500。
+        empty = (await self.client.get("/admin/api/logs?key_id=nope")).json()
+        self.assertEqual(empty["rows"], [])
+        self.assertEqual(empty["total"], 0)
+
+        # 不带 key_id 时行为不变（回归：不能把所有请求都过滤掉）。
+        all_rows = (await self.client.get("/admin/api/logs?limit=50")).json()
+        self.assertEqual(all_rows["total"], 25)
+        await self.client.aclose()
+
     async def test_usage_endpoints_paging_report_and_throttle(self):
         """用量三个接口：分页只读本地、报表聚合、手动拉取的防抖与不写 usage_synced_at。"""
         await self.login()

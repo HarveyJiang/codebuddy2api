@@ -702,11 +702,13 @@ class Database:
         return [{column: row[column] for column in LOG_COLUMNS} for row in rows]
 
     def page_request_logs(self, limit=50, offset=0, since=None, until=None,
-                          source=None, outcome=None):
+                          source=None, outcome=None, key_id=None):
         """分页读请求日志（按 id 倒序），返回 {rows, total, limit, offset}。
 
         total 是不带 limit/offset 的同条件总数，供前端画页码。条件都用参数绑定，
         不接受 SQL 片段，避免拼接注入。
+
+        key_id：只看某个客户端密钥的请求。命中 idx_logs_key_time 索引。
         """
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
@@ -723,6 +725,9 @@ class Database:
         if outcome:
             clauses.append("outcome = ?")
             params.append(str(outcome))
+        if key_id:
+            clauses.append("key_id = ?")
+            params.append(str(key_id))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         total = self.query(f"SELECT COUNT(*) AS n FROM request_logs{where}", tuple(params))[0]["n"]
         rows = self.query(

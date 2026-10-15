@@ -1016,7 +1016,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         result = store.db.page_request_logs(
             limit=as_int("limit", 50), offset=as_int("offset", 0),
             since=as_int("since"), until=as_int("until"),
-            source=params.get("source") or None, outcome=params.get("outcome") or None)
+            source=params.get("source") or None, outcome=params.get("outcome") or None,
+            key_id=params.get("key_id") or None)
         return {**result, "rows": _log_rows(result["rows"])}
 
     @app.get("/admin/api/logs/stats")

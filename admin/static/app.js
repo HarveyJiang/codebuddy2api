@@ -1,10 +1,16 @@
 "use strict";
 const $ = id => document.getElementById(id);
-// 积分余额可能带小数（Trae 按消耗比例扣减），统一保留最多 2 位小数展示。
+// 积分/消耗一律整数展示（向下取整，保守：宁可少显示不虚报）。
+// 只影响**显示层** —— 数据库仍存精确的 *_micro 值，对账与护栏判定不受影响。
+// 注意取整时机：多账号求和的场合要「先求和再取整」否则误差会累积，
+// 所以调用方应传原始 Number，不要传已格式化的字符串。
 const creditsFmt = v => {
+  // null / undefined 表示「还没查询过」，不是 0 —— 返回占位符而不是 0，
+  // 否则「未查询」和「余额耗尽」在界面上无法区分。数值 0 仍正常显示为 0。
+  if (v === null || v === undefined || v === "") return "—";
   const n = Number(v);
   if (!Number.isFinite(n)) return "—";
-  return (Math.round(n * 100) / 100).toLocaleString("zh-CN", {maximumFractionDigits: 2});
+  return Math.floor(n).toLocaleString("zh-CN");
 };
 let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
 let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0, traeFlow = null, traeTimer = null, traeTick = null, traeBase = "", traeExpiresAt = 0, traeTotal = 600;
@@ -100,7 +106,7 @@ function render() {
     const expired = !!k.expires_at && k.expires_at <= now;
     const scope = (list, noun) => (Array.isArray(list) && list.length)
       ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<select class="routing-select" data-routing="${k.id}" title="该密钥的账号分配策略"><option value=""${routing === "" ? " selected" : ""}>跟随默认</option><option value="round_robin"${routing === "round_robin" ? " selected" : ""}>轮转</option><option value="random"${routing === "random" ? " selected" : ""}>随机</option><option value="expiry_first"${routing === "expiry_first" ? " selected" : ""}>优先快过期</option></select>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型与账号">权限</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${ROUTING_ICON[routing] || ROUTING_ICON[""]} ${ROUTING_SHORT[routing] || ROUTING_SHORT[""]}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型、可用账号与分配策略">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
   }).join("");
   renderModels();
   const modelIds = Array.isArray(models?.models) ? models.models.filter(m => m.enabled).map(m => m.id) : [];
@@ -153,6 +159,10 @@ function renderDashboard() {
   if(accounts.length > 8) $("dash-account-list").insertAdjacentHTML("beforeend",'<p class="muted">更多账号请前往账号池查看。</p>');
 }
 const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
+// 分配策略的图标与短名：列表里用「图标 + 短名」展示，编辑集中到设置弹框。
+// 图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
+const ROUTING_ICON = {"": "↺", round_robin: "↻", random: "⁘", expiry_first: "⏳"};
+const ROUTING_SHORT = {"": "跟随默认", round_robin: "轮转", random: "随机", expiry_first: "快过期优先"};
 let logOffset = 0, logTotal = 0;
 function renderLogRows(rows) {
   $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === 'test' ? '后台测试' : 'API'}<small class="cell-note mono">${esc(r.path)}</small></td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
@@ -192,8 +202,10 @@ function renderAccounts() {
   const labels = {available:["可用","green"],cooling:["冷却中","amber"],paused:["已暂停",""],exhausted:["积分耗尽","amber"],invalid:["凭据异常","red"]};
   $("accounts-body").innerHTML = rows.map(a => {
     const status = labels[a.pool_state] || ["待查询", ""];
-    const credits = creditsFmt(a.remaining);
-    const expiring = creditsFmt(a.expiring_soon);
+    // 未查询过的账号 remaining 为 null。creditsFmt(null) 会得到 "0"，
+    // 显示成「剩余积分 0」与真的耗尽无法区分 —— 明确显示「待查询」。
+    const credits = a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining);
+    const expiring = a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon);
     const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
     return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.backend === "trae" ? '<span class="mini-trae">Trae</span>' : ""}</strong>${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
@@ -214,10 +226,15 @@ async function refresh(loadCredits) {
 }
 async function enter() { $("boot").hidden = true; $("login").hidden = true; $("workspace").hidden = false; goPage(location.hash.slice(1)); await refresh(true); }
 $("login-form").addEventListener("submit", async e => {
-  e.preventDefault(); const button = e.submitter; button.disabled = true; $("login-error").textContent = "";
+  // e.submitter 只在**点击**按钮提交时有值；按回车提交表单或程序化 submit 时为 null。
+  // 直接解引用会让整个登录流程抛异常（实测：回车提交即无法登录）。
+  e.preventDefault();
+  const button = e.submitter || $("login-form").querySelector("button[type=submit]");
+  if (button) button.disabled = true;
+  $("login-error").textContent = "";
   try { const data = await api("login", {method:"POST",body:{key:$("admin-key").value.trim()}}); csrf = data.csrf; $("admin-key").value = ""; await enter(); }
   catch (error) { $("login-error").textContent = error.message; }
-  finally { button.disabled = false; }
+  finally { if (button) button.disabled = false; }
 });
 $("logout").addEventListener("click", async () => { try { await api("logout", {method:"POST"}); showLogin(); } catch (e) { toast(e.message); } });
 async function batchAction(action) {
@@ -538,17 +555,18 @@ function confirmAction(title, desc, callback, field = null) {
   if (field && field.placeholder) input.placeholder = field.placeholder; else input.removeAttribute("placeholder");
   pendingConfirm = callback; $("confirm-dialog").showModal();
 }
-// token 友好格式：842 / 12.3K / 3.4M。口径是流式抓的估算值，不是精确账本。
+// token 友好格式：842 / 12K / 3M。口径是流式抓的估算值，不是精确账本。
+// 与积分同口径：向下取整，不出现小数（12.3K → 12K）。
 function fmtTokens(n) {
-  const v = Number(n) || 0;
-  const trim = x => x.toFixed(1).replace(/\.0$/, "");
+  const v = Math.floor(Number(n) || 0);
   if (v < 1000) return String(v);
   if (v < 1000000) {
-    // 999950 -> 1000.0K，读起来比 1M 还别扭，这种边界进位到 M。
-    if (v >= 999950) return trim(v / 1000000) + "M";
-    return trim(v / 1000) + "K";
+    // 999950 向下取整会得到 "999K"，读起来比 1M 还别扭；这种边界进位到 M。
+    // 注意 M 的换算也走 floor，若不先归一到 1000000，会算出 floor(0.99995)=0 → "0M"。
+    if (v >= 999950) return (Math.floor(v / 1000000) || 1) + "M";
+    return Math.floor(v / 1000) + "K";
   }
-  return trim(v / 1000000) + "M";
+  return Math.floor(v / 1000000) + "M";
 }
 // 回调自行关闭对话框时（恢复备份会重启服务，不能让这里再 refresh）就跳过收尾。
 // 判据用 dialog.open，不引进新标记——回调关掉了就说明它接管了后续流程。
@@ -567,15 +585,10 @@ $("accounts-body").addEventListener("click", async e => {
   if (b.dataset.action === "toggle") confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？", "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。", () => update({enabled:!a.enabled}));
   if (b.dataset.action === "delete") confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。`, () => api("accounts/" + a.id, {method:"DELETE"}));
 });
-$("keys-body").addEventListener("change", e => {
-  const select = e.target.closest("[data-routing]");
-  if (!select) return;
-  const kid = select.dataset.routing;
-  // 留空 = NULL = 动态跟随 settings.default_routing。
-  api("keys/" + kid, {method:"PATCH", body:{routing: select.value || null}})
-    .then(() => refresh()).catch(err => { toast(err.message); refresh(); });
-});
 $("keys-body").addEventListener("click", e => {
+  // 分配策略做成「图标 + 短名」的 chip，点击进设置弹框统一编辑（与「设置」按钮同一个弹框）。
+  const chip = e.target.closest("[data-routing-edit]");
+  if (chip) { openKeyBind(overview.keys.find(x => x.id === chip.dataset.routingEdit)); return; }
   const bind = e.target.closest("[data-bind]");
   if (bind) { openKeyBind(overview.keys.find(x => x.id === bind.dataset.bind)); return; }
   const limit = e.target.closest("[data-limit]");
@@ -747,9 +760,9 @@ function renderUsageSummary(report) {
   const t = report.total || {};
   const card = (label, value, note) => `<article><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`;
   $("usage-summary").innerHTML =
-    card("区间积分消耗", (t.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2}), "来自上游账单") +
+    card("区间积分消耗", creditsFmt(t.credit ?? 0), "来自上游账单") +
     card("记录条数", (t.count ?? 0).toLocaleString("zh-CN"), `免费 ${t.free ?? 0} · 付费 ${t.paid ?? 0}`) +
-    card("付费条均", t.paid ? ((t.credit ?? 0) / t.paid).toFixed(3) : "—", "不含免费调用") +
+    card("付费条均", t.paid ? creditsFmt((t.credit ?? 0) / t.paid) : "—", "不含免费调用") +
     card("维度", {day:"按日", account:"按账号", model:"按模型", client:"按客户端"}[report.group_by] || report.group_by, `共 ${report.bucket_total ?? (report.groups || []).length} 组`);
 }
 function renderUsageGroups(report) {
@@ -768,7 +781,7 @@ function renderUsageGroups(report) {
   const label = b => (report.group_by === "account" ? accountName(b) : b);
   host.innerHTML = shown.map(g =>
     `<tr><td>${esc(label(g.bucket))}</td><td class="align-right mono">${g.count}</td>`
-    + `<td class="align-right mono">${(g.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2})}</td>`
+    + `<td class="align-right mono">${creditsFmt(g.credit ?? 0)}</td>`
     + `<td class="align-right mono muted">${g.free} / ${g.paid}</td></tr>`).join("")
     || '<tr><td colspan="4" class="history-empty">该区间没有记录。</td></tr>';
 }
@@ -779,7 +792,7 @@ async function loadUsage(offset, withReport = true) {
     usageOffset = data.offset; usageTotal = data.total;
     $("usage-body").innerHTML = data.rows.map(r => `<tr><td class="mono muted">${esc(stamp(r.request_time * 1000))}</td>`
       + `<td>${esc(r.account_name || r.account_id || "—")}</td><td class="mono">${esc(r.model || "—")}</td>`
-      + `<td>${esc(r.client || "—")}</td><td class="align-right mono">${(r.credit ?? 0).toLocaleString("zh-CN", {maximumFractionDigits:2})}</td>`
+      + `<td>${esc(r.client || "—")}</td><td class="align-right mono">${creditsFmt(r.credit ?? 0)}</td>`
       + `<td class="muted">${esc(r.agent_purpose || "")}</td></tr>`).join("")
       || '<tr><td colspan="6" class="history-empty">该区间没有记录。可点击「拉取上游」同步。</td></tr>';
     const pages = Math.max(1, Math.ceil(usageTotal / size));
@@ -831,8 +844,46 @@ $("usage-group").addEventListener("change", () => loadUsage(usageOffset));
 $("usage-account").addEventListener("change", () => loadUsage(0));
 $("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsage(0); });
 
+/* ---------- 单个密钥的请求记录 ---------- */
+let keyReqId = null, keyReqOffset = 0, keyReqSize = 10;
+function renderKeyRequests(rows) {
+  $("key-requests-body").innerHTML = rows.map(r =>
+    `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
+    + `<td>${esc(r.backend || "—")}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td>`
+    + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td>`
+    + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
+    || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';
+}
+async function loadKeyRequests(offset) {
+  if (!keyReqId) return;
+  keyReqOffset = Math.max(0, offset);
+  $("key-requests-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
+  try {
+    const data = await api(`logs?limit=${keyReqSize}&offset=${keyReqOffset}&key_id=${encodeURIComponent(keyReqId)}`);
+    renderKeyRequests(data.rows);
+    const pages = Math.max(1, Math.ceil(data.total / keyReqSize));
+    const current = Math.floor(data.offset / keyReqSize) + 1;
+    $("key-requests-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
+    $("key-requests-prev").disabled = data.offset <= 0;
+    $("key-requests-next").disabled = data.offset + keyReqSize >= data.total;
+  } catch (err) {
+    $("key-requests-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(err.message)}</td></tr>`;
+  }
+}
+$("key-requests-prev").addEventListener("click", () => loadKeyRequests(keyReqOffset - keyReqSize));
+$("key-requests-next").addEventListener("click", () => loadKeyRequests(keyReqOffset + keyReqSize));
+
 /* ---------- 密钥用量历史 ---------- */
 $("keys-body").addEventListener("click", async e => {
+  const reqCell = e.target.closest("[data-requests]");
+  if (reqCell) {
+    keyReqId = reqCell.dataset.requests;
+    const k = overview.keys.find(x => x.id === keyReqId);
+    $("key-requests-name").textContent = `密钥「${k ? k.name : keyReqId}」`;
+    $("key-requests-dialog").showModal();
+    await loadKeyRequests(0);
+    return;
+  }
   const cell = e.target.closest("[data-usage]");
   if (!cell) return;
   const kid = cell.dataset.usage;
