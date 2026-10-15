@@ -639,7 +639,7 @@ def build_trae_catalog(menu: list[dict] | None) -> list[dict]:
 def checkin_status(client: httpx.Client, headers: dict, ug_host: str | None = None) -> dict:
     """查询签到状态。返回 {checked, credits, enable}。"""
     host = ug_host or UG_HOST
-    r = client.post(host + EP_CHECKIN_STATUS, headers=headers, json={})
+    r = client.post(host + EP_CHECKIN_STATUS, headers=headers, json=CHECKIN_BODY)
     if r.status_code != 200:
         raise TraeAPIError(f"签到状态接口返回 HTTP {r.status_code}", status=r.status_code)
     try:
@@ -659,7 +659,7 @@ def checkin_claim(client: httpx.Client, headers: dict, ug_host: str | None = Non
     注意上游对"失败"也返回 HTTP 200，真实结果看 body 的 code（见 interpret_checkin_claim）。
     """
     host = ug_host or UG_HOST
-    r = client.post(host + EP_CHECKIN_CLAIM, headers=headers, json={})
+    r = client.post(host + EP_CHECKIN_CLAIM, headers=headers, json=CHECKIN_BODY)
     if r.status_code != 200:
         raise TraeAPIError(f"签到接口返回 HTTP {r.status_code}", status=r.status_code)
     try:
@@ -669,15 +669,20 @@ def checkin_claim(client: httpx.Client, headers: dict, ug_host: str | None = Non
     return data if isinstance(data, dict) else {}
 
 
-# 签到 claim 可重试的业务码：上游容量限制（"当前参与用户太多，请稍后再试"）。
-CHECKIN_RETRYABLE_CODES = {9074}
+# 签到接口请求体：req_source 1 = Trae CN IDE（SOLO 为 2）。
+# 生产实测：body 缺 req_source 时上游按"订单参数不正确"拒绝（9004/9074）。
+CHECKIN_REQ_SOURCE = 1
+CHECKIN_BODY = {"req_source": CHECKIN_REQ_SOURCE}
+
+# 签到 claim 可重试的业务码：上游拒绝（高峰限流或设备/请求形态不被识别），稍后重试即可。
+CHECKIN_RETRYABLE_CODES = {9074, 9004}
 
 
 def interpret_checkin_claim(data: dict) -> tuple[bool, str, bool]:
     """签到 claim 响应 → (成功?, 消息, 可重试?)。
 
-    上游 HTTP 恒 200，用业务码判定：code 0/缺失＝成功；9074 等＝人多可重试；
-    其余非 0＝明确失败，透出上游 message（避免把容量限制误报成"尚未确认"）。
+    上游 HTTP 恒 200，用业务码判定：code 0/缺失＝成功；9074/9004 等＝上游暂时拒绝可重试；
+    其余非 0＝明确失败，透出上游 message（避免把上游拒绝误报成"尚未确认"）。
     """
     code = data.get("code")
     message = str(data.get("message") or "").strip()
@@ -869,7 +874,12 @@ class TraeCredentialManager:
     # -- ug API（动态模型表 / 签到 / 积分） --
 
     def ug_headers(self) -> dict:
-        """签到/积分（api.trae.cn）头：确保 token 新鲜后构造（对应 Go UgHeaders）。"""
+        """签到/积分（api.trae.cn）头：确保 token 新鲜后构造（对应 Go UgHeaders）。
+
+        生产实测（对照官方客户端与开源签到实现）：ug 接口除 Cloud-IDE-JWT 外还校验
+        设备三头（x-device-id/x-device-brand/x-device-type）与 x-app-version；
+        缺 x-device-id 上游返回 9004（设备形态不被识别），签到必失败。
+        """
         with self._lock:
             if self._is_expired():
                 self._refresh()
@@ -881,10 +891,13 @@ class TraeCredentialManager:
                 "User-Agent": CLIENT_UA,
                 "Authorization": f"Cloud-IDE-JWT {token}",
                 "X-User-Region": "CN",
+                "x-app-version": "1.0.0",
             }
             device_id = str(auth.get("deviceId") or "")
             if device_id:
                 h["X-Device-Id"] = device_id
+                h["x-device-brand"] = "PC"
+                h["x-device-type"] = "Linux"
             return h
 
     def fetch_models(self) -> list[dict]:

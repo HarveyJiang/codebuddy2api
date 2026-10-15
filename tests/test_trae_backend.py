@@ -1357,13 +1357,19 @@ def test_checkin_status_and_claim_and_ent_usage(tmp_path):
     def handler(req):
         paths.append(req.url.path)
         if req.url.path.endswith("/checkin_credits/status"):
-            # UgHeaders：Cloud-IDE-JWT + X-User-Region + X-Device-Id
+            # UgHeaders：Cloud-IDE-JWT + X-User-Region + 设备三头 + x-app-version
             assert req.headers["Authorization"] == "Cloud-IDE-JWT TRAE-ACCESS"
             assert req.headers["X-User-Region"] == "CN"
             assert req.headers["X-Device-Id"] == "d" * 32
+            assert req.headers["x-device-brand"] == "PC"
+            assert req.headers["x-device-type"] == "Linux"
+            assert req.headers["x-app-version"] == "1.0.0"
             assert req.headers["User-Agent"] == T.CLIENT_UA
+            # body 必须带 req_source，空 body 会被上游按"订单参数不正确"拒绝
+            assert json.loads(req.content) == {"req_source": 1}
             return httpx.Response(200, json={"checked_in": True, "credits": 66, "enable": False})
         if req.url.path.endswith("/checkin_credits/claim"):
+            assert json.loads(req.content) == {"req_source": 1}
             return httpx.Response(200, json={})
         return httpx.Response(200, json={"user_entitlement_pack_list": [
             {"entitlement_base_info": {"quota": {"credits_limit": 10}}},
@@ -1377,6 +1383,26 @@ def test_checkin_status_and_claim_and_ent_usage(tmp_path):
         mgr.checkin_claim(client)
         assert mgr.user_ent_usage(client) == 15
     assert paths.count("/trae/api/v2/ug/checkin_credits/claim") == 1
+
+
+def test_ug_headers_device_trio_and_req_source(tmp_path):
+    """ug_headers 必须带设备三头 + x-app-version；签到 body 必须带 req_source=1。"""
+    assert T.CHECKIN_BODY == {"req_source": 1}
+    doc = trae_credential()
+    p = tmp_path / "t.info"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    h = T.TraeCredentialManager(p).ug_headers()
+    assert h["X-Device-Id"] == "d" * 32
+    assert h["x-device-brand"] == "PC" and h["x-device-type"] == "Linux"
+    assert h["x-app-version"] == "1.0.0"
+    # deviceId 缺失时不发设备三头（x-app-version 仍发），由上游返回 9004 暴露
+    doc2 = trae_credential()
+    doc2["auth"].pop("deviceId")
+    p2 = tmp_path / "t2.info"
+    p2.write_text(json.dumps(doc2), encoding="utf-8")
+    h2 = T.TraeCredentialManager(p2).ug_headers()
+    assert "X-Device-Id" not in h2 and "x-device-brand" not in h2 and "x-device-type" not in h2
+    assert h2["x-app-version"] == "1.0.0"
 
 
 def test_manager_fetch_models_uses_solo_headers(tmp_path):

@@ -422,8 +422,9 @@ class AccountPool:
                         message = "当前没有可参与的签到活动"
                     else:
                         # 上游对签到失败也返回 HTTP 200，真实结果看 claim 的 code。
-                        # 9074 等＝"人多稍后再试"（容量限制），对 claim 本身做有界重试；
-                        # 其余非 0＝明确失败，透出上游 message（而非误报"尚未确认"）。
+                        # 9074/9004 等＝上游暂时拒绝（高峰限流或设备/请求形态问题），
+                        # 对 claim 本身做有界重试；其余非 0＝明确失败，透出上游
+                        # message（而非误报"尚未确认"）。
                         confirmed = False
                         last_msg = "签到失败，请稍后再试"
                         for attempt in range(4):
