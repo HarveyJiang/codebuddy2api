@@ -6,8 +6,8 @@
 import { readFileSync } from "node:fs";
 const src = readFileSync("admin/static/app.js", "utf8");
 
-// 抽取三个纯函数。用各自的源码形态精确定位，不靠「下一个 }」这类脆弱启发式
-// （app.js 里 const 箭头函数与 function 混用，行尾还有分号差异）。
+// 抽取几个纯函数。用各自的源码形态精确定位；app.js 里 const 箭头函数与 function
+// 混用、行尾还有分号差异，所以每个片段各有明确的起止串。
 function slice(from, to) {
   const start = src.indexOf(from);
   if (start < 0) throw new Error(`找不到 ${from}`);
@@ -19,9 +19,10 @@ const code = [
   slice("function groupModelsByName(list) {", "\n}"),
   slice("const modelBaseName = id =>", ";\n"),
   slice("const creditsText = m =>", ";\n"),
+  slice("function modelsInGroup(list, key) {", "\n}"),
 ].join("\n");
-const { groupModelsByName, modelBaseName, creditsText } =
-  new Function(code + "\nreturn {groupModelsByName, modelBaseName, creditsText};")();
+const { groupModelsByName, modelBaseName, creditsText, modelsInGroup } =
+  new Function(code + "\nreturn {groupModelsByName, modelBaseName, creditsText, modelsInGroup};")();
 
 let bad = 0;
 const check = (label, got, want) => {
@@ -72,6 +73,20 @@ check("modelBaseName 对空值安全", modelBaseName(null), "");
 check("倍率 0 显示免费", creditsText({ credits: 0 }), "免费");
 check("倍率 null 显示标准", creditsText({ credits: null }), "标准");
 check("倍率 0.48 原样显示", creditsText({ credits: 0.48 }), "×0.48");
+
+// 渲染与批量操作必须对「一个组有哪些条目」有**同一个答案**。
+// 若两边各算一遍，将来改了归组规则就会出现「显示 2 条、批量只操作到 1 条」，
+// 而且界面不会报错——这类静默不一致最难查。
+for (const g of groups) {
+  const viaHelper = modelsInGroup(list, g.key).map(m => m.id).sort();
+  const viaRender = g.items.map(m => m.id).sort();
+  check(`组 ${g.key} 的成员：渲染与批量判断一致`,
+        JSON.stringify(viaRender), JSON.stringify(viaHelper));
+}
+check("modelsInGroup 对空/异常输入不抛错",
+      JSON.stringify(modelsInGroup(null, "hy3")), JSON.stringify([]));
+check("modelsInGroup 只返回本组条目",
+      modelsInGroup(list, "hy3").map(m => m.id), ["hy3"]);
 
 console.log(bad ? `=== ${bad} 个失败 ===` : "=== 模型合并分组全部通过 ===");
 process.exit(bad ? 1 : 0);

@@ -106,7 +106,7 @@ function render() {
     const expired = !!k.expires_at && k.expires_at <= now;
     const scope = (list, noun) => (Array.isArray(list) && list.length)
       ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${ROUTING_ICON[routing] || ROUTING_ICON[""]} ${ROUTING_SHORT[routing] || ROUTING_SHORT[""]}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型、可用账号与分配策略">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型、可用账号与分配策略">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
   }).join("");
   renderModels();
   const modelIds = Array.isArray(models?.models) ? models.models.filter(m => m.enabled).map(m => m.id) : [];
@@ -168,9 +168,15 @@ function groupModelsByName(list) {
 }
 const modelBaseName = id => String(id || "").replace(/^trae\//, "");
 
+// 某个同名组包含哪些条目 —— **渲染与批量操作共用这一处判断**。
+// 若两边各算一遍，将来改了归组规则就会「显示 2 条、只操作到 1 条」且界面不报错。
+function modelsInGroup(list, key) {
+  return (Array.isArray(list) ? list : []).filter(m => modelBaseName(m.id) === key);
+}
+
 // 倍率/上下文的统一格式化。倍率保留后端给的精度（0.06 / 0.79 这种不能取整，
-// 否则会丢失免费与付费的区别）。
-const creditsText = m => m.credits === null || m.credits === undefined ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
+// 否则会丢失免费与付费的区别）。0 是「免费」、null 是「按标准计费」，两者必须区分。
+const creditsText = m => !Number.isFinite(m.credits) ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
 const ctxText = m => m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : String(m.max_input_tokens)) : "—";
 
 function renderModelGroup(g) {
@@ -242,6 +248,10 @@ const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完
 // 图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
 const ROUTING_ICON = {"": "↺", round_robin: "↻", random: "⁘", expiry_first: "⏳"};
 const ROUTING_SHORT = {"": "跟随默认", round_robin: "轮转", random: "随机", expiry_first: "快过期优先"};
+// 未知策略值**显示原值**而不是回落到「跟随默认」：回落会把服务端真实的配置
+// 显示成另一个策略，比显示一个陌生的英文词更容易误导。空串（未设置）才回落。
+const routingShort = r => r === "" || r == null ? ROUTING_SHORT[""] : (ROUTING_SHORT[r] || String(r));
+const routingIcon = r => r === "" || r == null ? ROUTING_ICON[""] : (ROUTING_ICON[r] || "•");
 let logOffset = 0, logTotal = 0;
 function renderLogRows(rows) {
   $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
@@ -737,19 +747,26 @@ $("models-body").addEventListener("click", async e => {
   if (batch) {
     const key = batch.dataset.modelGroupToggle;
     const enabled = batch.dataset.enabled === "1";
-    const list = (overview?.models?.models || []).filter(m => modelBaseName(m.id) === key);
+    // 与渲染同一处判断（modelsInGroup），避免「显示两组、只切一组」。
+    const list = modelsInGroup(overview?.models?.models, key);
     const targets = list.filter(m => !!m.enabled !== enabled);
     if (!targets.length) return;
     batch.disabled = true;
     const verb = enabled ? "启用" : "禁用";
+    let done = 0;
     try {
-      // 逐个串行：任一失败要能定位到具体模型，且已成功的保持生效。
+      // 逐个串行：任一失败要能定位到具体模型，已成功的保持生效（PATCH 幂等，可重试）。
       for (const m of targets) {
         await api("models/" + encodeURIComponent(m.id), {method:"PATCH", body:{enabled}});
+        done += 1;
       }
       await refresh();
       toast(`已${verb}「${key}」的 ${targets.length} 个后端条目`);
-    } catch (err) { toast(err.message); batch.disabled = false; await refresh(); }
+    } catch (err) {
+      // 报出「成了几个/共几个」：只说 err.message 会让人以为一个都没动。
+      await refresh();
+      toast(`「${key}」已${verb} ${done}/${targets.length} 个，失败：${err.message}`);
+    }
     return;
   }
   const toggle = e.target.closest("[data-model-toggle]");
@@ -958,9 +975,13 @@ function renderKeyRequests(rows) {
 async function loadKeyRequests(offset) {
   if (!keyReqId) return;
   keyReqOffset = Math.max(0, offset);
+  // 记下这次请求属于哪个密钥/哪一页：快速在密钥间点击时，先发的迟到响应
+  // 会覆盖后发的列表，导致「显示的记录不属于当前密钥」。
+  const requestedId = keyReqId, requestedOffset = keyReqOffset;
   $("key-requests-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
   try {
     const data = await api(`logs?limit=${keyReqSize}&offset=${keyReqOffset}&key_id=${encodeURIComponent(keyReqId)}`);
+    if (requestedId !== keyReqId || requestedOffset !== keyReqOffset) return;  // 已被更新的请求取代
     renderKeyRequests(data.rows);
     const pages = Math.max(1, Math.ceil(data.total / keyReqSize));
     const current = Math.floor(data.offset / keyReqSize) + 1;
@@ -968,6 +989,7 @@ async function loadKeyRequests(offset) {
     $("key-requests-prev").disabled = data.offset <= 0;
     $("key-requests-next").disabled = data.offset + keyReqSize >= data.total;
   } catch (err) {
+    if (requestedId !== keyReqId) return;
     $("key-requests-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }

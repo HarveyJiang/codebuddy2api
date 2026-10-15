@@ -4,11 +4,25 @@
 // 不依赖浏览器：只把要测的几个纯函数抠出来求值。这能抓住模板层面的错误
 // （字段名写错 -> undefined、渲染出 "未知" 徽标、把 0 显示成 ×0 等），
 // 这些正是「在浏览器里看起来不对」的根因。
-import { readFileSync } from "node:fs";
+//
+// 用法：**必须从仓库根目录运行**。数据来源是 WB_TEST_DB 指向的 state.db 所在
+// 目录（默认 /tmp/opencode/v7fresh，即一份迁移过的生产库副本）；拿不到就跳过，
+// 不让环境问题伪装成代码问题。
+import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-const SRC = "/home/openchamber/.local/share/opencode/worktree/e1b214/sprint01-refactor/admin/static/app.js";
+// 相对本文件定位 app.js，避免写死 worktree 的绝对路径。
+const here = dirname(fileURLToPath(import.meta.url));
+const SRC = join(here, "..", "..", "admin", "static", "app.js");
 const src = readFileSync(SRC, "utf8");
+
+const DB_ROOT = process.env.WB_TEST_DB || "/tmp/opencode/v7fresh";
+if (!existsSync(join(DB_ROOT, "management", "state.db"))) {
+  console.log(`跳过：未找到 ${DB_ROOT}/management/state.db（可用 WB_TEST_DB 指定）。`);
+  process.exit(0);
+}
 
 const snippets = [
   /const BACKEND_ICON = \{[\s\S]*?\};\n/,
@@ -39,13 +53,14 @@ const fn = new Function(code + `
 `)();
 
 // 拉真实数据：直接调 overview（复用 stage2_verify 已经验证过的登录方式）。
-const raw = execFileSync("/tmp/opencode/wb-venv/bin/python", [
+const PY = process.env.WB_TEST_PYTHON || "/tmp/opencode/wb-venv/bin/python";
+const raw = execFileSync(PY, [
   "-c", `
 import asyncio, sys, json
-sys.path.insert(0,'/home/openchamber/.local/share/opencode/worktree/e1b214/sprint01-refactor')
+sys.path.insert(0, ${JSON.stringify(join(here, "..", ".."))})
 from pathlib import Path
 import httpx
-ROOT=Path('/tmp/opencode/v7fresh')
+ROOT=Path(${JSON.stringify(DB_ROOT)})
 async def m():
     from admin import server as s
     app=s.create_app(ROOT/'management', ROOT/'auth','sk-test-client-key','admin-key-long-enough-1234')
@@ -66,8 +81,12 @@ const check = (label, cond, extra = "") => {
 
 const groups = fn.groupModelsByName(models);
 console.log(`真实模型 ${models.length} 个 -> ${groups.length} 行（合并掉 ${models.length - groups.length} 行）`);
-check("共 7 组重名被合并", models.length - groups.length === 7,
-      `实际合并 ${models.length - groups.length} 组`);
+// 只断言「有同名被合并」这个不变量，不写死组数：上游模型表会变，
+// 写死 7 会让测试因数据变动而红，那种红与代码质量无关。
+const dupGroups = groups.filter(g => g.items.length > 1);
+check("存在同名模型被合并", dupGroups.length >= 1, "没有任何重名组，合并逻辑可能失效");
+check("所有同名组都恰好包含多个后端",
+      dupGroups.every(g => new Set(g.items.map(m => m.backend)).size === g.items.length));
 
 const html = groups.map(g => fn.renderModelGroup(g)).join("\n");
 check("渲染没有 undefined", !/undefined/.test(html), html.match(/.{0,60}undefined.{0,60}/)?.[0] || "");
