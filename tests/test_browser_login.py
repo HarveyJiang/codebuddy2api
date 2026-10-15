@@ -92,12 +92,10 @@ class BrowserAccountTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = admin_tests.AdminTests.asyncTearDown
     make_app = admin_tests.AdminTests.make_app
     login = admin_tests.AdminTests.login
-    async def test_browser_account_deduplicates_and_preserves_active(self):
+    async def test_browser_account_deduplicates_and_updates(self):
         store = self.app.state.store
-        first = store.data['active']
         r = store.save_browser_account(credential('two'), 'Browser account')
         self.assertFalse(r['updated'])
-        self.assertEqual(store.data['active'], first)
         r2 = store.save_browser_account(credential('two', 'Updated'), None)
         self.assertTrue(r2['updated'])
         self.assertEqual(r['account_id'], r2['account_id'])

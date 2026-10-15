@@ -221,8 +221,6 @@ class AccountPool:
             # backend=None 时不过滤（旧调用/测试）。
             if backend is not None:
                 candidates = [row for row in candidates if row.get("backend", "workbuddy") == backend]
-            if self.store.data["pool"]["routing"] == "manual":
-                candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             now = self.clock()
@@ -231,7 +229,7 @@ class AccountPool:
                 if bindings[key].get("expires", 0) <= now:
                     del bindings[key]
             bound = bindings.get(affinity_key, {}).get("account_id")
-            if bound in {row["id"] for row in candidates} and self.store.data["pool"]["routing"] != "manual":
+            if bound in {row["id"] for row in candidates}:
                 # 亲和默认保持以命中上游缓存；但若绑定账号的最早过期积分离过期还远，
                 # 而其他账号的积分将在阈值内过期，则改绑过去，避免积分白白清零。
                 self.affinity_hits += 1

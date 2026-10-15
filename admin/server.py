@@ -73,7 +73,7 @@ class Store:
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
             self.data.setdefault("model_registry", {})
         else:
-            self.data = {"accounts": {}, "active": None, "keys": {}}
+            self.data = {"accounts": {}, "keys": {}}
             for p in sorted(self.auth_dir.glob("*.info")):
                 try:
                     doc = json.loads(p.read_text(encoding="utf-8"))
@@ -83,12 +83,15 @@ class Store:
                 aid = secrets.token_hex(8)
                 name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
                 self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time()), "backend": doc.get("backend", "workbuddy")}
-                if self.data["active"] is None and not doc.get("disabled"):
-                    self.data["active"] = aid
             if initial_key:
                 self.add_key("原有 API Key", initial_key)
             self.save()
-        self.sync_active()
+        # 旧版"手动 / 测试账号"机制已移除：清掉残留 active 字段，manual 路由回落轮转
+        if self.data.pop("active", None) is not None:
+            self.save()
+        if self.data.get("pool", {}).get("routing") not in (None, "round_robin"):
+            self.data.setdefault("pool", {})["routing"] = "round_robin"
+            self.save()
 
     @staticmethod
     def validate_credential(doc):
@@ -140,17 +143,13 @@ class Store:
                         item["name"] = name
                     self.data.get("account_status", {}).pop(aid, None)
                     self.save()
-                    self.sync_active()
                     return {"account_id": aid, "updated": True}
             if len(self.data["accounts"]) >= 100:
                 raise HTTPException(400, "最多保存 100 个账号")
             aid = secrets.token_hex(8)
             write_json(self.auth_dir / (aid + ".info"), doc)
             self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True, "backend": backend}
-            if self.data["active"] is None:
-                self.data["active"] = aid
             self.save()
-            self.sync_active()
             return {"account_id": aid, "updated": False}
 
     def file_for(self, item):
@@ -158,11 +157,6 @@ class Store:
         if path.parent.resolve() != self.auth_dir.resolve() or path.is_symlink():
             raise HTTPException(400, "凭据路径不合法")
         return path
-
-    def sync_active(self):
-        aid = self.data.get("active")
-        item = self.data["accounts"].get(aid)
-        converter.CONFIG["cred"] = self.manager_for(aid, item) if item and item["enabled"] and self.file_for(item).exists() else None
 
     def manager_for(self, aid, item):
         with self.lock:
@@ -192,7 +186,7 @@ class Store:
         result = []
         for aid, item in self.data["accounts"].items():
             backend = item.get("backend", "workbuddy")
-            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"], "backend": backend}
+            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "created": item["created"], "backend": backend}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
@@ -238,8 +232,6 @@ class Store:
             if added:
                 self.events.appendleft({"time": int(time.time()), "event": "adopt_auth", "count": added})
                 self.save()
-        if added:
-            self.sync_active()
         return added
 
     def add_key(self, name, value=None, daily_limit=None):
@@ -609,7 +601,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         with store.lock:
             settings = dict(store.data["pool"])
             if "routing" in body:
-                if body["routing"] not in ("manual", "round_robin"):
+                if body["routing"] != "round_robin":
                     raise HTTPException(400, "调度方式无效")
                 settings["routing"] = body["routing"]
             if "auto_checkin" in body:
@@ -663,10 +655,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             filename = aid + ".info"
             write_json(store.auth_dir / filename, doc)
             store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True, "backend": backend}
-            if store.data["active"] is None:
-                store.data["active"] = aid
             store.save()
-            store.sync_active()
         return {"id": aid}
 
     @app.post("/admin/api/accounts/adopt")
@@ -918,19 +907,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if type(body["enabled"]) is not bool:
                     raise HTTPException(400, "启用状态不正确")
                 new["enabled"] = body["enabled"]
-            if body.get("active") is True:
-                if not new["enabled"]:
-                    raise HTTPException(400, "请先启用账号")
-                try:
-                    store.validate_credential(json.loads(store.file_for(new).read_text(encoding="utf-8")))
-                except (ValueError, OSError):
-                    raise HTTPException(400, "凭据文件无法读取，请重新导入")
-                store.data["active"] = aid
             store.data["accounts"][aid] = new
-            if not new["enabled"] and store.data["active"] == aid:
-                store.data["active"] = None
             store.save()
-            store.sync_active()
         return {"ok": True}
 
     @app.delete("/admin/api/accounts/{aid}")
@@ -947,10 +925,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 write_json(trash / "credential.json", json.loads(source.read_text(encoding="utf-8")))
             write_json(trash / "metadata.json", item)
             del store.data["accounts"][aid]
-            if store.data["active"] == aid:
-                store.data["active"] = None
             store.save()
-            store.sync_active()
             # Keep the file so an in-flight token refresh may still complete safely.
             # Account storage is authoritative; deleted records cannot be selected.
         return {"ok": True}

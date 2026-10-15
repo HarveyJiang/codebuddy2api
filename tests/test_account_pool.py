@@ -252,7 +252,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError): summarize_packages([{}])
         self.assertEqual(self.pool.state(self.store.account_rows()[0]),'available')
 
-    def test_round_robin_paused_cooling_exhausted_and_manual(self):
+    def test_round_robin_paused_cooling_and_exhausted(self):
         self.assertEqual([self.pool.select()[0] for _ in range(4)],[self.a,self.b,self.a,self.b])
         self.store.data['accounts'][self.a]['enabled']=False
         self.assertEqual(self.pool.select()[0],self.b)
@@ -264,10 +264,8 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException):self.pool.select()
         self.now+=601
         self.assertEqual(self.pool.select()[0],self.b)
-        self.store.data['pool']['routing']='manual';self.store.data['active']=self.a
-        with self.assertRaises(HTTPException):self.pool.select()
 
-    def test_affinity_failover_persistence_expiry_and_manual(self):
+    def test_affinity_failover_persistence_and_expiry(self):
         key = request_affinity({b'authorization': b'Bearer api-test'}, {'model': 'm', 'prompt_cache_key': 'session-one'})
         self.assertEqual([self.pool.select(key)[0] for _ in range(3)], [self.a] * 3)
         self.pool.record(self.a)
@@ -276,9 +274,6 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pool.select(key)[0], self.b)
         self.now += 1801
         self.assertEqual(self.pool.select(key)[0], self.b)
-        self.store.data['pool']['routing'] = 'manual'
-        self.store.data['active'] = self.a
-        self.assertEqual(self.pool.select(key)[0], self.a)
         self.now += 86401
         self.pool.select()
         self.assertNotIn(key, self.store.data['session_bindings'])

@@ -51,20 +51,16 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.client.headers.pop("X-CSRF-Token")
         self.assertEqual((await self.client.post("/admin/api/keys", json={"name": "bad"})).status_code, 403)
 
-    async def test_account_import_switch_disable_delete_and_restart(self):
+    async def test_account_import_rename_disable_delete_and_restart(self):
         await self.login()
         first = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
         result = await self.client.post("/admin/api/accounts", json={"name": "Second", "credential": credential("two")})
         self.assertEqual(result.status_code, 200)
         aid = result.json()["id"]
-        self.assertTrue(first["active"])
-        result = await self.client.patch("/admin/api/accounts/" + aid, json={"active": True})
-        self.assertEqual(result.status_code, 200)
-        self.assertEqual(admin_server.converter.CONFIG["cred"].path.name, aid + ".info")
+        # "手动 / 测试账号"机制已移除：账号行不再有 active 字段。
+        self.assertNotIn("active", first)
         await self.client.patch("/admin/api/accounts/" + aid, json={"enabled": False})
-        self.assertIsNone(admin_server.converter.CONFIG["cred"])
-        self.assertEqual((await self.client.patch("/admin/api/accounts/" + aid, json={"active": True})).status_code, 400)
-        await self.client.patch("/admin/api/accounts/" + first["id"], json={"active": True, "name": "Primary"})
+        await self.client.patch("/admin/api/accounts/" + first["id"], json={"name": "Primary"})
         await self.client.delete("/admin/api/accounts/" + aid)
         self.assertTrue(list((self.root / "management/trash").glob("*/credential.json")))
         await self.client.aclose()
@@ -72,8 +68,25 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         accounts = (await self.client.get("/admin/api/overview")).json()["accounts"]
         self.assertEqual(len(accounts), 1)
-        self.assertTrue(accounts[0]["active"])
+        self.assertNotIn("active", accounts[0])
         self.assertEqual(accounts[0]["name"], "Primary")
+
+    async def test_legacy_manual_active_fields_migrated(self):
+        """旧版"手动 / 测试账号"数据重启后迁移：active 字段清除、manual 路由回落轮转。"""
+        store = self.app.state.store
+        aid = next(iter(store.data["accounts"]))
+        data = json.loads(store.path.read_text(encoding="utf-8"))
+        data["active"] = aid
+        data["pool"]["routing"] = "manual"
+        store.path.write_text(json.dumps(data), encoding="utf-8")
+        await self.client.aclose()
+        self.make_app()
+        await self.login()
+        overview = (await self.client.get("/admin/api/overview")).json()
+        self.assertNotIn("active", overview)
+        self.assertEqual(overview["pool"]["routing"], "round_robin")
+        self.assertTrue(all("active" not in row for row in overview["accounts"]))
+        self.assertNotIn("active", json.loads(store.path.read_text(encoding="utf-8")))
 
     async def test_key_revocation_persists_and_no_secret_leak(self):
         await self.login()
