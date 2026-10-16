@@ -38,6 +38,7 @@ const snippets = [
   /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /function backendBadge\(b\) \{[\s\S]*?\n\}\n/,
   /function groupModelsByName\(list\) \{[\s\S]*?\n\}\n/,
+  /function mergeByDisplayName\(groups\) \{[\s\S]*?\n\}\n/,
   /function modelBaseName\(id\) \{[\s\S]*?\n\}\n/,
   /const creditsText = [^\n]*\n/,
   /const CREDITS_ICON = [^\n]*\n/,
@@ -258,6 +259,26 @@ if (modelHead) {
 }
 check("倍率/上下文列各带行内图标",
       allHtml.includes(fn.CREDITS_ICON) && allHtml.includes(fn.CTX_ICON));
+
+// 跨后端展示名归并出来的行，行名用**官方展示名**（用户 2026-10-16 拍板）。
+// 主组裸名只是其中一个后端的 id（`kimi-k3-1` 这种，还可能正是上游写错的那个），
+// 拿它当跨后端共用名会误导 —— 这行已经不属于那一个后端了。
+const aliasGroups = fn.groupModelsByName([
+  {id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", max_input_tokens: 200000, enabled: true},
+  {id: "trae/kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", max_input_tokens: 200000, enabled: true},
+]);
+const aliasHtml = fn.renderModelGroup(aliasGroups[0]);
+check("归并行行名用官方展示名 Kimi-K3", aliasHtml.includes("<strong>Kimi-K3</strong>"), aliasHtml.slice(0, 160));
+check("归并行同时给出两个后端各自的真实 id",
+      aliasHtml.includes("kimi-k3-1") && aliasHtml.includes("trae/kimi-k3"), aliasHtml.slice(0, 260));
+// 反例守卫：hy3 / hy3-x 同属 WorkBuddy、展示名同为 Hy3，绝不能被合并且行名照旧用裸名。
+const hyGroups = fn.groupModelsByName([
+  {id: "hy3", backend: "workbuddy", credits: 0, name: "Hy3", max_input_tokens: 128000, enabled: true},
+  {id: "hy3-x", backend: "workbuddy", credits: 0.05, name: "Hy3", max_input_tokens: 200000, enabled: true},
+]);
+check("hy3 / hy3-x 不归并（同一后端内除外）", hyGroups.length, 2);
+check("hy3 行名仍是裸名（未被展示名替换，因为它没归并）",
+      fn.renderModelGroup(hyGroups.find(g => g.key === "hy3")).includes("<strong>hy3</strong>"));
 
 console.log(bad ? `=== ${bad} 个失败 ===` : "=== 真实数据渲染全部通过 ===");
 process.exit(bad ? 1 : 0);
