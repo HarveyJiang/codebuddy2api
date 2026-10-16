@@ -667,6 +667,20 @@ $("refresh").addEventListener("click", async () => {
   } else { refresh().catch(e=>toast(e.message)); }
 });
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
+// 查询全部积分（用户拍板：工具栏直接给一个，不用进设置弹框逐个点）。
+// 复用批量动作通道：状态动作里就含积分查询，弹窗逐账号报结果。
+$("batch-credits").addEventListener("click", async () => {
+  $("batch-credits").disabled = true;
+  const original = $("batch-credits").textContent;
+  $("batch-credits").textContent = "查询中…";
+  try {
+    const result = await api("pool/actions/status", {method:"POST"});
+    $("pool-result").hidden = false;
+    $("pool-result").textContent = result.results.map(r => `${overview.accounts.find(a=>a.id===r.id)?.name || "账号"}：${r.message}`).join("；") || "没有启用的账号";
+    await refresh(true); toast("已拉取全部账号积分");
+  } catch (e) { toast(e.message); }
+  finally { $("batch-credits").disabled = false; $("batch-credits").textContent = original; }
+});
 $("dash-add").addEventListener("click", () => openAccount());
 $("dash-add-account").addEventListener("click", () => openAccount());
 $("empty-add").addEventListener("click", () => openAccount());
