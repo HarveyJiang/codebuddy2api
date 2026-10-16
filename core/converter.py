@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import threading
 import time
@@ -103,6 +104,43 @@ _LOSSY_PROJECTION = config.get().lossy_projection
 # client 字段的取值来源（大写 WorkBuddy 为目标值）。
 IDE_TYPE = _PRODUCT_NAME
 USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
+
+
+def _uuid7_fallback_hex() -> str:
+    """UUIDv7 的 32 位 hex 形态（无连字符）——**手工实现，仅供 < 3.14 兜底**。
+
+    布局（RFC 9562 §5.7，高位 → 低位）：
+
+        unix_ts_ms 48 位 │ ver=7 4 位 │ rand_a 12 位 │ var=0b10 2 位 │ rand_b 62 位
+
+    只取时间位、不做同毫秒内的单调递增：上游要的是时刻而不是严格全序，随机位足够。
+    生产镜像已是 3.14，走 :func:`_uuid7_hex` 的内置分支；这条仅为让本地
+    低版本解释器（以及某些 CI 镜像）仍能跑得起来。
+    """
+    ms = time.time_ns() // 1_000_000
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    value = (ms << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b
+    return f"{value:032x}"
+
+
+#: 生产跑 3.14 → 直接用标准库。本地/CI 若低于 3.14 走手工实现兜底。
+_builtin_uuid7 = getattr(uuid, "uuid7", None)
+
+
+def _uuid7_hex() -> str:
+    """生成 X-Request-ID 用的 UUIDv7（32 位 hex，无连字符）。
+
+    ## 为什么是 v7 而不是 v4
+
+    上游按 **UUIDv7 的时间位**还原请求时刻。v4 的那 48 位是随机值、解析不出任何
+    有意义的毫秒数，于是上游要么渲染出错乱的时刻，要么判为不可解析、改用自己
+    那套 ``crb-`` 前缀 ID。v7 把 unix 毫秒时间戳放在最高 48 位，ID 自带时间序，
+    上游不需要额外的时间头就能还原时刻。
+    """
+    if _builtin_uuid7 is not None:
+        return _builtin_uuid7().hex
+    return _uuid7_fallback_hex()
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -252,7 +290,9 @@ class CredentialManager:
             "X-IDE-Version": _PRODUCT_VERSION,
             "X-Product": "SaaS",
             "X-Product-Version": _PRODUCT_VERSION,
-            "X-Request-ID": uuid.uuid4().hex,
+            # UUIDv7：上游从这里还原请求时刻（见 _uuid7_hex 的说明）。
+            # 只作用于 WorkBuddy —— Trae 有自己的 _solo_headers，不走这条路径。
+            "X-Request-ID": _uuid7_hex(),
             "User-Agent": USER_AGENT,
         }
         return h

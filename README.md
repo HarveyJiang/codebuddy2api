@@ -59,7 +59,7 @@
 你需要先满足这 3 个条件：
 
 1. 本机已经安装并登录 **WorkBuddy / CodeBuddy** 桌面端
-2. 本机有 **Python 3.10+**（Docker 使用 Python 3.12）
+2. 本机有 **Python 3.14**（与 Docker 一致；3.14 才内置 `uuid.uuid7()`，见下）
 3. 已安装依赖 `fastapi`、`uvicorn`、`httpx`、`cryptography`
 
 默认会在这些位置寻找登录态：
