@@ -31,20 +31,29 @@ Trae 下线不影响 WorkBuddy。本方案就是把这句话做成用户手里�
 第 8 条的后半句是关键：已绑定的 key 在后端被禁用后，**报错而不串**。
 串到别的后端是隔离不变量要杀的头号行为，报错才是对的。
 
-## 3. 开关存哪：不能进 `settings` 固定列
+## 3. 开关存哪：`settings` 加 JSON 列（用户拍板，2026-10-16）
 
-`settings` 是固定列单行（`SETTINGS_COLUMNS`），「每后端一个开关」装不下——
-这是第 3 个同类实例（前两个：`synced_at` 放进行、`order` 放进 `_REGISTRY` 表内）。
-规律：**凡按后端数量伸缩的东西，一律不进固定结构**。
+原方案写「不能进 `settings` 固定列，要建新表」——**这个判断不精确，收回**。
+v9 的真实教训是「**不能动态发明列名**」（当时第一版写成
+`models_updated_<backend>`，启动报 `no such column: models_updated_trae`
+直接挂掉 `create_app`）；但一个**固定名字、内容按后端伸缩**的 JSON 列，
+根本不会触发这个问题。而且：
 
-推荐：新表 `backend_flags(backend TEXT PK, enabled INTEGER)`。
+- 先例：`keys.models` / `keys.accounts` 就是 JSON 数组存 TEXT；
+- 成本：`save_settings` 本来就是整行重写（全列 `INSERT OR REPLACE`），
+  JSON 读改写不增加任何额外开销；
+- 读取：`get_settings` 整行读进内存，`is_enabled` 在内存里查 map，
+  不需要 SQL 按后端过滤——「SQL 查不方便」不是问题，因为没人这么查。
 
-- 加后端零迁移（新后端首行默认启用，由 `is_enabled` 缺行即启用兜底）。
-- 与环境变量的关系：`CODEBUDDY_ENABLE_TRAE=0` 保留为**最高优先级逃生门**
-  （运维用，不经过 UI）；`is_enabled(name)` = 环境未禁用 **且** 表中未禁用。
-  两处都读它，一处改动全链路生效（现状已是如此）。
-- `is_enabled` 现在只认环境变量，改成同时读表——这是唯一要动的核心函数，
-  其余 9 条路径都是「在这里加一行 `if not is_enabled(...): 跳过`」。
+最终形状（两列，各管一个概念，与 `SETTINGS_COLUMNS` 一列一概念的风格一致）：
+
+- `backend_enabled TEXT NOT NULL DEFAULT '{}'` — `{后端名: 是否启用}`，
+  缺键即启用（新后端零迁移，加行不加列）；
+- `model_backend_order TEXT NOT NULL DEFAULT '[]'` — 全局后端顺序（有序列表），
+  空即注册表顺序（裸名自动选后端方案用，见 `model-routing-by-policy.md` §9.4）。
+
+与环境变量的关系不变：`CODEBUDDY_ENABLE_TRAE=0` 保留为**最高优先级逃生门**
+（运维用，不经过 UI）；`is_enabled(name)` = 环境未禁用 **且** map 中未禁用。
 
 ## 4. 禁用默认后端（WorkBuddy）的后果
 
