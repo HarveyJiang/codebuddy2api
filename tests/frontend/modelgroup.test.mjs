@@ -33,6 +33,7 @@ const code = [
   slice("const creditsText = m =>", ";\n"),
   slice("const ctxText = m =>", ";\n"),
   slice("function renderModelRow(m) {", "\n}"),
+  slice("function batchTargets(rows, enabled) {", "\n}"),
   // 元数据驱动：这几个 helper 是 /admin/api/backends 的唯一消费口。
   slice("let backends = [];", "\n"),
   slice("function applyBackends(list) {", "\n}"),
@@ -42,19 +43,17 @@ const code = [
   slice("const SVG_ALLOWED_TAGS = ", ";\n"),
   slice("const backendIconSvg = b => {", "\n};\n"),
   slice("const esc = v =>", ";\n"),
-  slice("const CREDITS_ICON = ", ";\n"),
-  slice("const CTX_ICON = ", ";\n"),
   slice("let modelsTab = ", ";\n"),
 ].join("\n");
 
 // 页签渲染要写 DOM（$("models-tabs")）；测试里给一个最小的桩，只记录 innerHTML。
 const box = { hidden: false, innerHTML: "" };
 const code2 = code.replace(/const \$ = .*\n/, "");
-const api = new Function("$", code2 + "\nreturn {backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText,"
+const api = new Function("$", code2 + "\nreturn {backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, batchTargets,"
   + " getTab: () => modelsTab, setTab: v => { modelsTab = v; }};")(
   id => (id === "models-tabs" ? box : null)
 );
-const { backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, getTab, setTab } = api;
+const { backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, batchTargets, getTab, setTab } = api;
 // 页签渲染要读 modelsTab 才知道哪个 selected；测「选中态」时先设好再画。
 setTab("workbuddy");
 // 与 GET /admin/api/backends 的返回同构（顺序故意打乱，验证 applyBackends 会排序）。
@@ -148,11 +147,21 @@ check("开关带 backend（去前缀后裸名不唯一确定后端）", row.incl
 check("启用的行按钮为「启用」（点一下禁用）", row.includes('data-enabled="0"'), true);
 check("单行不出现跨后端合并的「N 个后端」话术", row.includes("个后端"), false);
 
+const rowCustom = renderModelRow({ id: "my-model", backend: "trae", credits: null, enabled: true, source: "custom", custom: true });
+// 来源三色（用户 2026-10-16：内置和上游一个色看不出差别）：
+//   内置 = green、自定义 = amber、上游 = 默认灰。这是「内置≠上游」的唯一视觉来源。
+check("内置模型来源 pill 是绿色", renderModelRow({ id: "x", backend: "workbuddy", source: "builtin", enabled: true }).includes('class="pill green"'), true);
+check("上游模型来源 pill 是默认灰", row.includes('class="pill "'), true);
+check("自定义模型来源 pill 是琥珀色", rowCustom.includes('class="pill amber"'), true);
+
 const rowOff = renderModelRow({ id: "hy3", backend: "workbuddy", credits: 0, max_input_tokens: 128000, enabled: false, source: "upstream" });
 check("禁用的行按钮为「禁用」（点一下启用）", rowOff.includes('data-enabled="1"'), true);
 check("倍率 0 显示「免费」", rowOff.includes("免费"), true);
 
-const rowCustom = renderModelRow({ id: "my-model", backend: "trae", credits: null, enabled: true, source: "custom", custom: true });
+// 操作列取消（用户 2026-10-16）：行尾不再有 align-right 的操作单元格，
+// 删除按钮挪进模型名列（.model-name-cell），只有自定义模型有。
+check("单行没有操作列", row.includes("align-right"), false);
+check("自定义删除在模型名列里", rowCustom.includes('class="model-name-cell"') && rowCustom.includes("model-del"), true);
 check("自定义项有删除按钮（带 backend）", rowCustom.includes('data-model-delete="my-model"'), true);
 check("自定义项删除按钮带 backend", rowCustom.includes('data-model-backend="trae"'), true);
 const rowUpstream = renderModelRow({ id: "glm-5.3", backend: "workbuddy", credits: 0.1, enabled: true, source: "upstream" });
@@ -162,6 +171,17 @@ check("上游模型没有删除按钮", rowUpstream.includes("data-model-delete"
 check("倍率 0 显示免费", creditsText({ credits: 0 }), "免费");
 check("倍率 null 显示标准", creditsText({ credits: null }), "标准");
 check("倍率 0.48 原样显示", creditsText({ credits: 0.48 }), "×0.48");
+
+// ---- 批量启用/禁用（操作列取消后的批量入口，在工具栏）----
+// 作用范围 = 当前页签的行；目标 = 状态与目标不一致的那些。
+const batchRows = [
+  { id: "a", backend: "trae", enabled: true },
+  { id: "b", backend: "trae", enabled: false },
+  { id: "c", backend: "trae", enabled: true },
+];
+check("批量启用 → 只取禁用的那 1 条", batchTargets(batchRows, true).map(m => m.id), ["b"]);
+check("批量禁用 → 只取启用的那 2 条", batchTargets(batchRows, false).map(m => m.id).sort(), ["a", "c"]);
+check("全开时批量启用无目标（按钮置灰的依据）", batchTargets(batchRows.filter(m => m.enabled), true).length, 0);
 
 // ---- 4. 被删的那套不能再回来 ----
 // 合并展示的整套（归组 / 行内并排多后端）已随「按上游分页」删除。

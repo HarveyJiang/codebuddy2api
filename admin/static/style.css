@@ -64,14 +64,20 @@
 // 列宽（用户 2026-10-16 重排后的新列序）：
 //   1 模型 2 来源 3 倍率 4 上下文 5 官方描述 6 状态 7 操作
 .models-table{table-layout:fixed}
-.models-table th:nth-child(1),.models-table td:nth-child(1){width:24%}
+/* 6 列：模型（含自定义模型的删除按钮）→ 来源 → 倍率 → 上下文 → 官方描述 → 状态。
+   操作列已取消（用户 2026-10-16）：删除做进模型名列，批量开关在工具栏。 */
+.models-table th:nth-child(1),.models-table td:nth-child(1){width:26%}
 .models-table th:nth-child(2),.models-table td:nth-child(2){width:8%}
-.models-table th:nth-child(3),.models-table td:nth-child(3){width:14%}
+.models-table th:nth-child(3),.models-table td:nth-child(3){width:11%}
 .models-table th:nth-child(4),.models-table td:nth-child(4){width:11%}
-.models-table th:nth-child(5),.models-table td:nth-child(5){width:22%;white-space:normal;overflow-wrap:anywhere;line-height:1.7}
-.models-table th:nth-child(6),.models-table td:nth-child(6){width:9%}
-.models-table th:nth-child(7),.models-table td:nth-child(7){width:12%;text-align:right}
-@media(max-width:1100px){.models-table th:nth-child(1),.models-table td:nth-child(1){width:22%}.models-table th:nth-child(5),.models-table td:nth-child(5){width:24%}}
+.models-table th:nth-child(5),.models-table td:nth-child(5){width:26%;white-space:normal;overflow-wrap:anywhere;line-height:1.7}
+.models-table th:nth-child(6),.models-table td:nth-child(6){width:18%}
+@media(max-width:1100px){.models-table th:nth-child(1),.models-table td:nth-child(1){width:24%}.models-table th:nth-child(5),.models-table td:nth-child(5){width:26%}}
+/* 模型名单元格：id + 展示名 + （仅自定义）删除按钮。删除是次要操作，
+   平时淡显、悬停行才醒目 —— 一列红按钮比数据还抢眼。 */
+.model-name-cell{white-space:normal}
+.model-name-cell .model-del{margin-top:7px;font-size:10px;padding:3px 9px;opacity:.55}
+tr:hover .model-name-cell .model-del{opacity:1}
 /* 状态列即开关：pill 样式复用，但它是 <button> —— 补上「可点」的指针与悬停反馈，
    并清掉 button 的默认边框/背景（全局 button 只有 transition，没有外观重置）。 */
 .model-state-toggle{margin:0;border:0;cursor:pointer}

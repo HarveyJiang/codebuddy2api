@@ -278,8 +278,60 @@ function renderModels() {
   const rows = list.filter(m => m.backend === modelsTab);
   $("models-badge").textContent = rows.filter(m => m.enabled).length + " / " + rows.length;
   $("models-body").innerHTML = rows.map(renderModelRow).join("")
-    || `<tr><td colspan="7" class="muted">${tabs.length ? "该上游暂无模型。" : "没有启用的上游。"}</td></tr>`;
+    || `<tr><td colspan="6" class="muted">${tabs.length ? "该上游暂无模型。" : "没有启用的上游。"}</td></tr>`;
+  paintBatchButtons(rows);
 }
+
+// 批量启用/禁用（用户 2026-10-16 拍板：操作列取消后，批量开关挪到工具栏）。
+// 作用范围 = **当前页签**：页签就是「各管各的」的边界，跨页签的批量操作没有
+// 语义（用户得先选一个上游才知道自己在批量操作谁）。
+// 按钮上有多少可切换的目标就显示成什么样：没有可切目标（全开 → 禁用键没意义）
+// 时置灰，而不是点了之后 toast 一句「无事可做」。
+function batchTargets(rows, enabled) {
+  return rows.filter(m => !!m.enabled !== enabled);
+}
+
+function paintBatchButtons(rows) {
+  for (const [id, enabled] of [["models-batch-enable", true], ["models-batch-disable", false]]) {
+    const btn = $(id);
+    if (!btn) continue;
+    const n = batchTargets(rows, enabled).length;
+    btn.disabled = n === 0;
+    btn.title = n === 0 ? `当前上游没有可${enabled ? "启用" : "禁用"}的模型`
+      : `把当前上游的 ${n} 个模型${enabled ? "启用" : "禁用"}`;
+  }
+}
+
+async function batchToggle(enabled) {
+  const catalog = overview?.models;
+  const rows = (Array.isArray(catalog?.models) ? catalog.models : [])
+    .filter(m => backendIsVisible(m.backend) && m.backend === modelsTab);
+  const targets = batchTargets(rows, enabled);
+  if (!targets.length) return;
+  const verb = enabled ? "启用" : "禁用";
+  if (!confirm(`确定${verb}当前上游的 ${targets.length} 个模型？`)) return;
+  const btn = $(enabled ? "models-batch-enable" : "models-batch-disable");
+  btn.disabled = true;
+  let done = 0;
+  try {
+    // 逐个串行（PATCH 幂等，可重试）：任一失败要能定位，已成功的保持生效。
+    for (const m of targets) {
+      await api("models/" + encodeURIComponent(m.id), {method:"PATCH", body:{enabled, backend: m.backend}});
+      done += 1;
+    }
+    await refresh();
+    toast(`已${verb} ${done} 个模型`);
+  } catch (err) {
+    // 报出「成了几个/共几个」：只说 err.message 会让人以为一个都没动。
+    await refresh();
+    toast(`已${verb} ${done}/${targets.length} 个，失败：${err.message}`);
+  } finally {
+    // refresh() 之后 renderModels 会重算按钮态；这里兜底防 refresh 失败时按钮卡死。
+    btn.disabled = false;
+  }
+}
+$("models-batch-enable").addEventListener("click", () => batchToggle(true));
+$("models-batch-disable").addEventListener("click", () => batchToggle(false));
 
 // 幂等去重用的键：联合主键是 (model_id, backend)，但**渲染前还要再防一手**。
 // 第 3/4 步已把读库改成按行取（`load_model_rows`），同名两行不会再互相覆盖；
@@ -292,11 +344,6 @@ const modelRowKey = m => `${m.backend || ""}\u0000${m.id || ""}`;
 // 否则会丢失免费与付费的区别）。0 是「免费」、null 是「按标准计费」，两者必须区分。
 const creditsText = m => !Number.isFinite(m.credits) ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
 const ctxText = m => m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : String(m.max_input_tokens)) : "—";
-// 倍率/上下文列前的图标：**逐行**显示，同列各行用同一形状，靠对齐读出「这列是什么」。
-// 这样表头就不必再写「倍率」「上下文」两个词（用户 2026-10-16：用了 icon 就别再上文字，
-// 冗余且不友好）。图标是字符不是 emoji，不存在字形盒宽度不一致的问题。
-const CREDITS_ICON = "◭";
-const CTX_ICON = "⌘";
 
 // 当前选中的上游页签。空串表示「还没选过」（首次渲染时由 renderModels 填）。
 let modelsTab = "";
@@ -345,24 +392,33 @@ function paintModelsTabs(tabs, list) {
 // `renderModelGroup` 已删）：合并的理由是「同名两行看着像重复」，而现在它们
 // 分在两个页签里，各管各的，本来就不会同屏。
 function renderModelRow(m) {
+  // 来源三色（用户 2026-10-16：内置和上游一个色看不出差别）：
+  //   上游 = 默认灰、内置 = 绿（来自后端声明，不是用户动的）、自定义 = 琥珀。
   const sourceLabel = {upstream: "上游", builtin: "内置", custom: "自定义"}[m.source] || m.source || "—";
-  const sourceTag = `<span class="pill ${m.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
+  const sourceClass = m.custom ? "amber" : m.source === "builtin" ? "green" : "";
+  const sourceTag = `<span class="pill ${sourceClass}">${esc(sourceLabel)}</span>`;
   const credits = `<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span>`;
   const promoNote = m.promo ? `<small class="cell-note">${esc(m.promo.label)} ×${m.promo.credits}</small>` : "";
   const stateCell = `<button class="pill model-state-toggle${m.enabled ? " green" : ""}"`
     + ` data-model-toggle="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"`
     + ` data-enabled="${m.enabled ? "0" : "1"}"`
     + ` title="点击${m.enabled ? "禁用" : "启用"}「${esc(m.id)}」">${m.enabled ? "启用" : "禁用"}</button>`;
+  // 删除入口（用户 2026-10-16 拍板）：操作列整个取消后，删除**做进模型名列**，
+  // 只有自定义模型有。非自定义的行不渲染按钮（不是隐藏）—— 操作列不存在了，
+  // 「没有按钮」与「不能删」是同一件事。
   const del = m.custom
-    ? `<button class="danger" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}">删除</button>`
+    ? `<button class="danger model-del" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"`
+      + ` title="删除自定义模型「${esc(m.id)}」">删除</button>`
     : "";
-  // 列序与表头一致：模型 → 来源 → 倍率 → 上下文 → 官方描述 → 状态 → 操作。
-  return `<tr><td><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small></td>`
+  // 列序与表头一致：模型（含删除）→ 来源 → 倍率 → 上下文 → 官方描述 → 状态。
+  // 表头已改为**文字**（倍率 / 上下文）：行内不再画列图标 —— 页签已经区分了
+  // 上游，行内那一对 ◭/⌘ 每行重复一遍是噪声（用户拍板）。
+  return `<tr><td class="model-name-cell"><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small>${del}</td>`
     + `<td>${sourceTag}</td>`
-    + `<td><span class="model-id-line">${CREDITS_ICON}</span>${credits}${promoNote}</td>`
-    + `<td><span class="model-id-line">${CTX_ICON}</span><span class="mono">${esc(ctxText(m))}</span></td>`
+    + `<td>${credits}${promoNote}</td>`
+    + `<td><span class="mono">${esc(ctxText(m))}</span></td>`
     + `<td class="model-desc-cell">${esc(m.description || "—")}</td>`
-    + `<td>${stateCell}</td><td class="align-right">${del}</td></tr>`;
+    + `<td>${stateCell}</td></tr>`;
 }
 
 function renderDashboard() {

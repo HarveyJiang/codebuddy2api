@@ -37,8 +37,6 @@ const snippets = [
   /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /function backendBadge\(b\) \{[\s\S]*?\n\}\n/,
   /const creditsText = [^\n]*\n/,
-  /const CREDITS_ICON = [^\n]*\n/,
-  /const CTX_ICON = [^\n]*\n/,
   /const ctxText = [^\n]*\n/,
   // 按上游分页后的两个渲染函数（合并展示的 groupModelsByName / renderModelGroup
   // 已随用户拍板删除，这里不再抽）。
@@ -46,6 +44,8 @@ const snippets = [
   /function visibleBackends\(\) \{[\s\S]*?\n\}\n/,
   /function paintModelsTabs\(tabs, list\) \{[\s\S]*?\n\}\n/,
   /function renderModelRow\(m\) \{[\s\S]*?\n\}\n/,
+  /function batchTargets\(rows, enabled\) \{[\s\S]*?\n\}\n/,
+  /function paintBatchButtons\(rows\) \{[\s\S]*?\n\}\n/,
   /let modelsTab = [^\n]*\n/,
   /function renderModels\(\) \{[\s\S]*?\n\}\n/,
   /const stamp = [^\n]*\n/,
@@ -68,7 +68,7 @@ const fn = new Function("$", "overview", code + `
   return {renderModelRow, backendIsVisible, visibleBackends, paintModelsTabs, renderModels, applyBackends, esc,
           backendIconSvg, backendBadge,
           backendsForTest: () => backends, getTab: () => modelsTab, setTab: v => { modelsTab = v; },
-          getDom: () => dom, CREDITS_ICON, CTX_ICON};
+          getDom: () => dom, batchTargets, paintBatchButtons};
 `)($, undefined);
 
 // 注入与 GET /admin/api/backends 同构的元数据（真实服务返回的就是这份形状）。
@@ -280,21 +280,21 @@ check("自定义模型的操作列有删除按钮",
 
 // ---- 行体 td 数与表头一致（重排列时最容易漏改表头，页面不报错只是永久错位） ----
 const cellCount = (onRow.match(/<td/g) || []).length;
-check("模型行恰好 7 个 td", cellCount === 7, `实际 ${cellCount} 个`);
+check("模型行恰好 6 个 td（操作列已取消）", cellCount === 6, `实际 ${cellCount} 个`);
 const indexHtml = readFileSync(join(here, "..", "..", "admin", "static", "index.html"), "utf8");
 const modelHead = /<table class="models-table">[\s\S]*?<thead><tr>([\s\S]*?)<\/tr><\/thead>/.exec(indexHtml);
 check("模型表有 class=\"models-table\"（列宽靠它按 nth-child 定）", Boolean(modelHead));
 if (modelHead) {
   const heads = [...modelHead[1].matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)].map(m => m[1].trim());
-  check("表头 7 列且列序为 模型/来源/◭/⌘/官方描述/状态/操作",
-        heads.length === 7 && heads[4] === "官方描述" && heads[5] === "状态",
+  check("表头 6 列且列序为 模型/来源/倍率/上下文/官方描述/状态",
+        heads.length === 6 && heads[2] === "倍率" && heads[3] === "上下文长度"
+        && heads[4] === "官方描述" && heads[5] === "状态",
         JSON.stringify(heads));
-  check("倍率/上下文表头是图标而非文字（免得与行内图标重复）",
-        heads[2] !== "倍率" && heads[3] !== "上下文", JSON.stringify(heads.slice(2, 4)));
+  check("没有「操作」表头（操作列已取消）", !heads.includes("操作"), JSON.stringify(heads));
   check("表头列数 == 行体 td 数", heads.length === cellCount, `表头 ${heads.length} / 行体 ${cellCount}`);
 }
-check("倍率/上下文列各带行内图标",
-      onRow.includes(fn.CREDITS_ICON) && onRow.includes(fn.CTX_ICON));
+check("行内不再画列图标（◭/⌘ 已随文本表头删除）",
+      !onRow.includes("◭") && !onRow.includes("⌘"));
 check("官方描述在第 5 个 td", /<td class="model-desc-cell">/.test(onRow));
 
 // 页签条容器必须在 HTML 里（否则 JS 找不到它，整页静默不渲染页签）。
