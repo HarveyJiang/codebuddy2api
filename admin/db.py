@@ -283,7 +283,32 @@ def _v13_to_v14(db):
         db._write.execute("ALTER TABLE models ADD COLUMN canonical TEXT")
 
 
-SCHEMA_VERSION = 14
+def _v14_to_v15(db):
+    """v14 → v15：settings 补裸名路由的两列（specs/model-routing-by-policy.md §5/§9.4）。
+
+    - ``model_backend_order``：用户调序（JSON 列表）。**NULL = 未配置** = 用注册表
+      顺序。空列表与 NULL 同义（`_validate_backend_order` 把 [] 归一成 None）。
+    - ``bare_name_routing``：裸名自动选后端的 kill switch（§8 阶段三）。
+      **默认 1 = 开**（用户拍板，照 §8 原文）。
+
+    **为什么默认开**：与 `queue_failover`（默认关）的差异是**有意**的——那个会
+    **重放整个请求**，失败代价是重复计费；裸名路由只是「选哪个后端」，选错的最大
+    后果是走到另一个同样能服务该模型的后端。影响面性质不同，默认值也就不同。
+
+    加的是**列**而不是 JSON 里的一个键：这两项有固定形状（一个列表、一个布尔），
+    不像 `backend_enabled` 那样随后端数量变化，塞进 JSON 只会丢掉「NULL = 未配置」
+    这个有用的语义（JSON 里区分「缺键」与「显式空」要额外约定）。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    if "model_backend_order" not in columns:
+        # 可空是设计：NULL = 跟随注册表顺序（用户从没调过序）。
+        db._write.execute("ALTER TABLE settings ADD COLUMN model_backend_order TEXT")
+    if "bare_name_routing" not in columns:
+        db._write.execute(
+            "ALTER TABLE settings ADD COLUMN bare_name_routing INTEGER NOT NULL DEFAULT 1")
+
+
+SCHEMA_VERSION = 15
 
 
 MICRO = 1_000_000
@@ -483,7 +508,9 @@ class Database:
             guard_daily_token_limit INTEGER NOT NULL DEFAULT 0,
             guard_daily_credit_limit INTEGER NOT NULL DEFAULT 0,
             guard_model_daily_token_limit INTEGER NOT NULL DEFAULT 0,
-            models_updated INTEGER NOT NULL DEFAULT 0)""",
+            models_updated INTEGER NOT NULL DEFAULT 0,
+            model_backend_order TEXT,
+            bare_name_routing INTEGER NOT NULL DEFAULT 1)""",
         """CREATE TABLE IF NOT EXISTS session_bindings (
             affinity_key TEXT PRIMARY KEY, account_id TEXT NOT NULL,
             expires INTEGER NOT NULL)""",
@@ -665,7 +692,7 @@ class Database:
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
-                  (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14))
+                  (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -706,6 +733,10 @@ class Database:
         "backup_last_at", "backup_last_name",
         "guard_reserve_credits", "guard_daily_token_limit",
         "guard_daily_credit_limit", "guard_model_daily_token_limit",
+        # 裸名路由（specs/model-routing-by-policy.md §5/§9.4）。
+        # model_backend_order 在库里是 NULL 或 JSON 文本（列表），经 _load 归一成
+        # 「list 或 None」；bare_name_routing 是 0/1，经 _load 归一成 bool。
+        "model_backend_order", "bare_name_routing",
     )
 
     def get_settings(self, defaults=None):

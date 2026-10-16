@@ -161,6 +161,72 @@ def _dumps_backend_flags(flags: dict) -> str:
     return json.dumps({k: bool(v) for k, v in flags.items()}, sort_keys=True)
 
 
+def _decode_backend_order(raw):
+    """`model_backend_order` 落库形态 → 内存形态（``list`` 或 ``None``）。
+
+    落库是 JSON 文本（或 NULL），内存必须是**列表或 None** —— 见 `Store._load` 里
+    「为什么必须归一」的说明。脏值一律当「未配置」（回落注册表顺序）：顺序读坏了
+    退回默认顺序是最安全的降级，而顺序本身不是安全边界（价格红线与候选集另有
+    判定），不必像总闸那样朝「全启用」偏。
+
+    只保留字符串项并去重保序；未知后端名**不在这里过滤** —— 那是
+    `build_order` 的职责（它才知道注册表，且要保证「配置里没提到的追加到末尾」）。
+    """
+    if isinstance(raw, list):        # 兼容已解好的形态（测试与内存直塞）
+        data = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(data, list):
+            return None
+    else:
+        return None
+    order, seen = [], set()
+    for name in data:
+        if isinstance(name, str) and name not in seen:
+            seen.add(name)
+            order.append(name)
+    return order or None
+
+
+def _dumps_backend_order(order):
+    """内存形态 → 落库形态：列表存 JSON 文本，None 存 NULL（= 未配置）。"""
+    if not order:
+        return None
+    return json.dumps(list(order), ensure_ascii=False)
+
+
+def _validate_backend_order(raw):
+    """校验 `settings.model_backend_order`，返回落库用的列表（或 None = 未配置）。
+
+    规则（与 §9.4 / 施工图「决策」表一致）：
+
+    - ``None`` / ``[]`` → **清除配置**（回到注册表顺序）。留空 = 跟随默认，
+      与 `_routing_for` 的「单 key 留空即跟随全局」同一口径。
+    - 必须是字符串列表；未知后端名**报错**而不是忽略 —— 与
+      `_validate_backend_flags` 同理：静默忽略会让用户以为调了一个不存在的后端，
+      而排序看起来「没生效」却毫无提示（比报错难排得多）。
+    - 重复项**去重并保序**：重复没有语义，保留会让 `rank()` 的位次计算变得难以解释。
+    - **不校验覆盖完整性**：没提到的后端由 `build_order` 追加到末尾（它才是
+      顺序的权威组装处），这里只做形状与合法性检查，不重复实现那条规则。
+    """
+    if raw is None or raw == []:
+        return None
+    if not isinstance(raw, list):
+        raise HTTPException(400, "后端顺序需为列表")
+    known = list(known_backends())
+    order, seen = [], set()
+    for name in raw:
+        if not isinstance(name, str) or name not in known:
+            raise HTTPException(400, f"未知后端：{name}")
+        if name not in seen:
+            seen.add(name)
+            order.append(name)
+    return order or None
+
+
 def _validate_backend_flags(raw, store) -> str:
     """校验总闸提交，返回落库用的 JSON 串。非法即 400（不静默改写）。
 
@@ -291,6 +357,15 @@ class Store:
         self._backend_flags = _decode_backend_flags(self.data["pool"].get("backend_enabled"))
         self._backend_flags = self._guard_enabled_invariant(self._backend_flags)
         self.data["pool"]["backend_enabled"] = _dumps_backend_flags(self._backend_flags)
+        # 裸名路由两项要**归一成内存形态**（§5/§9.4）：库里 model_backend_order 是
+        # JSON 文本（或 NULL），bare_name_routing 是 0/1。不归一的后果是
+        # `build_order(configured='["trae",...]')` 会按**字符串**逐字符遍历（得到
+        # 一堆单字符的「后端名」），而 `get("bare_name_routing", True)` 拿到 0 时
+        # 判为假、拿到 '0' 时判为真 —— 两种都是静默错，最难查。
+        self.data["pool"]["model_backend_order"] = _decode_backend_order(
+            self.data["pool"].get("model_backend_order"))
+        self.data["pool"]["bare_name_routing"] = bool(
+            self.data["pool"].get("bare_name_routing", 1))
         self.data["session_bindings"] = self.db.load_bindings()
 
     def _migrate_state_json(self):
@@ -363,6 +438,19 @@ class Store:
             self.save()
         legacy.rename(legacy.with_suffix(".json.migrated"))
 
+    def _save_settings(self, values):
+        """`save_settings` 的包装：把**内存形态**的 pool 设置编码成**落库形态**。
+
+        目前只有 `model_backend_order` 需要转换（内存里是 list、库里是 TEXT/JSON 或
+        NULL）。放在这里而不是让内存持有 JSON 串，是因为内存里的消费者
+        （`build_order`）要的是列表 —— 让内存迁就存储格式，等于把这个格式泄漏给
+        每一个读者（`build_order` 得自己判断「这是串还是列表」，漏一处就是静默错：
+        按字符串逐字符遍历，得到一堆单字符的「后端名」）。
+        """
+        payload = dict(values)
+        payload["model_backend_order"] = _dumps_backend_order(values.get("model_backend_order"))
+        return self.db.save_settings(payload)
+
     @staticmethod
     def validate_credential(doc):
         if not isinstance(doc, dict) or not isinstance(doc.get("auth"), dict) or not isinstance(doc.get("account"), dict):
@@ -408,7 +496,7 @@ class Store:
                 # 放同一事务：keys 落库而历史没落库会造成两边不一致。
                 self.db.save_key_usage_daily(self.data["keys"])
                 self.keys_dirty = False
-                for key, dump, load in (("pool", self.db.save_settings, None),
+                for key, dump, load in (("pool", self._save_settings, None),
                                         ("session_bindings", self.db.save_bindings, None)):
                     value = self.data.get(key)
                     if value != self._dirty.get(key, _MISSING):
@@ -1592,6 +1680,16 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 settings["backend_enabled"] = flags_json
                 # 同步内存 map：registry 立刻生效，不必等落库/重启。
                 store.set_backend_flags(_decode_backend_flags(flags_json))
+            # ---- 裸名路由（specs/model-routing-by-policy.md §5 / §9.4）--------
+            if "bare_name_routing" in body:
+                if type(body["bare_name_routing"]) is not bool:
+                    raise HTTPException(400, "裸名自动选后端开关无效")
+                settings["bare_name_routing"] = bool(body["bare_name_routing"])
+            if "model_backend_order" in body:
+                # 内存里保持**列表形态**（build_order 的入参），落库形态由
+                # `save_settings` 前的 `_encode_for_db` 统一转换 —— 见下面的包装。
+                settings["model_backend_order"] = _validate_backend_order(
+                    body["model_backend_order"])
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}

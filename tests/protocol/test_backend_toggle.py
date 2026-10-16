@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from admin.server import Store, create_app
+from admin.server import Store, create_app, _decode_backend_order
 from core.backends import registry
 from core.backends.base import BackendSpec
 
@@ -210,6 +210,132 @@ class _StoreFixture(unittest.TestCase):
 # --------------------------------------------------------------------------
 # 3. 不变量：启用集合恒 ≥ 1
 # --------------------------------------------------------------------------
+
+class _BareRoutingSettingsApiTests(unittest.TestCase):
+    """`model_backend_order` / `bare_name_routing` 的设置入口（§9.4 / §8 阶段三）。
+
+    **为什么必须有**：实测发现原实现的白名单里没有这两个键 —— 提交返回 200 却
+    什么都不存，表现为「调了序但落点没变」。这类「静默 no-op」行为测试抓不住
+    （顺序没被改过，请求落点自然不变，与「生效了但恰好还是原后端」无法区分），
+    所以直接在接口层断言「存进去了」。
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.auth = self.root / "auth"
+        self.auth.mkdir()
+        self.app = create_app(str(self.root / "mgmt"), str(self.auth), API, ADMIN)
+        # https：管理 cookie 带 Secure，http 下浏览器语义不回传（实测 401）。
+        self.client = TestClient(self.app, base_url="https://console.test")
+        login = self.client.post("/admin/api/login", json={"key": ADMIN})
+        self.headers = {"X-CSRF-Token": login.json()["csrf"]}
+
+    def tearDown(self):
+        registry.set_enabled_provider(None)
+        self.client.close()
+
+    def test_order_round_trips_through_the_api(self):
+        r = self.client.patch("/admin/api/pool/settings",
+                              json={"model_backend_order": ["trae", "workbuddy"]},
+                              headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        # 内存里必须是**列表**（build_order 的入参），不是 JSON 串。
+        self.assertEqual(self.app.state.store.data["pool"]["model_backend_order"],
+                         ["trae", "workbuddy"])
+        # 且真的落库了（save 之后重读）。
+        self.assertEqual(
+            _decode_backend_order(self.app.state.store.db.get_settings()["model_backend_order"]),
+            ["trae", "workbuddy"])
+
+    def test_order_can_be_cleared_back_to_default(self):
+        """置空 = 回到注册表顺序（NULL 语义）。"""
+        self.client.patch("/admin/api/pool/settings",
+                          json={"model_backend_order": ["trae", "workbuddy"]},
+                          headers=self.headers)
+        r = self.client.patch("/admin/api/pool/settings",
+                              json={"model_backend_order": None}, headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(self.app.state.store.data["pool"]["model_backend_order"])
+        self.assertIsNone(self.app.state.store.db.get_settings()["model_backend_order"])
+
+    def test_unknown_backend_in_order_is_rejected(self):
+        r = self.client.patch("/admin/api/pool/settings",
+                              json={"model_backend_order": ["ghost"]},
+                              headers=self.headers)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("ghost", r.json()["detail"])
+
+    def test_kill_switch_round_trips(self):
+        r = self.client.patch("/admin/api/pool/settings",
+                              json={"bare_name_routing": False}, headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        # 内存里是 bool（不是 0/1 整数），生成器与路由都按真值判断。
+        self.assertIs(self.app.state.store.data["pool"]["bare_name_routing"], False)
+        self.assertEqual(self.app.state.store.db.get_settings()["bare_name_routing"], 0)
+
+    def test_kill_switch_rejects_non_bool(self):
+        r = self.client.patch("/admin/api/pool/settings",
+                              json={"bare_name_routing": "no"}, headers=self.headers)
+        self.assertEqual(r.status_code, 400)
+
+    def test_order_from_db_is_normalized_to_a_list_in_memory(self):
+        """从库里读出来后，内存里的 `model_backend_order` 必须是**列表**。
+
+        `Store._load` 把 DB 的 JSON 文本归一成 list。若去掉那步归一，`build_order`
+        会收到 `'["trae","workbuddy"]'` 这个**字符串** —— 遍历它得到一堆单字符的
+        「后端名」，排序静默错乱（不报错、不崩溃，只是顺序永远是默认）。
+        所以这里断言**类型**，而不只是「能读出来」。
+        """
+        root = Path(tempfile.mkdtemp())
+        auth = root / "auth"
+        auth.mkdir()
+        # 先建库并写入调序（DB 里存 JSON 文本）。
+        app = create_app(str(root / "mgmt"), str(auth), API, ADMIN)
+        client = TestClient(app, base_url="https://console.test")
+        login = client.post("/admin/api/login", json={"key": ADMIN})
+        client.patch("/admin/api/pool/settings",
+                     json={"model_backend_order": ["trae", "workbuddy"]},
+                     headers={"X-CSRF-Token": login.json()["csrf"]})
+        client.close()
+
+        # 重启（重新 create_app 读同一个库）→ 内存里应是 list。
+        again = create_app(str(root / "mgmt"), str(auth), API, ADMIN)
+        try:
+            value = again.state.store.data["pool"].get("model_backend_order")
+            self.assertIsInstance(value, list, f"内存里应是 list，实际是 {type(value)}")
+            self.assertEqual(value, ["trae", "workbuddy"])
+        finally:
+            registry.set_enabled_provider(None)
+
+    def test_kill_switch_from_db_is_normalized_to_bool(self):
+        """库里的 0（INTEGER）读进内存后必须是 `False`（bool）而不是 0。
+
+        `build_order`/`_resolve_backend_for` 用 `if not ...` 真值判断，0 与 False
+        在这里等价；但 `_dumps_backend_order` 那类以为「内存是布尔」的代码一旦遇到
+        整数会出错。断言类型是为了让「库里是 INTEGER」这件事止步于 `_load`。
+        """
+        root = Path(tempfile.mkdtemp())
+        auth = root / "auth"
+        auth.mkdir()
+        app = create_app(str(root / "mgmt"), str(auth), API, ADMIN)
+        client = TestClient(app, base_url="https://console.test")
+        login = client.post("/admin/api/login", json={"key": ADMIN})
+        client.patch("/admin/api/pool/settings", json={"bare_name_routing": False},
+                     headers={"X-CSRF-Token": login.json()["csrf"]})
+        client.close()
+
+        again = create_app(str(root / "mgmt"), str(auth), API, ADMIN)
+        try:
+            value = again.state.store.data["pool"].get("bare_name_routing")
+            self.assertIsInstance(value, bool, f"内存里应是 bool，实际是 {type(value)}")
+            self.assertFalse(value)
+        finally:
+            registry.set_enabled_provider(None)
+
+    def test_kill_switch_defaults_to_enabled(self):
+        """没配过时 pool settings 里 `bare_name_routing` 是 True（§8 阶段三默认开）。"""
+        self.assertTrue(self.app.state.store.data["pool"].get("bare_name_routing", True))
+
 
 class _ToggleApiTests(unittest.TestCase):
     """走真实 HTTP 打 PATCH /admin/api/pool/settings。
