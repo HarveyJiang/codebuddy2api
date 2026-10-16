@@ -456,7 +456,7 @@ function renderModelRow(m) {
   // 行内那一对 ◭/⌘ 每行重复一遍是噪声（用户拍板）。
   return `<tr><td class="model-check-cell"><input type="checkbox" class="model-check"`
     + ` data-model-key="${esc(key)}" aria-label="选择 ${esc(m.id)}"></td>`
-    + `<td class="model-name-cell"><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small>${del}</td>`
+    + `<td class="model-name-cell"><span class="model-name-line"><strong>${esc(m.id)}</strong>${del}</span><small class="cell-note">${esc(m.name || "")}</small></td>`
     + `<td>${sourceTag}</td>`
     + `<td>${credits}${promoNote}</td>`
     + `<td><span class="mono">${esc(ctxText(m))}</span></td>`
@@ -465,7 +465,10 @@ function renderModelRow(m) {
 }
 
 // 行的唯一键：id + backend。同名模型跨后端各占一行，单凭 id 区分不开。
-const modelKey = m => m.backend ? `${m.backend}\u0000${m.id}` : m.id;
+// 分隔符用 " "（空格）：模型 id 与后端名都不含空格；不能用 \u0000 ——
+// HTML 解析器会把属性值里的 NUL 替换成 U+FFFD，dataset 读回来就对不上
+// 了（批量按钮永远置灰的真因，用户 2026-10-16 报告）。
+const modelKey = m => m.backend ? `${m.backend} ${m.id}` : m.id;
 
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
