@@ -568,7 +568,7 @@ function renderAccounts() {
     // 行首小 icon（用户 2026-10-16：39px 方块太大，改小号内联图标贴在账户名前）。
     const kindIcon = `<span class="account-icon-backend account-icon-inline" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${backendIconSvg(a.backend)}</span>`;
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<div><strong>${esc(a.name)}</strong>${backendTag(a.backend)}${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<div><strong>${esc(a.name)}</strong>${backendTag(a.backend)}${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="7" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -592,9 +592,6 @@ function openAccountDetail(a) {
     ["积分更新时间", stampOr(a.credits_updated)],
     ["3 天内到期", a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon)],
     ["最早一批过期", stampOr(a.earliest_expiry)],
-    ["预计过期浪费", a.expire_unused ? creditsFmt(a.expire_unused) : "—"],
-    ["日耗估算", a.daily_rate ? creditsFmt(a.daily_rate) : "—"],
-    ["预计用完天数", a.days_to_empty === null || a.days_to_empty === undefined ? "—" : String(a.days_to_empty)],
     ["今日已签到", yes(a.today_checked_in)],
     ["签到时段", a.checkin_slot ? `${a.checkin_slot} ${a.checkin_when || ""}` : "—"],
     ["冷却至", a.cooldown_until > Date.now()/1000 ? stamp(a.cooldown_until*1000) : "—"],
@@ -606,8 +603,11 @@ function openAccountDetail(a) {
   ];
   $("account-detail-title").textContent = a.name || "账号详情";
   $("account-detail-sub").textContent = `${backendName(a.backend)} 账号 · ${a.id}`;
+  // 每对 dt+dd 直接铺进 grid（auto 1fr）→ dt 属性在左列、dd 值在右列。
+  // 不能再包 <div>：包一层就变成「一个键值对占一格」，dt/dd 在格内上下堆叠
+  // （用户 2026-10-16 报告「表格上下显示数据」的真因）。
   $("account-detail-body").innerHTML = rows.map(([k, v]) =>
-    `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("");
+    `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
   $("account-detail-dialog").showModal();
 }
 async function refresh(loadCredits) {
