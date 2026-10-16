@@ -138,8 +138,8 @@ Trae 可下线）。「默认后端」只是无归属字符串的兜底默认值
 
 | 位置 | 改动 |
 |---|---|
-| `admin/db.py` | 新表 `backend_flags` + 读写方法；迁移（建表，无回填，缺行即启用） |
-| `core/backends/registry.py` | `is_enabled` 同时读表（需把 Store/DB 引用传进去或回调注入——registry 目前不依赖 admin 层，**不能顶部 import**，用回调参数或懒引用） |
+| `admin/db.py` | `settings` 加两个 JSON 列 `backend_enabled` / `model_backend_order`（§3）；迁移只加列，无回填 |
+| `core/backends/registry.py` | `is_enabled` 同时读内存里的 `backend_enabled` map（需把 Store/DB 引用传进去或回调注入——registry 目前不依赖 admin 层，**不能顶部 import**，照抄 `set_catalog_provider` 的注入模式） |
 | `admin/models.py` | `fetch`/`refresh_catalog` 跳过禁用后端 |
 | `admin/pool.py` | `tick` 的签到/刷新候选过滤禁用后端账号 |
 | `admin/server.py` | key 绑定选择接口过滤；设置页读写总闸的 API（含**非空校验**，见 §4.1） |

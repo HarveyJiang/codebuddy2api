@@ -180,7 +180,8 @@
 
 > 注：本节最初按「查表替代内存 registry」设计（v2 迁移），实际落地时
 > `ModelRegistry` 保留内存态、表只做持久化。`canonical` 列待排期后以迁移加入
-> （加列，幂等，安全类型；注意线上已到 v10，`canonical` 加入时版本号顺延）。
+> （加列，幂等，安全类型；注意线上当前是 **v9**，`models.backend`（归属方案）
+先落、`canonical` 后落，版本号按实际顺序顺延）。
 > 落地时前端 `groupModelsByName` 的分组键从 `modelBaseName(id)` 切换为
 > `canonical || modelBaseName(id)`——Kimi K3 这类跨后端别名才合得进同一组。
 
