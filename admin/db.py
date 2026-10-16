@@ -849,7 +849,12 @@ class Database:
         result = {}
         for row in self.query(sql):
             item = {key: row[key] for key in row.keys()}
-            item["credits"] = _from_micro(item.pop("credits_micro", None))
+            # 精确值（整数 micro）**保留**在内存里：路由层的价格红线要精确比较
+            # （specs/model-routing-by-policy.md §9.3：用户明确要求「精确比较」，
+            # float 比较会引入误差）。显示层继续用下面的 float `credits`——
+            # 两者是同一个 DB 值，只是精度不同，不新增存储。
+            item["credits_micro"] = item.get("credits_micro")
+            item["credits"] = _from_micro(item.get("credits_micro"))
             result[row["model_id"]] = item
         return result
 
@@ -865,6 +870,14 @@ class Database:
         marks = ", ".join(["?"] * len(columns))
         rows = []
         for mid, item in models.items():
+            # 单价**只从 float `credits` 换算**，不认 `credits_micro` 入参。
+            #
+            # 曾经想过「有精确值就原样写回」，实测证明那是**多余的**：
+            # `_to_micro(_from_micro(m)) == m` 对全部 micro 取值恒成立
+            # （穷举 0..2e6 零例外），所以两种写法结果逐位相同。
+            # 留一个不可测的分支只会让人以为它有用 —— 不写。
+            # `load_models` 仍保留 `credits_micro` 给**路由层精确比较**用
+            # （§9.3），那是读路径的事，与写入无关。
             rows.append((mid,
                          str(item.get("name") or mid), item.get("description"),
                          _to_micro(item.get("credits")),

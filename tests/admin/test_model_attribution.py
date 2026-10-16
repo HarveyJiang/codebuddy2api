@@ -375,6 +375,59 @@ class MigrationTests(unittest.TestCase):
         finally:
             again.close()
 
+    def test_load_models_keeps_exact_credits_micro(self):
+        """`load_models` 同时给出精确整数 `credits_micro` 与 float `credits`。
+
+        路由的价格红线要精确比较（§9.3），而显示层要 float。同一个 DB 值两种精度，
+        不新增存储 —— 这条钉住「两个都在」。
+        """
+        path = self.root / "micro.db"
+        db = Database(path)
+        try:
+            db.save_models({"glm-5.3": {"name": "GLM-5.3", "backend": "workbuddy",
+                                        "credits": 0.79}})
+            item = db.load_models()["glm-5.3"]
+            self.assertEqual(item["credits_micro"], 790_000)
+            self.assertEqual(item["credits"], 0.79)
+            self.assertIsInstance(item["credits_micro"], int)
+        finally:
+            db.close()
+
+    def test_save_models_cost_is_stable_across_repeated_persist(self):
+        """反复 persist 不得改变单价（这是「原样写回」担心的那个漂移，实测为零）。
+
+        跑多轮 `save_models(load_models())`，`credits_micro` 必须逐位不变。
+        实测 `_to_micro(_from_micro(m)) == m` 恒成立，所以这条是**回归守卫**：
+        将来若有人改成 `int(x * 1e6)`（截断）或换换算基准，它会立刻红。
+        """
+        path = self.root / "drift.db"
+        db = Database(path)
+        try:
+            db.save_models({"m": {"name": "M", "backend": "workbuddy", "credits": 0.000249}})
+            first = db.load_models()["m"]["credits_micro"]
+            self.assertEqual(first, 249, "float 换算走 round 语义（不是截断的 248）")
+            for _ in range(5):
+                db.save_models(db.load_models())
+            self.assertEqual(db.load_models()["m"]["credits_micro"], first,
+                             "反复 persist 后精确值不得漂移")
+        finally:
+            db.close()
+
+    def test_snapshot_carries_credits_micro_matching_the_db(self):
+        """`snapshot()` 的 `credits_micro` 必须与写库的换算**逐位一致**（不是第二份真相）。
+
+        用 `0.000249`：`_to_micro`（round）= 249，而 `int(credits * 1e6)`（trunc）= 248。
+        若有人把 snapshot 改成自己 round（`int()` 截断这类），这条会红。
+        """
+        from admin.db import _to_micro
+
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        registry.add("exact-model", credits=0.000249)
+        snap = {m["id"]: m for m in registry.snapshot()["models"]}
+        self.assertEqual(snap["exact-model"]["credits_micro"], _to_micro(0.000249))
+        self.assertEqual(snap["exact-model"]["credits_micro"], 249)
+
 
 class SortOrderTests(unittest.TestCase):
     """四层排序（§6）：来源 → 归属 → 启用 → 倍率。"""

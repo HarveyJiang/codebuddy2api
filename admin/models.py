@@ -664,6 +664,15 @@ class ModelRegistry:
                     entry = dict(catalog[bare], id=prefix + bare,
                                  enabled=bare not in state["disabled"],
                                  backend=backend)
+                    # 精确单价（整数 micro）：路由层的价格红线用它做**精确比较**
+                    # （specs/model-routing-by-policy.md §9.3 —— 用户明确要求精确比较，
+                    # float 会引入误差）。这里从上游给的 float `credits` 用与写库
+                    # **同一个** `_to_micro` 换算，所以它与 DB 列逐位一致，
+                    # 不是第二份真相源。显示层继续用 `credits`。
+                    # 局部 import：`admin.db` 在模块级 `from .models import CN`，
+                    # 反向模块级 import 会成环（与 db.py 里 `_canonical_column` 同因）。
+                    from .db import _to_micro
+                    entry["credits_micro"] = _to_micro(entry.get("credits"))
                     if backend == self._default:
                         entry["custom"] = bare in state["custom"]
                     entry["source"] = normalize_source(entry.get("source"))
