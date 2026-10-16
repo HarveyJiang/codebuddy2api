@@ -1134,6 +1134,13 @@ class TraeBackend(BackendSpec):
     label = "Trae"
     short = "Trae"
     icon = "⚡"
+    # 图形场景用 SVG：闪电。字符 ⚡ 的 EAW 是 W（宽）且会渲染成彩色 emoji，
+    # 字形盒约是 ◈ 的两倍——改用 SVG 后两个图标同框同尺寸（都是 24×24 viewBox）。
+    icon_svg = (
+        '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+        '<path d="M13.2 2.2 5.6 13.1h5.1l-.9 8.7 7.6-10.9h-5.1z"/>'
+        "</svg>"
+    )
     color = "#7c4dff"
     order = 1
     login_kind = "trae"

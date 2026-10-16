@@ -52,6 +52,8 @@ const snippets = [
   /const backendMeta = [^\n]*\n/,
   /const backendIcon = [^\n]*\n/,
   /const backendName = [^\n]*\n/,
+  /const SVG_ALLOWED_TAGS = [^\n]*\n/,
+  /const backendIconSvg = [\s\S]*?\n\};\n/,
   /const backendLabel = [^\n]*\n/,
   /const backendOrder = [^\n]*\n/,
   /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
@@ -100,7 +102,7 @@ for (const a of accounts) {
   const html = fn.renderRow(a);
   const tag = `${a.name}(${a.backend})`;
   check(`${tag} 行渲染无 undefined`, !/undefined/.test(html), html.slice(0, 200));
-  check(`${tag} 行有后端图标`, html.includes(fn.backendIcon(a.backend)));
+  check(`${tag} 行有后端图标`, html.includes("backend-icon-svg") || html.includes(fn.backendIcon(a.backend)));
   check(`${tag} 行有后端名`, html.includes(fn.backendName(a.backend)));
   check(`${tag} 行带 data-account（点行开详情要用）`, html.includes(`data-account="${a.id}"`));
   check(`${tag} 行有账号类型图标 class`, html.includes("account-icon-backend"));

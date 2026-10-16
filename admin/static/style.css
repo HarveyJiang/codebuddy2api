@@ -22,23 +22,30 @@
 .dash-pool-table th:first-child{padding-left:0}
 .dash-pool-table td:first-child{padding-left:0}
 /* 账号类型图标：占位与 .account-icon 相同，颜色由后端声明（内联 style）。
-   两个后端共用这一个类，所以**字号**必须在这里显式钉死：`⚡` 的字形比 `◈`
-   填得满（更宽更高），同样字号下看上去大一圈。统一收到 14px，两个字形在同一
-   视觉盒里对齐，不再一个胖一个瘦。
-   盒尺寸**不在这里定**——它由使用场景决定：账号表要 39px 的圆角方块（继承
-   .account-icon），模型名前只要贴住字形的行内图标（见 .model-id-line 那条）。 */
-.account-icon-backend{font:14px/1 Georgia,serif}
+   图标本身是后端声明的**内联 SVG**（BackendSpec.icon_svg）——不再用字符：
+   各字符的 East Asian Width 不同（◈ 是窄、⚡ 是宽且会渲染成彩色 emoji），
+   同字号下 ⚡ 的字形盒约是 ◈ 的两倍，`font-size` 永远调不平。SVG 的尺寸由
+   这里的 width/height 唯一决定，与系统字体、emoji 字体都无关，两个后端必然一致。
+   `color` 由外层内联 style 给（后端声明的 color），SVG 用 fill=currentColor 接。 */
+.account-icon-backend{display:grid;place-items:center;font:14px/1 Georgia,serif}
+.backend-icon-svg{width:1em;height:1em;display:block}
+/* SVG 缺席时的字符回落（见 app.js backendIconSvg 的校验失败分支）。 */
+.backend-icon-text{font:14px/1 Georgia,serif;line-height:1}
 /* 模型合并行：一个模型名对应多个后端时，倍率/上下文按后端分行并列，
    icon 标出哪个数属于哪条链路。不合并数值本身（免费与付费必须可区分）。 */
 .model-line{display:flex;align-items:center;gap:6px;margin:2px 0}
 /* 行前归属 icon：模型名前并排显示该行所属后端（多后端组按顺序多个）。
    与模型名同基线对齐，不撑高行高。 */
 .model-id-line{display:inline-flex;align-items:center;gap:4px;margin-right:7px;vertical-align:middle}
-/* 模型名前的归属 icon：不要 39px 的方块底，只留字形本身贴住基线。
-   字号在这里再钉一次（同 .account-icon-backend 的值），这样 flex 容器
-   里 `⚡` 与 `◈` 用的是同一字号，字形宽窄差异不再被放大。 */
+/* 模型名前的归属 icon：不要 39px 的方块底，只留图标本身贴住基线。
+   尺寸在这里定死（1em = 14px，与账号表同源），两个后端因此必然同尺寸。 */
 .model-id-line .account-icon{width:auto;height:auto;background:none;border-radius:0;font-size:14px;line-height:1}
 .model-line .mini-backend{flex-shrink:0}
+/* 徽标里的 SVG 跟着徽标字号走（9px）：用 em 而不是 px，改字号不必改这里。 */
+.mini-backend .backend-icon-svg{width:1em;height:1em}
+.mini-backend .backend-icon-text{font-size:1em}
+/* 设置页后端开关、添加模型弹框的选项：行内图标，与文字同高。 */
+.inline-checkbox .backend-icon-svg,.model-backend-option .backend-icon-svg{width:1em;height:1em}
 .model-mini-toggle{font-size:10px;border:0;background:transparent;padding:0 4px 0 0;color:#7d9085;cursor:pointer}
 .model-mini-toggle:hover{color:#2f5744;text-decoration:underline}
 /* 模型归属多选（添加模型弹框）：选项由 /admin/api/backends 驱动。 */

@@ -416,15 +416,34 @@ create_app() 里对每个后端只做 ensure_static_catalog(name)，
 「自定义 → 内置三档 → WorkBuddy 上游 → Trae 上游」两后端各成一块。
 **排序代码一行未改**（用户已确认按此方向）。
 
-**③ `◈` / `⚡` 视觉大小不一**
+**③ `◈` / `⚡` 视觉大小不一 → 改用内联 SVG**
 
-两个后端用的是**同一个类** `.account-icon-backend`，字号本应一样；差异来自字形
-本身（`⚡` 比 `◈` 填得满，同字号下更宽更高）。原值 `font-size:16px` 又是从容器
-`.account-icon` 的 `font:20px Georgia,serif` 简写里「漏」出来的。修法：
-- `.account-icon-backend` 显式钉死 `font:14px/1 Georgia,serif` + 22×22 盒
-  （不再依赖容器简写）；
-- `.model-id-line .account-icon`（模型名前的场景）再钉一次 `font-size:14px`，
-  这样 flex 容器里两个字形用同一字号，宽窄差异不被放大。
+先按字符思路修过一版（调 `font-size`），**方向错了**：`font-size` 调不平，因为
+两个字符的**字形盒**本身不同 ——
+
+| 字符 | 码位 | East Asian Width | 说明 |
+|---|---|---|---|
+| `◈` | U+25C8 | **A**（窄） | 普通几何字符 |
+| `⚡` | U+26A1 | **W**（宽） | 且落在 emoji 区，可能渲染成彩色 emoji |
+
+同字号下 `⚡` 的宽度约是 `◈` 的两倍——这才是「图片本身大小不统一」的真正来源。
+
+修法：后端声明新增 `BackendSpec.icon_svg`（内联 SVG），**图形场景**用它，
+**纯文本场景**（账号详情的「账号类型：◈ WorkBuddy」、`title` 提示）继续用字符
+`icon`。
+
+- SVG 约定：`viewBox="0 0 24 24"`、`fill="currentColor"`（颜色由外层 `color`
+  决定）、**不写 width/height**（交给 CSS）—— 尺寸由 CSS 的 `1em` 唯一决定，
+  与系统字体、emoji 字体全无关系，两个后端必然同尺寸；
+- `app.js` 新增 `backendIconSvg(b)`：**不过 `esc()`**（过了会把标签转义成可见
+  文本），代价是绕开转义保护，所以自带一层**结构校验**——只放行「单个根
+  `<svg>`、标签限于形状/分组/路径、无 `script`/`style`/`foreignObject`/`use`/
+  `image`、无 `on*`、无 `href`」，否则回落到（已转义的）字符图标。后端声明是
+  我们自己的代码，这层是纵深防御；
+- 7 个消费点里 **6 个图形场景**改用 SVG（模型行前图标、账号类型图标、
+  `mini-backend` 徽标 ×2、后端开关、添加弹框选项），**1 个纯文本场景**保留字符；
+- CSS：`.backend-icon-svg{width:1em;height:1em}`（`.mini-backend` 里用 `em`
+  跟着 9px 徽标字号走，不必另写 px）。
 
 **三条修正的回归测试**（`tests/admin/test_catalog_backends.py`，新增 13 条）：
 `CatalogUpdatedAccessorTests`（读数语义与跨重启往返）、`StartupRefreshTests`

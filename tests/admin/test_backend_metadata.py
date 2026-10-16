@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,11 +75,34 @@ class BackendMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows)
         for row in rows:
             # 前端 renderLoginModes / backendBadge / backendTag 逐字段用。
-            for key in ("name", "label", "short", "icon", "color", "order",
+            for key in ("name", "label", "short", "icon", "icon_svg", "color", "order",
                         "prefix", "login_kind", "enabled", "default", "accounts"):
                 self.assertIn(key, row, f"{row.get('name')} 缺字段 {key}")
             self.assertIsInstance(row["accounts"], int)
             self.assertIsInstance(row["enabled"], bool)
+
+    async def test_every_backend_declares_a_sized_svg_icon(self):
+        """每个后端都要有 icon_svg，且是 24×24 viewBox 的单个 <svg>。
+
+        为什么必须有：字符图标的 EAW 不一致（◈ 窄、⚡ 宽且是 emoji 字形），
+        同字号下字形盒能差一倍 —— 只有 SVG 能让两个后端的图标真正同尺寸。
+        这条钉住「声明齐了」，前端 backendIconSvg 才不会退化成字符回落。
+        """
+        await self.login()
+        rows = (await self.client.get("/admin/api/backends")).json()["backends"]
+        for row in rows:
+            svg = row["icon_svg"]
+            self.assertTrue(svg, f"{row['name']} 没声明 icon_svg")
+            self.assertTrue(svg.startswith("<svg") and svg.endswith("</svg>"),
+                            f"{row['name']} 的 icon_svg 不是单个 <svg> 元素")
+            self.assertIn('viewBox="0 0 24 24"', svg, f"{row['name']} 的 viewBox 不是 24×24")
+            # 尺寸交给 CSS，不由 SVG 自带 width/height —— 否则两个后端各写一个尺寸，
+            # 又回到「大小不统一」。fill 用 currentColor 才能接住后端声明的颜色。
+            self.assertNotIn("<svg", svg.replace("<svg", "", 1))
+            head = svg.split(">", 1)[0]
+            self.assertIsNone(re.search(r'(?<![\w-])(?:width|height)\s*=', head),
+                              f"{row['name']} 的 <svg> 自带 width/height（应交给 CSS）")
+            self.assertIn("currentColor", svg)
 
     async def test_order_is_stable_and_default_first(self):
         """顺序稳定是前端渲染的前提（每次刷新行序不能跳）。"""

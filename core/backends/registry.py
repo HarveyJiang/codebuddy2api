@@ -299,6 +299,7 @@ def backend_meta() -> list[dict]:
             "label": spec.label,
             "short": spec.short,
             "icon": spec.icon,
+            "icon_svg": spec.icon_svg,
             "color": spec.color,
             "order": spec.order,
             "prefix": spec.model_prefix,

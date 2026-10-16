@@ -31,6 +31,8 @@ const snippets = [
   /const backendMeta = [^\n]*\n/,
   /const backendIcon = [^\n]*\n/,
   /const backendName = [^\n]*\n/,
+  /const SVG_ALLOWED_TAGS = [^\n]*\n/,
+  /const backendIconSvg = [\s\S]*?\n\};\n/,
   /const backendLabel = [^\n]*\n/,
   /const backendOrder = [^\n]*\n/,
   /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
@@ -52,13 +54,16 @@ const escMatch = src.match(/const esc = [^\n]*\n/);
 code += escMatch[0];
 
 const fn = new Function(code + `
-  return {renderModelGroup, groupModelsByName, backendBadge, backendTag, backendName, applyBackends, esc};
+  return {renderModelGroup, groupModelsByName, backendBadge, backendTag, backendName, backendIconSvg, applyBackends, esc};
 `)();
 
 // 注入与 GET /admin/api/backends 同构的元数据（真实服务返回的就是这份形状）。
+// icon_svg 与本项目两个后端的真实声明同形（viewBox 24×24 + currentColor）。
+const WB_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.6 21.4 12 12 21.4 2.6 12z"/><path d="M12 9.2 14.8 12 12 14.8 9.2 12z" fill="currentColor" stroke="none"/></svg>';
+const TRAE_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13.2 2.2 5.6 13.1h5.1l-.9 8.7 7.6-10.9h-5.1z"/></svg>';
 fn.applyBackends([
-  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", color: "#2f6fed", order: 0, prefix: "" },
-  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", color: "#7c4dff", order: 1, prefix: "trae/" },
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", icon_svg: WB_SVG, color: "#2f6fed", order: 0, prefix: "" },
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", icon_svg: TRAE_SVG, color: "#7c4dff", order: 1, prefix: "trae/" },
 ]);
 
 // 拉真实数据：直接调 overview（复用 stage2_verify 已经验证过的登录方式）。
@@ -117,8 +122,43 @@ const stepHtml = fn.renderModelGroup(step);
 check("step-5-preview 行内同时出现免费与 ×0.48",
       stepHtml.includes("免费") && stepHtml.includes("×0.48"));
 check("step-5-preview 行内两个后端标记都在",
-      stepHtml.includes(">◈ WB<") || stepHtml.includes("◈ WB"),
+      (stepHtml.match(/mini-backend/g) || []).length >= 2
+      && stepHtml.includes("WB") && stepHtml.includes("Trae"),
       stepHtml.slice(0, 200));
+check("行前归属图标渲染成内联 SVG（不是字符）",
+      stepHtml.includes('class="backend-icon-svg"') && !stepHtml.includes(">⚡<"),
+      stepHtml.slice(0, 260));
+
+// 图标是后端声明的 SVG，要当 HTML 插进 DOM（绕开 esc），所以 backendIconSvg
+// 自带一层结构校验。这里逐个喂坏输入，确认都回落到**转义过的字符**。
+const badIconCases = [
+  ["带 script", '<svg viewBox="0 0 24 24"><script>alert(1)</script></svg>'],
+  ["带 on* 事件", '<svg viewBox="0 0 24 24" onload="alert(1)"><path d="M0 0"/></svg>'],
+  ["带 href", '<svg viewBox="0 0 24 24"><a href="javascript:alert(1)"/></svg>'],
+  ["多根元素", '<svg viewBox="0 0 24 24"><path d="M0 0"/></svg><b>x</b>'],
+  ["非 svg 根", '<div>hi</div>'],
+  ["空串", ""],
+];
+for (const [label, bad] of badIconCases) {
+  fn.applyBackends([
+    { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", icon_svg: bad, color: "#2f6fed", order: 0, prefix: "" },
+    { name: "trae", label: "Trae", short: "Trae", icon: "⚡", icon_svg: TRAE_SVG, color: "#7c4dff", order: 1, prefix: "trae/" },
+  ]);
+  const out = fn.backendIconSvg("workbuddy");
+  check(`坏 icon_svg（${label}）回落成字符、不注入`,
+        out.includes("backend-icon-text") && !out.includes("<script") && !out.includes("onload"),
+        out);
+}
+// 合法 SVG 必须原样放行（不能被误判成坏输入），且打上 class 供 CSS 定尺寸。
+fn.applyBackends([
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", icon_svg: WB_SVG, color: "#2f6fed", order: 0, prefix: "" },
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", icon_svg: TRAE_SVG, color: "#7c4dff", order: 1, prefix: "trae/" },
+]);
+const okSvg = fn.backendIconSvg("trae");
+check("合法 icon_svg 原样输出且带 class",
+      okSvg.includes('class="backend-icon-svg"') && okSvg.includes("<path"), okSvg);
+check("SVG 不带 width/height（尺寸全交给 CSS）",
+      !/[\s"](?:width|height)=/.test(okSvg.split(">")[0]), okSvg.split(">")[0]);
 
 // 单后端行不应出现后端标记之外的杂项。
 const single = groups.find(g => g.items.length === 1);

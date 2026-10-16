@@ -183,7 +183,7 @@ function applyBackends(list) {
 function paintBackendToggles() {
   const box = $("backend-toggles");
   if (!box) return;
-  box.innerHTML = backends.map(b => `<label class="inline-checkbox" data-env-locked="${b.env_disabled ? "1" : ""}" title="${esc(b.env_disabled ? "该后端已被环境变量 CODEBUDDY_ENABLE_TRAE=0 禁用，开关不生效" : "")}"><input type="checkbox" data-backend-toggle="${esc(b.name)}"${b.enabled ? " checked" : ""}>${esc(backendIcon(b.name))} ${esc(b.label)}${b.env_disabled ? '<span class="pill">环境禁用</span>' : ""}</label>`).join("")
+  box.innerHTML = backends.map(b => `<label class="inline-checkbox" data-env-locked="${b.env_disabled ? "1" : ""}" title="${esc(b.env_disabled ? "该后端已被环境变量 CODEBUDDY_ENABLE_TRAE=0 禁用，开关不生效" : "")}"><input type="checkbox" data-backend-toggle="${esc(b.name)}"${b.enabled ? " checked" : ""}>${backendIconSvg(b.name)} ${esc(b.label)}${b.env_disabled ? '<span class="pill">环境禁用</span>' : ""}</label>`).join("")
     || `<span class="muted">没有可用后端</span>`;
   lockBackendToggles();
 }
@@ -218,6 +218,29 @@ const backendFlagsBody = () => Object.fromEntries(
 const backendMeta = b => backends.find(x => x.name === b) || null;
 const backendIcon = b => backendMeta(b)?.icon || "◇";
 const backendName = b => backendMeta(b)?.label || b || "未知";
+
+// 图形场景的图标：后端声明的内联 SVG（见 BackendSpec.icon_svg）。
+//
+// **不能过 esc()**：这段要当 HTML 插进 DOM，转义会把标签变成可见的文本
+// （`<svg>` 原样显示出来）。代价是这段字符串绕开了 esc 的保护，所以不信任它：
+// 这里做一次结构化校验，只放行「一个 <svg> 元素、只含形状/分组/路径标签、
+// 不带 script/on*/href」的串，其余一律回落到字符图标（转义后再插）。
+// 后端声明是我们自己的代码，这层是纵深防御——万一将来 icon_svg 来自配置/用户，
+// 也不会变成注入点。
+const SVG_ALLOWED_TAGS = new Set(["svg", "g", "path", "circle", "ellipse", "rect", "line", "polyline", "polygon"]);
+const backendIconSvg = b => {
+  const meta = backendMeta(b);
+  const raw = meta?.icon_svg;
+  if (typeof raw !== "string" || !raw.trim()) return `<span class="backend-icon-text">${esc(backendIcon(b))}</span>`;
+  // 只接受单个根 <svg …>…</svg>，内部无 <script/<style/<foreignObject、无 on* 事件、无 href。
+  if (!/^<svg[\s>][\s\S]*<\/svg>$/.test(raw.trim())) return `<span class="backend-icon-text">${esc(backendIcon(b))}</span>`;
+  if (/<\s*(script|style|foreignObject|use|image|iframe|object|embed)\b/i.test(raw)) return `<span class="backend-icon-text">${esc(backendIcon(b))}</span>`;
+  if (/\son[a-z]+\s*=/i.test(raw) || /\b(?:xlink:)?href\s*=/i.test(raw)) return `<span class="backend-icon-text">${esc(backendIcon(b))}</span>`;
+  const tags = [...raw.matchAll(/<\/?([a-zA-Z][\w:-]*)/g)].map(m => m[1].toLowerCase());
+  if (tags.some(t => !SVG_ALLOWED_TAGS.has(t))) return `<span class="backend-icon-text">${esc(backendIcon(b))}</span>`;
+  // 颜色由外层 CSS/内联 color 决定；这里补 currentColor 兜底，避免后端忘了写 fill。
+  return raw.replace(/<svg\b(?![^>]*\bclass=)/, '<svg class="backend-icon-svg"');
+};
 // 列表列宽窄时用短名（最近请求的后端列）。
 const backendLabel = b => backendMeta(b)?.short || b || "—";
 // 后端在展示顺序里的序号；未知后端排在已知的后面（而不是插到最前）。
@@ -231,7 +254,7 @@ function backendBadge(b) {
 // 带后端名的徽标（账号表、模型表用），形如「◈ WorkBuddy」。
 function backendTag(b) {
   const key = b || backends[0]?.name;
-  return `<span class="mini-backend mini-${esc(key)}" title="${esc(backendName(key))} 账号">${esc(backendIcon(key))} ${esc(backendName(key))}</span>`;
+  return `<span class="mini-backend mini-${esc(key)}" title="${esc(backendName(key))} 账号">${backendIconSvg(key)} ${esc(backendName(key))}</span>`;
 }
 
 function renderModels() {
@@ -290,11 +313,11 @@ function renderModelGroup(g) {
   const anyEnabled = enabledCount > 0;
 
   // 后端标记：单后端直接打标；多后端在每个值前面标，读得出「哪个数属于哪个后端」。
-  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))} ${esc(backendLabel(m.backend))}</span>`;
+  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)} ${esc(backendLabel(m.backend))}</span>`;
   // 行前归属 icon（specs/model-backend-attribution.md §4.1）：纯 icon 无 pill
   // （复用账号表同款 .account-icon-backend），颜色由后端声明经 /admin/api/backends
   // 提供。多后端组按后端顺序并排，一眼看出这行跨了几条链路。
-  const attrIcon = m => `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(m.backend)?.color || "#888")}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))}</span>`;
+  const attrIcon = m => `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(m.backend)?.color || "#888")}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)}</span>`;
   const attrIcons = items.map(attrIcon).join("");
 
   const creditsCell = multi
@@ -420,7 +443,7 @@ function renderAccounts() {
     const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
     // 账号类型图标（需求 5）：用后端注册表的 icon，而不是固定的首字母。
     // 首字母在两个后端都可能一样时无法区分账号类型，这正是需求要解决的问题。
-    const kindIcon = `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${esc(backendIcon(a.backend))}</span>`;
+    const kindIcon = `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${backendIconSvg(a.backend)}</span>`;
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<div><strong>${esc(a.name)}</strong>${backendTag(a.backend)}${a.nickname ? `<small>${esc(a.nickname)}</small>` : ""}</div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.daily_rate ? `<small class="cell-note">日耗约 ${creditsFmt(a.daily_rate)}${a.days_to_empty !== null ? ` · 按当前速率约 ${a.days_to_empty} 天用完` : ""}</small>` : ""}${a.expire_unused ? `<small class="cell-note field-error">预计 ${creditsFmt(a.expire_unused)} 积分将过期浪费</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="7" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
@@ -1012,7 +1035,7 @@ function renderBackendPicker() {
   // 只有多于一个后端时才需要选：单后端时归属别无选择，藏起来减少噪音。
   if (backends.length < 2) { box.hidden = true; list.innerHTML = ""; return; }
   box.hidden = false;
-  list.innerHTML = backends.map(b => `<label class="model-backend-option"><input type="checkbox" data-model-backend="${esc(b.name)}"${b.enabled === false ? " disabled" : ""}${b.enabled === false ? "" : " checked"}> ${esc(backendIcon(b.name))} ${esc(b.label || b.name)}</label>`).join("");
+  list.innerHTML = backends.map(b => `<label class="model-backend-option"><input type="checkbox" data-model-backend="${esc(b.name)}"${b.enabled === false ? " disabled" : ""}${b.enabled === false ? "" : " checked"}> ${backendIconSvg(b.name)} ${esc(b.label || b.name)}</label>`).join("");
 }
 $("models-add").addEventListener("click", () => {
   $("model-form").reset();

@@ -66,7 +66,19 @@ class BackendSpec:
     #: 不再写死后端名。order 决定展示顺序（默认后端在最前）。
     label: str = "base"
     short: str = "base"
+    #: 字符图标。**纯文本场景**用它（账号详情的「账号类型：◈ WorkBuddy」、title
+    #: 提示等）；图形场景见下面的 ``icon_svg``。
     icon: str = "◈"
+    #: 内联 SVG 图标（**图形场景**用：行前归属图标、账号类型图标）。
+    #:
+    #: 为什么不能用字符：各字符的 East Asian Width 不同（``◈`` U+25C8 是 A/窄，
+    #: ``⚡`` U+26A1 是 W/宽且落在 emoji 区），同字号下 ``⚡`` 的字形盒约是
+    #: ``◈`` 的两倍宽——``font-size`` 永远调不平。SVG 的尺寸完全由 viewBox 与
+    #: CSS 决定，与系统字体/emoji 字体无关。
+    #:
+    #: 约定：``viewBox="0 0 24 24"``、``fill="currentColor"``（颜色由外层
+    #: ``color`` 决定）、不写 width/height（交给 CSS）。后端只需声明路径。
+    icon_svg: str = ""
     color: str = "#888888"
     order: int = 100
     #: 是否需要（且有）交互式授权登录流程（前端据此决定是否渲染「XX 授权」按钮）。

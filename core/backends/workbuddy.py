@@ -28,6 +28,15 @@ class WorkBuddyBackend(BackendSpec):
     label = "WorkBuddy"
     short = "WB"
     icon = "◈"
+    # 图形场景用 SVG：外菱形描边 + 内实心小菱形（对应字符 ◈ 的「菱形套小菱形」）。
+    # viewBox 24×24、fill=currentColor，尺寸全交给 CSS（见 icon_svg 的约定）。
+    icon_svg = (
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">'
+        '<path d="M12 2.6 21.4 12 12 21.4 2.6 12z"/>'
+        '<path d="M12 9.2 14.8 12 12 14.8 9.2 12z" fill="currentColor" stroke="none"/>'
+        "</svg>"
+    )
     color = "#2f6fed"
     order = 0
     login_kind = "browser"
