@@ -569,7 +569,10 @@ function renderAccounts() {
     // 全是冗余 —— 归属一列已有「账号类型」语义，后端名在详情弹框里看）。
     const kindIcon = `<span class="account-icon-backend account-icon-inline" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${backendIconSvg(a.backend)}</span>`;
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><button class="weight-btn" data-action="weight" data-id="${a.id}" title="权重越大越优先分配请求">权重 ${a.weight || 0}</button></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
+    // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
+    const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 签到 / 暂停 / 删除">⚙ 设置</button></td>`;
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td>${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="7" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -1016,16 +1019,75 @@ $("accounts-body").addEventListener("click", async e => {
     return;
   }
   const a = overview.accounts.find(x => x.id === b.dataset.id); if (!a) return;
-  if (["status","checkin","refresh"].includes(b.dataset.action)) {
-    b.disabled = true;
-    try { const result=await api(`accounts/${a.id}/actions/${b.dataset.action}`,{method:"POST"});toast(result.message);await refresh(); }
-    catch(err){toast(err.message);} finally {b.disabled=false;} return;
-  }
-  const update = body => api("accounts/" + a.id, {method:"PATCH", body});
-  if (b.dataset.action === "rename") confirmAction("编辑账号备注", "备注仅用于在管理后台识别账号。", () => update({name:$("rename-value").value}), {value:a.name, label:"账号备注"});
-  if (b.dataset.action === "weight") confirmAction("设置调度权重", "权重 0-100，越大越优先分配请求；同权重时优先消耗积分最早过期的账号。", () => update({weight:Number($("rename-value").value)}), {value:String(a.weight || 0), label:"调度权重（0-100）", type:"number", min:0, max:100});
-  if (b.dataset.action === "toggle") confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？", "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。", () => update({enabled:!a.enabled}));
-  if (b.dataset.action === "delete") confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。`, () => api("accounts/" + a.id, {method:"DELETE"}));
+  if (b.dataset.action === "settings") { openAccountSettings(a); return; }
+});
+// -- 账号设置弹框 ----------------------------------------------------------
+// 操作列收成一个「设置」按钮（用户 2026-10-16）：备注/权重在这里改，
+// 查询积分/签到/刷新凭据这类即时动作也在顶部一排，暂停/删除沉底。
+let settingsAccountId = null;
+
+function openAccountSettings(a) {
+  if (!a) return;
+  settingsAccountId = a.id;
+  $("account-settings-title").textContent = a.name || "账号设置";
+  $("account-settings-sub").textContent = `${backendName(a.backend)} 账号 · ${a.id}`;
+  $("as-name").value = a.name || "";
+  $("as-weight").value = a.weight || 0;
+  $("account-settings-error").textContent = "";
+  const toggle = $("as-toggle");
+  toggle.textContent = a.enabled ? "暂停账号" : "恢复账号";
+  toggle.classList.toggle("danger", !!a.enabled);
+  $("account-settings-dialog").showModal();
+}
+
+const settingsAccount = () => overview.accounts.find(x => x.id === settingsAccountId);
+
+$("as-status").addEventListener("click", async e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  e.target.disabled = true;
+  try { const r = await api(`accounts/${a.id}/actions/status`, {method:"POST"}); toast(r.message); await refresh(); }
+  catch (err) { toast(err.message); } finally { e.target.disabled = false; }
+});
+$("as-checkin").addEventListener("click", async e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  e.target.disabled = true;
+  try { const r = await api(`accounts/${a.id}/actions/checkin`, {method:"POST"}); toast(r.message); await refresh(); }
+  catch (err) { toast(err.message); } finally { e.target.disabled = false; }
+});
+$("as-refresh").addEventListener("click", async e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  e.target.disabled = true;
+  try { const r = await api(`accounts/${a.id}/actions/refresh`, {method:"POST"}); toast(r.message); await refresh(); }
+  catch (err) { toast(err.message); } finally { e.target.disabled = false; }
+});
+$("as-toggle").addEventListener("click", e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？",
+    "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。",
+    async () => { await api("accounts/" + a.id, {method:"PATCH", body:{enabled:!a.enabled}}); $("account-settings-dialog").close(); });
+});
+$("as-delete").addEventListener("click", e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。`,
+    async () => { await api("accounts/" + a.id, {method:"DELETE"}); $("account-settings-dialog").close(); });
+});
+$("account-settings-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  const w = Number($("as-weight").value);
+  if (!Number.isInteger(w) || w < 0 || w > 100) { $("account-settings-error").textContent = "权重须为 0-100 的整数"; return; }
+  $("as-save").disabled = true;
+  try {
+    await api("accounts/" + a.id, {method:"PATCH", body:{name: $("as-name").value.trim() || a.name, weight: w}});
+    $("account-settings-dialog").close();
+    await refresh(); toast("设置已保存");
+  } catch (err) { $("account-settings-error").textContent = err.message; }
+  finally { $("as-save").disabled = false; }
 });
 // 表头排序：点击同一列在 升 → 降 → 取消 之间循环。
 document.querySelectorAll("[data-sort]").forEach(th => th.addEventListener("click", () => {
