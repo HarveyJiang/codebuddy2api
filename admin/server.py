@@ -1082,6 +1082,16 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     app.add_middleware(PoolMiddleware, pool=pool, model_registry=model_registry)
     app.add_middleware(MetricsMiddleware, metrics=metrics, store=store)
 
+    # 展示层（/v1/models 的 owned_by，§9.6）用的策略查询入口。**复用中间件自己
+    # 的决策方法**，不另写一套 —— 两套排序迟早分叉，表现为「列表说走 A，请求
+    # 实际走 B」。这里只把「决定后端」这一步暴露出去，「决定模型名/凭据」仍是
+    # 请求路径的事。
+    from .bare_routing_provider import set_strategy_winner
+
+    _routing_mw = PoolMiddleware.__new__(PoolMiddleware)
+    _routing_mw.pool, _routing_mw.model_registry = pool, model_registry
+    set_strategy_winner(lambda model: _routing_mw._resolve_backend_for(model, None))
+
     async def payload(req):
         try:
             body = await req.json()

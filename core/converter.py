@@ -63,6 +63,8 @@ from .backends.base import BackendHTTPError  # noqa: F401（re-export 供测试/
 from .backends.registry import (  # noqa: F401（re-export 便利）
     backend_name_for,
     make_credential,
+    pinned_model_owner,
+    prefix_for,
     resolve_backend,
     spec_for,
 )
@@ -633,11 +635,35 @@ def list_models(
             # `m.startswith("trae/")` 猜——那是把「谁是我」的判断硬编码在调用方，
             # 加/改后端时这里会悄悄失效（声明里改了 owned_by 也同步不过来）。
             # backend_name_for 是「模型名 → 后端名」的唯一判定处（先 pinned 后前缀）。
-            "owned_by": spec_for(backend_name_for(m)).owned_by,
+            #
+            # 裸名条目（不带任何后端前缀）额外按**当前策略**报归属（§9.6）：
+            # 客户端拿这个字段判断「这个 id 实际会路由到谁」。带前缀的条目本来就是
+            # 用户点名的后端，不需要也不该被策略覆盖。
+            "owned_by": spec_for(_owner_backend_for(m)).owned_by,
         }
         for m in models
     ]
     return {"object": "list", "data": data}
+
+
+def _owner_backend_for(model) -> str:
+    """`/v1/models` 里某个 id 的归属后端（§9.6）。
+
+    带前缀 / `pinned_models` → 声明的归属（不动，用户已点名）。
+    裸名 → **当前策略第一名**（与请求实际落点一致；客户端据此显示「这条会走谁」）。
+
+    策略不可用时**回落** `backend_name_for`（今天的答案），不让展示路径因
+    「没有可用候选」而报错 —— `/v1/models` 是**只读展示**，它列的模型可能此刻
+    确实没有可用账号（全都禁用/冷却），那不是 500 的理由。
+    """
+    if prefix_for(model) or pinned_model_owner(model) is not None:
+        return backend_name_for(model)
+    try:
+        from admin.bare_routing_provider import strategy_winner_for
+        return strategy_winner_for(model) or backend_name_for(model)
+    except Exception:
+        # 展示路径永不因路由失败而中断（含 admin 未加载、registry 缺失等）。
+        return backend_name_for(model)
 
 
 def _routed_backend(request) -> str | None:

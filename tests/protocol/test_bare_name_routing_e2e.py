@@ -25,6 +25,7 @@ from pathlib import Path
 import httpx
 
 from core.backends import trae as T
+from core.backends.registry import spec_for
 
 API = "sk-test-client-key"
 ADMIN = "admin-key-long-enough-1234"
@@ -158,6 +159,39 @@ class BareNameRoutingEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self._last_log_backend(), "trae")
 
+    async def test_models_list_bare_name_reports_the_strategy_winner(self):
+        """§9.6：`/v1/models` 里裸名条目的 `owned_by` = **当前策略第一名**。
+
+        构造：把 Trae 提到第一位（显式配序）→ 裸名条目必须改报 Trae 的 owned_by。
+        这条把「展示层复用同一套策略」钉住：若 `owned_by` 退回静态
+        `backend_name_for`（恒为默认后端），它会仍然说 codebuddy 而红。
+        """
+        r0 = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        before = {m["id"]: m["owned_by"] for m in r0.json()["data"]}
+        self.assertEqual(before["glm-5.3"], spec_for("workbuddy").owned_by,
+                         "默认顺序下裸名归默认后端")
+
+        # 用户把 Trae 调到第一位（显式配序）。
+        self.app.state.store.data["pool"]["model_backend_order"] = ["trae", "workbuddy"]
+        r1 = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        after = {m["id"]: m["owned_by"] for m in r1.json()["data"]}
+        self.assertEqual(after["glm-5.3"], spec_for("trae").owned_by,
+                         "用户调序后，裸名条目的 owned_by 必须跟着变")
+        # 带前缀的条目**不受策略影响**（用户已点名后端）。
+        self.assertEqual(after["trae/glm-5.3"], spec_for("trae").owned_by)
+
+    async def test_models_list_never_errors_when_no_candidate(self):
+        """展示路径不因「此刻没有可用候选」而失败（它列的是目录，不是可用性）。
+
+        把两个后端的账号全禁掉 → 候选集为空。`/v1/models` 仍必须 200：它是
+        只读展示，客户端此刻发请求会 400/503，但「你们家有哪些模型」不该跟着 500。
+        """
+        for item in self.app.state.store.data["accounts"].values():
+            item["enabled"] = False
+        r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["data"])
+
     async def test_unknown_model_lists_every_rejection(self):
         """§5.1 末段：候选为空 → 400，且逐条说明每个后端为什么出局。"""
         r = await self._post("no-such-model-anywhere")
@@ -169,6 +203,57 @@ class BareNameRoutingEndToEnd(unittest.IsolatedAsyncioTestCase):
         # 名字是稳定标识；展示名在别处（/v1/models 的 owned_by）。
         self.assertIn("workbuddy", body)
         self.assertIn("trae", body)
+
+
+class StrategyProviderIsolationTests(unittest.TestCase):
+    """策略查询入口的**故障隔离**契约（`admin/bare_routing_provider.py`）。
+
+    `/v1/models` 是只读展示：策略算不出来（provider 抛异常、还没注入）时，
+    它必须**回落**静态归属而不是把异常抛给客户端。若有人把那层 try/except
+    删掉（看起来像「多余的防御」），这条会红 —— 这是那个 else 存在的理由。
+    """
+
+    def tearDown(self):
+        from admin.bare_routing_provider import set_strategy_winner
+        set_strategy_winner(None)   # 别把注入泄漏给其它测试
+
+    def test_returns_none_when_not_injected(self):
+        from admin.bare_routing_provider import set_strategy_winner, strategy_winner_for
+        set_strategy_winner(None)
+        self.assertIsNone(strategy_winner_for("glm-5.3"))
+
+    def test_swallows_provider_exception(self):
+        """provider 抛异常 → 返回 None（调用方回落），异常不外泄。"""
+        from admin.bare_routing_provider import set_strategy_winner, strategy_winner_for
+
+        def boom(model):
+            raise RuntimeError("候选集为空")
+
+        set_strategy_winner(boom)
+        self.assertIsNone(strategy_winner_for("glm-5.3"))
+
+    def test_forwards_the_provider_answer(self):
+        from admin.bare_routing_provider import set_strategy_winner, strategy_winner_for
+        set_strategy_winner(lambda model: "trae")
+        self.assertEqual(strategy_winner_for("glm-5.3"), "trae")
+
+    def test_models_endpoint_survives_a_raising_provider(self):
+        """端到端：provider 炸了，`/v1/models` 仍 200（回归到 500 会红）。
+
+        走真实 `_owner_backend_for`（不是直接调 provider），证明那层兜底真的接上了。
+        """
+        from admin.bare_routing_provider import set_strategy_winner
+        from core.converter import _owner_backend_for
+
+        def boom(model):
+            raise RuntimeError("boom")
+
+        set_strategy_winner(boom)
+        # 裸名：策略炸了 → 回落静态归属（默认后端），不抛。
+        got = _owner_backend_for("glm-5.3")
+        self.assertEqual(got, "workbuddy")
+        # 带前缀的：根本不查策略（用户已点名）。
+        self.assertEqual(_owner_backend_for("trae/glm-5.3"), "trae")
 
 
 if __name__ == "__main__":
