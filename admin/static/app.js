@@ -1159,7 +1159,10 @@ function openKeyBind(k) {
     if (!items.length) { const p = document.createElement("p"); p.className = "muted"; p.textContent = "暂无可选项。"; host.replaceChildren(p); }
   };
   const models = (overview.models?.models || []).filter(m => m.enabled)
-    .map(m => ({value: m.id, name: m.name || "", backend: m.backend}));
+    .map(m => ({value: m.id, name: m.name || "", backend: m.backend,
+      // creditsText / 活动标签要用：map 收窄字段时把计费信息带上，
+      // 否则可选模型全部显示「标准」（用户报告）。
+      credits: m.credits, promo: m.promo}));
   const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state, backend:a.backend,
     remaining:a.remaining, expiring_soon:a.expiring_soon}));
   // 可用模型按归属分页签（用户拍板）：同一份 check-list，页签只控制**哪些行
