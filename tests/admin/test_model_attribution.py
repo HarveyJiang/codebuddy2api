@@ -7,7 +7,7 @@
 2. ``pinned_models`` 声明：三档路由的归属由声明保证，不再是「无前缀所以恰好
    归默认后端」的巧合；
 3. 迁移 v12 回填：历史行按前缀推导填一次，之后列即权威；
-4. 四层排序：来源 → 归属 → 启用 → 倍率。
+4. 三层排序：来源 → 归属 → 倍率（启用与否**不参与**，用户 2026-10-16 撤销）。
 """
 from __future__ import annotations
 
@@ -464,7 +464,7 @@ class MigrationTests(unittest.TestCase):
 
 
 class SortOrderTests(unittest.TestCase):
-    """四层排序（§6）：来源 → 归属 → 启用 → 倍率。"""
+    """三层排序（§6）：来源 → 归属 → 倍率（启用与否不参与，用户已撤销）。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -502,15 +502,32 @@ class SortOrderTests(unittest.TestCase):
             self.assertLess(ids.index(m), first_upstream,
                             "三档内置整体排在所有上游模型之前")
 
-    def test_enabled_before_disabled_within_same_source(self):
+    def test_disabled_does_not_sink_to_bottom(self):
+        """禁用不参与排序（用户 2026-10-16 撤销「启用优先、禁用沉底」）。
+
+        分页签后每行就是一个开关：点一下若行跳到别处，用户要在原地找结果。
+        这条钉住「开关前后行序不变」——有人把 enabled 加回排序键会先红。
+        """
         registry = self._registry()
+        before = [m["id"] for m in registry.snapshot()["models"]]
         registry.set_enabled("glm-5.2", False)
+        registry.set_enabled("deep-model", False)
         models = registry.snapshot()["models"]
-        upstream = [m for m in models if m["source"] == "upstream"]
-        enabled = [i for i, m in enumerate(upstream) if m["enabled"]]
-        disabled = [i for i, m in enumerate(upstream) if not m["enabled"]]
-        if enabled and disabled:
-            self.assertLess(max(enabled), min(disabled))
+        after = [m["id"] for m in models]
+        # 禁用的行留在原位（相对于同来源的其他行），不是沉底
+        self.assertEqual([i for i in before if i not in ("glm-5.2", "deep-model")],
+                         [i for i in after if i not in ("glm-5.2", "deep-model")],
+                         "其余行的相对顺序必须纹丝不动")
+        # 禁用的 glm-5.2（上游里倍率最高的）仍按倍率排在上游段**末尾附近但不
+        # 是因为沉底** —— step-5-preview（免费）在它前面，space-bunny 也在
+        # 它前面（space-bunny 无倍率视为 0）。真正的断言是：禁用前后它在
+        # 上游段的位置不变。
+        up_before = [i for i in before if i == "glm-5.2" or
+                     (i in {"step-5-preview", "space-bunny"})]
+        up_after = [i for i in after if i == "glm-5.2" or
+                    (i in {"step-5-preview", "space-bunny"})]
+        self.assertEqual(up_before.index("glm-5.2"), up_after.index("glm-5.2"),
+                         "禁用前后 glm-5.2 在上游段的位置必须不变")
 
     def test_credits_ascending_within_same_group(self):
         models = self._registry().snapshot()["models"]

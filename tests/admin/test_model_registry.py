@@ -142,13 +142,13 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(desc["glm-5.2"], "旗舰模型，擅长复杂软件工程")
         self.assertEqual(desc["space-bunny"], BUILTIN_MODELS["space-bunny"]["description"])
 
-    def test_snapshot_orders_by_source_then_enabled_then_credits(self):
-        """四层排序（specs/model-backend-attribution.md §6）：
+    def test_snapshot_orders_by_source_then_credits(self):
+        """三层排序（specs/model-backend-attribution.md §6，启用已撤销）：
 
         ① 来源 custom(0) → builtin(1) → upstream(2)
         ② 归属（注册表顺序；本用例单后端）
-        ③ 启用的在前、禁用的沉底
-        ④ 倍率升序（None 视为 0）
+        ③ 倍率升序（None 视为 0）
+        禁用与否**不参与**：开关前后行序纹丝不动（点开关不能让行跳走）。
         """
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         response = unittest.mock.Mock(status_code=200)
@@ -156,17 +156,17 @@ class ModelRegistryTests(unittest.TestCase):
         with patch("admin.models.httpx.Client") as client_cls:
             client_cls.return_value.__enter__.return_value.get.return_value = response
             registry.fetch()
-        # 各禁用一条：一段内置（deep-model）、一段上游（最便宜的 step-5-preview）。
-        # 取这两条正是为了证明「来源」压过「启用」——被禁用的内置仍在上游之前。
+        # 禁用两条（内置 deep-model、上游最便宜的 step-5-preview）：
+        # 若「启用」还在排序键里，被禁用的 deep-model 会掉进上游段、
+        # step-5-preview 会沉到上游末尾 —— 断言立刻红。
         registry.set_enabled("step-5-preview", False)
         registry.set_enabled("deep-model", False)
         ids = [m["id"] for m in registry.snapshot()["models"]]
-        # 第①层先把 builtin（三档）全部提到 upstream 之前，与启用状态无关：
-        # 被禁用的 deep-model 仍排在所有上游模型之前。builtin 组内再按
-        # ③启用 ④倍率排（三档同级同倍率 → 保持目录原顺序）；upstream 组内
-        # 被禁用的 step-5-preview 沉底。
+        # ① builtin 整体在 upstream 之前（与启用状态无关）；
+        # ③ 上游组内按倍率升序（step-5-preview 免费 = 0 最前，glm-5.2 ×0.79 最后），
+        #    step-5-preview 被禁用也**不沉底**。
         self.assertEqual(ids, ["fast-model", "balanced-model", "deep-model",
-                               "space-bunny", "glm-5.2", "step-5-preview"])
+                               "step-5-preview", "space-bunny", "glm-5.2"])
 
     def test_fetch_failure_keeps_previous_snapshot(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())

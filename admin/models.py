@@ -633,14 +633,17 @@ class ModelRegistry:
     def snapshot(self):
         """Full catalog with management flags and current promo, for the admin UI.
 
-        排序规则（四层，specs/model-backend-attribution.md §6，用户已拍板）：
+        排序规则（三层，specs/model-backend-attribution.md §6，用户已拍板）：
 
         1. **来源**：custom(0) → builtin(1) → upstream(2)。自定义永远在最前，
            内置其次，动态拉取的最后；
         2. **归属**：注册表顺序（``BackendSpec.order``，默认后端在最前）；
-        3. **启用**：启用的在前，禁用的沉底；
-        4. **倍率**：``credits`` 升序；``None``（按标准计费）视为 0，与免费并列最前。
+        3. **倍率**：``credits`` 升序；``None``（按标准计费）视为 0，与免费并列最前。
            同分用目录原顺序（``available`` 下标）稳定决胜。
+
+        **「启用优先、禁用沉底」已被用户撤销**（2026-10-16）：分页签后每行就是
+        一个开关，点一下行就跳到别处，用户要在原地看到结果。禁用与否**不参与
+        排序** —— 行的位置只由来源/归属/倍率决定，开关前后纹丝不动。
 
         **第 4 层的倍率取「同名组内的最小值」**，不是单条自己的值（用户 2026-10-16
         拍板：「如果有倍率，选择较小的一个进行排」）。理由：管理页把同名模型跨后端
@@ -721,8 +724,7 @@ class ModelRegistry:
             models.sort(key=lambda m: (
                 _SOURCE_RANK[m["source"]],          # ① 来源
                 spec_for(m["backend"]).order,       # ② 归属（注册表顺序）
-                not m["enabled"],                   # ③ 启用优先
-                group_min[m["canonical"]],          # ④ 倍率（同名组内最小值）
+                group_min[m["canonical"]],          # ③ 倍率（同名组内最小值）
                 m["_seq"],                          # 稳定决胜：同分保持目录原顺序
             ))
             for m in models:
