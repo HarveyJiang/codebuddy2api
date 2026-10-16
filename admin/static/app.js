@@ -555,7 +555,11 @@ function renderAccounts() {
     // 显示成「剩余积分 0」与真的耗尽无法区分 —— 明确显示「待查询」。
     const credits = a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining);
     const expiring = a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon);
-    const expiringCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong><small class="cell-note">3 天内到期</small></td>`;
+    // 最近过期列（用户 2026-10-16：3 天改 7 天 + 时间与积分同列）：有即将过期
+    // 的积分才显示时间，没有则只显示「—」。
+    const expiryCell = `<td><strong class="credit-number ${a.expiring_soon > 0 ? "credit-warn" : ""}">${expiring}</strong>`
+      + (a.expiring_soon > 0 && a.earliest_expiry ? `<small class="cell-note">${esc(stamp(a.earliest_expiry * 1000))} 到期</small>` : "<small class=\"cell-note\">7 天内无</small>")
+      + "</td>";
     // 账号类型图标（需求 5）：用后端注册表的 icon，而不是固定的首字母。
     // 首字母在两个后端都可能一样时无法区分账号类型，这正是需求要解决的问题。
     // 行首小 icon + 账号名，就这两样（用户 2026-10-16：icon/后端徽标/昵称
@@ -565,7 +569,7 @@ function renderAccounts() {
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
     const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 签到 / 暂停 / 删除">⚙ 设置</button></td>`;
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${actions}</tr>`;
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiryCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="5" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -587,8 +591,9 @@ function openAccountDetail(a) {
     ["状态", a.pool_state || "—"],
     ["剩余积分", a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)],
     ["积分更新时间", stampOr(a.credits_updated)],
-    ["3 天内到期", a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon)],
+    ["7 天内到期", a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon)],
     ["最早一批过期", stampOr(a.earliest_expiry)],
+    ["最早一批过期积分", a.earliest_expiry_remaining === null || a.earliest_expiry_remaining === undefined ? "—" : creditsFmt(a.earliest_expiry_remaining)],
     ["今日已签到", yes(a.today_checked_in)],
     ["签到时段", a.checkin_slot ? `${a.checkin_slot} ${a.checkin_when || ""}` : "—"],
     ["冷却至", a.cooldown_until > Date.now()/1000 ? stamp(a.cooldown_until*1000) : "—"],

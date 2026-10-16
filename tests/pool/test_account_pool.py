@@ -96,8 +96,10 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             {'CycleCapacityRemainPrecise': '20', 'CycleCapacitySizePrecise': '20', 'CycleEndTime': '2026-10-16 23:00:00'},
             {'CycleCapacityRemainPrecise': '30', 'CycleCapacitySizePrecise': '30', 'CycleEndTime': '2026-10-13 00:00:00'},
         ], now=fixed)
-        # 只有 10-16 在 3 天窗口内；10-20 太远，10-13 已过期。
-        self.assertAlmostEqual(result['expiring_soon'], 20)
+        # 7 天窗口（≤ 10-21 08:00）：10-16（2.6 天）与 10-20（5.7 天）都在，
+        # 10-21 23:00（7.6 天）太远，10-13 已过期。原来是 3 天窗口（只有 10-16），
+        # 窗口加宽后断言随之更新。
+        self.assertAlmostEqual(result['expiring_soon'], 30)
         self.assertEqual(result['remaining'], 60)
 
     def test_expiring_soon_defaults_to_now(self):

@@ -65,7 +65,7 @@ BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
 USAGE_BILLING = "https://www.workbuddy.cn/billing/meter/"
 USAGE_PAGE_SIZE = 100
 USAGE_SYNC_DAYS = 30   # 拉取窗口必须 ≥ 同步周期，否则连续断档会留永久空洞
-EXPIRY_SOON_DAYS = 3
+EXPIRY_SOON_DAYS = 7
 # 三档轮转策略。round_robin 按权重+最早过期排序后用游标轮转；
 # random 随机；expiry_first 只看最早过期、不看权重。
 ROUTING_POLICIES = frozenset(("round_robin", "random", "expiry_first"))
