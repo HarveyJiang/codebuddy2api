@@ -1193,12 +1193,13 @@ function openKeyBind(k) {
   };
   const paintBindModels = () => {
     const rows = models.filter(m => m.backend === bindTab);
-    // 括号里放**倍率 + 活动**（用户拍板：name 常与 id 同义，无信息量）；
-    // model id 本身放进 title —— 悬停可见，需要精确名时看得到。
+    // 每行 = **模型 id 为主** + 括号里倍率/活动（用户反馈：id 是必须显示的
+    // 标识，上一版只放 tooltip 过度删除了）。name 与 id 同义时不重复显示。
     list($("key-bind-models"), rows, selectedModels, m => {
       const bits = [creditsText(m)];
       if (m.promo) bits.push(`${m.promo.label} ×${m.promo.credits}`);
-      return {text: bits.join(" · "), title: m.value};
+      const extra = m.name && m.name !== m.value ? `（${m.name}）` : "";
+      return {text: `${m.value}${extra}（${bits.join(" · ")}）`, title: m.promo ? `${m.promo.label} 折扣后 ×${m.promo.credits}` : ""};
     });
   };
   bindTabsBox.hidden = !bindTabs.length || models.length < 2;
