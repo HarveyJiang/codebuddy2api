@@ -176,11 +176,13 @@
 | sort_order | INTEGER | 否 | 0 | 上游顺序，排序 tiebreak |
 | promo | TEXT | 是 | NULL | 促销展示文本；见下"促销取舍" |
 | synced_at | INTEGER | 否 | 0 | 该行所属后端的目录上次成功拉取时刻（schema v9；未知=0。按后端记，不进 `settings`——见第 3 阶段记录） |
-| canonical | TEXT | 是 | NULL | **预留，未实现**。跨后端同名模型的规范名（如 `kimi-k3-1` 与 `trae/kimi-k3` 都是 `kimi-k3`）；裸名自动选后端的候选键（见 `specs/model-routing-by-policy.md` §6.1）。空 = 无跨后端同名者 |
+| canonical | TEXT | 是 | NULL | **归一化别名（设计已定，未实现）**。跨后端别名映射到同一值（如 `kimi-k3-1` 与 `trae/kimi-k3` 都是 `kimi-k3`）；模型管理页分组与裸名自动选后端的键（见 `specs/model-routing-by-policy.md` §4）。填写规则：目录同步时按各后端声明的 `canonical_for` 填，不声明则默认去前缀 `model_id`；空 = 无跨后端同名者（绝大多数行） |
 
 > 注：本节最初按「查表替代内存 registry」设计（v2 迁移），实际落地时
-> `ModelRegistry` 保留内存态、表只做持久化。`canonical` 列待裸名自动选后端
-> 排期后以 v10 迁移加入（加列，幂等，安全类型）。
+> `ModelRegistry` 保留内存态、表只做持久化。`canonical` 列待排期后以迁移加入
+> （加列，幂等，安全类型；注意线上已到 v10，`canonical` 加入时版本号顺延）。
+> 落地时前端 `groupModelsByName` 的分组键从 `modelBaseName(id)` 切换为
+> `canonical || modelBaseName(id)`——Kimi K3 这类跨后端别名才合得进同一组。
 
 刷新策略：**UPSERT 不删行**。上游消失的模型标 `available=0` 保留，保证 `request_logs.model_id` / `upstream_request_usage.model` 长期可 join。`enabled` 仅由用户操作改写，刷新时不动。
 
