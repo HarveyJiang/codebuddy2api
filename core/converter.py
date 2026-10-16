@@ -636,6 +636,11 @@ def list_models(
     rows = _listed_rows()
     if rows is None:
         rows = [(m, None) for m in get_available_models()]
+    # 每行的元数据（上下文长度/倍率/描述）：来自注册表目录（admin 注入）。
+    # OpenAI 协议允许 model 对象带额外字段，客户端忽略不认识的不受影响；
+    # 而上下文长度正是「外部工具添加模型时必须手动填」的那一项 —— 直接给出
+    # 就不用人工查（用户 2026-10-16）。查不到行元数据时字段省略，不报错。
+    meta = _listed_meta()
     data = [
         {
             "id": mid,
@@ -646,6 +651,8 @@ def list_models(
             # 行自带 backend 时直接用它（每行一个后端）；否则按 §9.6 判策略第一名
             # （客户端拿这个判断「这个 id 实际会路由到谁」）。
             "owned_by": spec_for(backend or _owner_backend_for(mid)).owned_by,
+            **({k: meta[mid] for k in ("context_length", "credits", "description")
+                if meta.get(mid, {}).get(k) is not None} if meta else {}),
         }
         for mid, backend in rows
     ]
@@ -657,6 +664,15 @@ def _listed_rows():
     try:
         from admin.bare_routing_provider import listed_rows_for
         return listed_rows_for()
+    except Exception:
+        return None
+
+
+def _listed_meta():
+    """`/v1/models` 每行的元数据（裸名 -> 上下文/倍率/描述）；不可用返回 None。"""
+    try:
+        from admin.bare_routing_provider import listed_meta_for
+        return listed_meta_for()
     except Exception:
         return None
 

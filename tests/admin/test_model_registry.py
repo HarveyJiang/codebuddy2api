@@ -530,3 +530,30 @@ import pytest  # noqa: E402  (标记需要)
 # ---------------------------------------------------------------------------
 pytestmark = [pytest.mark.core]
 
+
+
+class ListedMetaTests(unittest.TestCase):
+    """`/v1/models` 每行元数据（上下文长度/倍率/描述）。
+
+    外部工具添加模型时要手动填上下文 —— 直接在 /v1/models 给出（用户 2026-10-16）。
+    """
+
+    def _registry(self):
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = upstream_payload()
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+        return registry
+
+    def test_listed_meta_reports_context_and_credits(self):
+        meta = self._registry().listed_meta()
+        self.assertTrue(meta)
+        glm = meta.get("glm-5.2")
+        self.assertEqual(glm["context_length"], 1000000)
+        self.assertEqual(glm["credits"], 0.79)
+        self.assertIn("description", glm)
+        # 上下文缺失时兜底 131072，不是 None（与 catalog_entries 同口径）。
+        for row in meta.values():
+            self.assertIsInstance(row["context_length"], int)

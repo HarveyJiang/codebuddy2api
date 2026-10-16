@@ -62,6 +62,30 @@ def set_listed_rows_provider(provider) -> None:
     _listed_rows = provider
 
 
+_listed_meta = None
+
+
+def set_listed_meta_provider(provider) -> None:
+    """注入 `/v1/models` 的每行元数据来源（上下文长度/倍率/描述）。
+
+    与行来源同理：数据在 admin 的 ModelRegistry 目录里，core 反向 import
+    不合规，由 admin 启动时注入；未注入/出错时 `/v1/models` 只省略这些
+    额外字段，不影响协议正确性。
+    """
+    global _listed_meta
+    _listed_meta = provider
+
+
+def listed_meta_for():
+    """裸名 -> {context_length, credits, description}；不可用时返回 None。"""
+    if _listed_meta is None:
+        return None
+    try:
+        return _listed_meta()
+    except Exception:
+        return None
+
+
 def listed_rows_for():
     """`/v1/models` 要列出的 (model_id, backend) 行；不可用时返回 None。
 

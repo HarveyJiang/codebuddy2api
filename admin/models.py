@@ -610,6 +610,29 @@ class ModelRegistry:
             state["error"] = None
         return True
 
+    def listed_meta(self):
+        """`/v1/models` 每行的元数据：裸名 -> {context_length, credits, description}。
+
+        外部工具（cherry studio、one-api 等）添加模型时必须手动填上下文长度 ——
+        直接在 /v1/models 里给出，工具能自动带出（用户 2026-10-16）。同名模型
+        在两个后端各一行时取**先注册的后端**值（倍率可能不同，取第一个遇到的；
+        展示用途，精度足够）。上下文缺失时报 131072 兜底（与 catalog_entries 同口径）。
+        """
+        with self._lock:
+            out = {}
+            for backend in known_backends():
+                state = self._state_for(backend)
+                for mid in state["available"]:
+                    if mid in out:
+                        continue
+                    entry = state["catalog"].get(mid) or {}
+                    out[mid] = {
+                        "context_length": entry.get("max_input_tokens") or 131072,
+                        "credits": entry.get("credits"),
+                        "description": entry.get("description"),
+                    }
+            return out
+
     def catalog_entries(self, backend):
         """供后端自己的目录提供者用：bare id 列表（含被禁用的 —— 禁用只挡客户端请求）。"""
         with self._lock:

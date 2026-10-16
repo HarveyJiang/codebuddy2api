@@ -1174,7 +1174,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     # 的决策方法**，不另写一套 —— 两套排序迟早分叉，表现为「列表说走 A，请求
     # 实际走 B」。这里只把「决定后端」这一步暴露出去，「决定模型名/凭据」仍是
     # 请求路径的事。
-    from .bare_routing_provider import set_strategy_winner, set_listed_rows_provider
+    from .bare_routing_provider import set_strategy_winner, set_listed_rows_provider, set_listed_meta_provider
 
     _routing_mw = PoolMiddleware.__new__(PoolMiddleware)
     _routing_mw.pool, _routing_mw.model_registry = pool, model_registry
@@ -1183,6 +1183,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     # 各有一行，`owned_by` 要按每行自己的后端报（用户 2026-10-16 拍板）——
     # 扁平的名字列表给不出这个信息。
     set_listed_rows_provider(model_registry.listed_models)
+    # `/v1/models` 的**每行元数据**（上下文长度/倍率/描述）：外部工具加模型
+    # 时能自动带出上下文长度，不用人工查（用户 2026-10-16）。
+    set_listed_meta_provider(model_registry.listed_meta)
 
     async def payload(req, optional=False):
         """解析 JSON body。
