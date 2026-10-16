@@ -12,9 +12,18 @@
 #   3. 数据目录    data/               → data/（整目录独立，state.db 不共享）
 #   4. 密钥        各自生成，永不复用生产的 ADMIN_KEY / API KEY
 #
-# **凭据不自动复制**：两个进程各持一份同一个 WorkBuddy 账号的凭据文件时，
-# 刷新令牌是单次有效的——dev 刷新一次会让生产手里那份失效，直接打挂线上。
-# 所以 dev 从零账号开始，用管理页的「浏览器授权」单独登一个账号。
+# **账号用生产同一份凭据**（挂载生产的 auth 目录，不是复制）：
+#
+# 这里刻意**不复制**。复制会得到两份会分叉的文件——生产刷新出 T2 写进自己那份、
+# dev 还拿着旧的 T1，而刷新令牌是单次有效的，dev 那次刷新会让生产下次刷新失败。
+# 挂载**同一个目录**则是单一真相源：谁刷新谁写回共享文件，另一个下次 mtime 检查
+# 就读到新的。
+#
+# 残余风险只有一个：两个进程在同一瞬间并发刷新同一份过期凭据，其中一次会失败。
+# 后果可控——凭据写回是原子的（tmp + os.replace，不会写坏文件），失败的进程抛
+# RuntimeError 只影响那一次请求，下次请求重读到新 token 即恢复。
+#
+# 挂载必须读写：只读的话生产停掉超过 token 有效期，dev 就自己续不上了。
 #
 # 用法：
 #   scripts/dev-deploy.sh              # 构建 + 重启 + 等健康
@@ -33,6 +42,9 @@ DEV_DIR="/opt/docker/workbuddy2api-dev"
 DEV_TAG="dev-local"                      # 本地构建的镜像 tag，不带时间戳
 DEV_PORT=8788
 DEV_URL="https://codebuddy-dev.2020224.xyz"
+
+# dev 直接挂生产同一份凭据目录（见文件头说明：挂载共享安全，复制才危险）
+SHARED_AUTH_DIR="${DEV_AUTH_DIR:-/opt/docker/workbuddy2api/data/auth}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -76,11 +88,15 @@ ok "已传输"
 # 传给远端。之前用不引用的 heredoc + 反斜杠转义 $ 是个坑：转义挡住了本地展开，
 # 远端 set -u 又会去展开同一个变量，结果 unbound。
 #
-# 参数：$1=DEV_DIR  $2=DEV_PORT  $3=DEV_TAG  $4=rebuild(0/1)
+# 参数：$1=DEV_DIR  $2=DEV_PORT  $3=DEV_TAG  $4=rebuild(0/1)  $5=共享 auth 目录
 ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes "$REMOTE" \
-    bash -s -- "$DEV_DIR" "$DEV_PORT" "$DEV_TAG" "$rebuild" <<'REMOTE_SCRIPT'
+    bash -s -- "$DEV_DIR" "$DEV_PORT" "$DEV_TAG" "$rebuild" "$SHARED_AUTH_DIR" <<'REMOTE_SCRIPT'
 set -euo pipefail
-DEV_DIR="$1"; DEV_PORT="$2"; DEV_TAG="$3"; REBUILD="$4"
+DEV_DIR="$1"; DEV_PORT="$2"; DEV_TAG="$3"; REBUILD="$4"; SHARED_AUTH="$5"
+
+# 必须先 export：下面的 compose heredoc 是**不引用**的，写文件时远端会展开
+# ${SHARED_AUTH_DIR}，那时还没定义的话 set -u 会直接报 unbound。
+export SHARED_AUTH_DIR="$SHARED_AUTH"
 
 cd "$DEV_DIR"
 rm -rf src && mkdir -p src
@@ -120,7 +136,10 @@ services:
       WORKBUDDY_IMAGE_TAG: ${DEV_TAG}
       TZ: Asia/Shanghai
     volumes:
-      - ./data/auth:/data/auth
+      # 凭据：挂生产同一份目录（单一真相源，理由见脚本头）。
+      # 状态：dev 自己的目录，绝不与生产共享——两套 state.db 并发写同一个
+      # SQLite 会真的把库锁坏。
+      - ${SHARED_AUTH_DIR}:/data/auth
       - ./data/management:/data/management
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=5)"]
@@ -129,7 +148,13 @@ services:
       retries: 3
 EOF
 
-mkdir -p data/auth data/management
+mkdir -p data/management
+
+if [ ! -d "$SHARED_AUTH" ]; then
+  echo "  共享凭据目录不存在：$SHARED_AUTH" >&2
+  exit 1
+fi
+echo "  共享凭据目录：$SHARED_AUTH（$(ls -1 "$SHARED_AUTH"/*.info 2>/dev/null | wc -l) 个凭据）"
 
 # 3) 构建
 if [ "$REBUILD" = "1" ]; then
