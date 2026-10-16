@@ -1145,8 +1145,11 @@ function openKeyBind(k) {
       label.className = "check-item";
       const box = document.createElement("input");
       box.type = "checkbox"; box.value = item.value; box.checked = selected.includes(item.value);
+      const out = render(item);
       const span = document.createElement("span");
-      span.textContent = render(item);
+      // render 可返回字符串，或 {text, title}（带悬停提示，模型列表在用）。
+      if (typeof out === "string") span.textContent = out;
+      else { span.textContent = out.text; if (out.title) span.title = out.title; }
       label.append(box, span);
       return label;
     }));
@@ -1182,7 +1185,13 @@ function openKeyBind(k) {
   };
   const paintBindModels = () => {
     const rows = models.filter(m => m.backend === bindTab);
-    list($("key-bind-models"), rows, selectedModels, m => m.name ? `${m.value}（${m.name}）` : m.value);
+    // 括号里放**倍率 + 活动**（用户拍板：name 常与 id 同义，无信息量）；
+    // model id 本身放进 title —— 悬停可见，需要精确名时看得到。
+    list($("key-bind-models"), rows, selectedModels, m => {
+      const bits = [creditsText(m)];
+      if (m.promo) bits.push(`${m.promo.label} ×${m.promo.credits}`);
+      return {text: bits.join(" · "), title: m.value};
+    });
   };
   bindTabsBox.hidden = !bindTabs.length || models.length < 2;
   paintBindTabs();
