@@ -1,4 +1,4 @@
-# 后端总闸：设置页启用/禁用后端（设计方案，未实现）
+# 后端总闸：设置页启用/禁用后端（**已实现**，2026-10-16）
 
 > 状态：**方案讨论中**（2026-10-16）。用户需求：设置页可勾选启用/禁用
 > workbuddy / trae；禁用某个后端后相关功能全部消失，但数据库保留，
@@ -152,7 +152,7 @@ Trae 可下线）。「默认后端」只是无归属字符串的兜底默认值
 
 | 位置 | 改动 |
 |---|---|
-| `admin/db.py` | `settings` 加两个 JSON 列 `backend_enabled` / `model_backend_order`（§3）；迁移只加列，无回填 |
+| `admin/db.py` | `settings` 加 `backend_enabled` JSON 列（§3）；迁移只加列，无回填。**新库 DDL 也要改**（新库走 `CREATE TABLE` 不走 `ALTER`，漏了会 `no such column`）。`model_backend_order` 随路由方案落地——总闸不需要它，不提前加死列 |
 | `core/backends/registry.py` | `is_enabled` 同时读内存里的 `backend_enabled` map（需把 Store/DB 引用传进去或回调注入——registry 目前不依赖 admin 层，**不能顶部 import**，照抄 `set_catalog_provider` 的注入模式） |
 | `admin/models.py` | `fetch`/`refresh_catalog` 跳过禁用后端 |
 | `admin/pool.py` | `tick` 的签到/刷新候选过滤禁用后端账号 |
@@ -161,8 +161,21 @@ Trae 可下线）。「默认后端」只是无归属字符串的兜底默认值
 | `tests/` | 每条语义的回归测试（禁用→行为消失→启用→恢复），arch guard 不变 |
 
 注意 `registry.py` 不能 import `admin`（循环依赖：admin 依赖 registry）。
-`is_enabled` 读表需要一个注入点——设计时可参考 `set_catalog_provider` 的
-「admin 启动时注入」模式（Trae 目录提供者就是这么解的，有先例）。
+`is_enabled` 读表需要一个注入点——已按 `set_catalog_provider` 的「admin 启动时注入」
+模式实现：`registry.set_enabled_provider(store.backend_flags)`，数据源是**内存副本**
+（`is_enabled` 在请求路径上，不能每次查 SQLite）。
+
+## 4.2 实现补充（落地时发现的两件事）
+
+1. **`is_enabled` 顺手声明化**：原实现是 `if name == "trae": return trae_enabled()`
+   ——一个按后端名分支的 if（当时注释还专门为它辩护）。总闸要动这个函数，正好改成
+   读 `BackendSpec.kill_switch_env` 声明。少一个名分支，`arch guard` 铁律
+   （禁止按后端名分支）从此在 registry 也成立，并有测试守（扫 `is_enabled` 源码里
+   有没有后端名）。
+2. **数据源异常按「全启用」处理**：`toggle_disabled` 里 provider 抛异常时返回
+   「未禁用」。方向性理由——总闸是「下线功能」，读失败当成全关会让线上后端集体消失、
+   大面积 400；当成全开最多是总闸暂时失效。`_decode_backend_flags` 同理（脏 JSON
+   → `{}`）。
 
 ## 6. 开放问题
 

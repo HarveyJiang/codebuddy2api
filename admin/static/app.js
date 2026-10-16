@@ -84,6 +84,7 @@ function render() {
   if (!$("pool-settings").contains(document.activeElement)) {
     $("pool-routing").value = overview.pool?.default_routing || "round_robin"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; $("sync-start").value = overview.pool?.sync_start || "10:00"; $("sync-end").value = overview.pool?.sync_end || "20:00";
     $("queue-failover").checked = overview.pool?.queue_failover || false; $("queue-model-fallback").checked = overview.pool?.queue_model_fallback !== false; $("queue-retry").value = overview.pool?.queue_retry ?? 3; $("queue-cooldown").value = overview.pool?.queue_cooldown ?? 120; $("queue-hold-ms").value = overview.pool?.queue_hold_ms ?? 3000; $("queue-fallback-model").value = overview.pool?.queue_fallback_model || "fast-model";
+    paintBackendToggles();
     paintSettings();
   }
   $("keys-body").innerHTML = keys.map(k => {
@@ -122,6 +123,35 @@ function applyBackends(list) {
   backends = (Array.isArray(list) ? list : []).slice()
     .sort((a, b) => (a.order ?? 50) - (b.order ?? 50) || String(a.name).localeCompare(String(b.name)));
 }
+// 后端总闸（settings.backend_enabled）：复选框由注册表驱动，加后端自动多一项。
+// enabled 取自后端接口的 is_enabled（已含环境逃生门），前端不自己判断。
+function paintBackendToggles() {
+  const box = $("backend-toggles");
+  if (!box) return;
+  box.innerHTML = backends.map(b => `<label class="inline-checkbox"><input type="checkbox" data-backend-toggle="${esc(b.name)}"${b.enabled ? " checked" : ""}>${esc(backendIcon(b.name))} ${esc(b.label)}</label>`).join("")
+    || `<span class="muted">没有可用后端</span>`;
+  lockBackendToggles();
+}
+// 不变量「启用集合恒 ≥ 1」的前端一半：只剩一个启用时把它置灰（服务端也会拒，
+// 两处都要有——只靠前端的话 curl 直打接口就能绕过）。
+function lockBackendToggles() {
+  const boxes = [...document.querySelectorAll("[data-backend-toggle]")];
+  const on = boxes.filter(b => b.checked);
+  boxes.forEach(b => {
+    const solo = on.length === 1 && b.checked;
+    b.disabled = solo;
+    b.closest("label").title = solo ? "至少需要保留一个后端启用" : "";
+  });
+}
+const backendToggle = $("backend-toggles");
+if (backendToggle) {
+  backendToggle.addEventListener("change", lockBackendToggles);
+  backendToggle.addEventListener("click", () => setTimeout(lockBackendToggles, 0));
+}
+// 提交用：{后端名: 是否启用}。置灰的那项仍是 checked，照实提交（它就是那个保留的）。
+const backendFlagsBody = () => Object.fromEntries(
+  [...document.querySelectorAll("[data-backend-toggle]")].map(b => [b.dataset.backendToggle, b.checked]));
+
 const backendMeta = b => backends.find(x => x.name === b) || null;
 const backendIcon = b => backendMeta(b)?.icon || "◇";
 const backendName = b => backendMeta(b)?.label || b || "未知";
@@ -418,7 +448,7 @@ $("dash-add").addEventListener("click", () => openAccount());
 $("dash-add-account").addEventListener("click", () => openAccount());
 $("empty-add").addEventListener("click", () => openAccount());
 $("accounts-back-dash").addEventListener("click", e => { e.preventDefault(); goPage("dashboard"); });
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value)}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody()}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 
 // ── 数据库备份 ──────────────────────────────────────────────────────────

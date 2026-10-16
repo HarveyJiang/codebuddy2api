@@ -141,16 +141,52 @@ def strip_prefix(model) -> str:
     return model[len(prefix):].strip() if prefix else (model or "")
 
 
-def is_enabled(name: str) -> bool:
-    """该后端是否在全局 kill switch 下启用。
+#: 设置页总闸的数据源（``{后端名: 是否启用}``，缺键即启用）。
+#:
+#: **为什么要注入而不是直接读 DB**：本模块是 core 层，不能 import admin
+#: （admin 依赖 registry，反向 import 成环）。admin 在启动时把一个「读内存
+#: 字典」的可调用对象塞进来——与 ``trae.set_catalog_provider`` 同一模式
+#: （core 侧对象持有 admin 启动时注入的可调用对象）。
+#:
+#: 为什么必须是**内存**字典而不是每次查库：``is_enabled`` 在请求路径上
+#: （``resolve_backend`` 每次请求都问一次），不能带一次 SQLite 查询。
+_enabled_provider = None
 
-    kill switch 目前只有 Trae 有（``CODEBUDDY_ENABLE_TRAE``）。这是**环境开关**，
-    与后端能力无关，所以按名字查是合适的 —— 它是「这个名字确实有开关」的白名单，
-    而不是「按名字分支」的逻辑。加一个没有 kill switch 的后端时这里不用改。
+
+def set_enabled_provider(provider) -> None:
+    """admin 启动时注入总闸数据源（返回 ``{后端名: bool}`` 或 None）。
+
+    传 None 退回「全启用」——测试与脚本直接构造 registry 时的默认行为，
+    与总闸功能上线前完全一致。
     """
-    if name == "trae":
-        return trae_enabled()
-    return True
+    global _enabled_provider
+    _enabled_provider = provider
+
+
+def toggle_disabled(name: str) -> bool:
+    """设置页总闸是否把该后端关掉了（读注入的数据源，缺键/无数据源=启用）。"""
+    if _enabled_provider is None:
+        return False
+    try:
+        flags = _enabled_provider() or {}
+    except Exception:
+        # 数据源异常时**按启用处理**：总闸是「下线功能」，因读取失败就把
+        # 线上后端下线会造成大面积 400，比不禁用坏得多。
+        return False
+    return not bool(flags.get(name, True))
+
+
+def is_enabled(name: str) -> bool:
+    """该后端是否启用：环境逃生门 **且** 设置页总闸，两者都为「开」。
+
+    两层的分工（specs/backend-toggle.md §3）：
+    - **环境逃生门**（``BackendSpec.kill_switch_env``）：运维手段，不经过 UI，
+      优先级最高。关掉它 UI 也救不回来——这是「出事了最快的止血方式」。
+    - **设置页总闸**（``settings.backend_enabled``）：用户功能，缺键即启用。
+
+    两层都读**声明**，不认后端名：加一个带逃生门的后端不用改这里。
+    """
+    return not spec_for(name).env_disabled() and not toggle_disabled(name)
 
 
 def backend_name_for(model) -> str:
@@ -163,7 +199,11 @@ def backend_name_for(model) -> str:
 
 
 def trae_enabled() -> bool:
-    """kill switch：CODEBUDDY_ENABLE_TRAE=0 时全链路禁用 Trae（模型列表/路由/目录）。"""
+    """环境逃生门：CODEBUDDY_ENABLE_TRAE=0 时全链路禁用 Trae（模型列表/路由/目录）。
+
+    保留这个函数名给既有调用方/测试用；它只看环境变量，**不含**设置页总闸
+    ——要问「整体启不启用」用 :func:`is_enabled`。
+    """
     return os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") != "0"
 
 
@@ -178,11 +218,13 @@ def resolve_backend(model) -> tuple[BackendSpec, str]:
     if prefix:
         name = backend_name_for(model)
         if not is_enabled(name):
+            # 文案不区分「谁关的」：环境逃生门关掉时提示「管理员禁用」也不算错
+            # （管理员就是运维），统一一句比让用户对着两种措辞猜要省事。
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": {
-                        "message": f"{spec_for(name).label} 后端已禁用（CODEBUDDY_ENABLE_TRAE=0）",
+                        "message": f"{spec_for(name).label} 后端已被管理员禁用",
                         "type": "invalid_request_error",
                     }
                 },

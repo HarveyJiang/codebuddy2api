@@ -28,8 +28,10 @@ from core.backends.registry import (
     backend_meta,
     backend_name_for,
     default_name as default_backend,
+    is_enabled as is_backend_enabled,
     known_names as known_backends,
     make_credential,
+    set_enabled_provider,
     spec_for,
 )
 from . import config, logging_setup
@@ -132,6 +134,62 @@ _MISSING = object()
 ENTITY_FIELDS = ("name", "file", "enabled", "created", "backend")
 
 
+def _decode_backend_flags(raw) -> dict:
+    """总闸 JSON 串 → {后端名: bool}。脏值一律当「全启用」。
+
+    宽容解析的理由：这是「下线功能」的开关，读坏了当成全关会让线上后端集体
+    消失、大面积 400；当成全开最多是总闸暂时失效，方向上安全得多。
+    只保留布尔值，键里的后端名由调用方按注册表校验（防手写错名字静默生效）。
+    """
+    if isinstance(raw, dict):  # 兼容已解好的形态（测试与内存直塞）
+        data = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+    else:
+        return {}
+    known = set(known_backends())
+    return {k: bool(v) for k, v in data.items() if k in known and isinstance(v, bool)}
+
+
+def _dumps_backend_flags(flags: dict) -> str:
+    """{后端名: bool} → 落库用的 JSON 串。空 map 存 '{}'（= 全启用）。"""
+    return json.dumps({k: bool(v) for k, v in flags.items()}, sort_keys=True)
+
+
+def _validate_backend_flags(raw, store) -> str:
+    """校验总闸提交，返回落库用的 JSON 串。非法即 400（不静默改写）。
+
+    三条规则：
+    1. 必须是 {后端名: 布尔}；未知后端名报错而不是忽略——静默忽略会让用户
+       以为自己关掉了某个后端（前端传错名字时尤其容易发生）。
+    2. **不变量：启用集合恒 ≥ 1**（用户拍板）。全关等于服务活着但没功能，
+       是最难排障的状态，所以这里硬拒而不是给提示。
+    3. 环境逃生门关着的后端**不计入**候选（CODEBUDDY_ENABLE_TRAE=0 时那个
+       后端本来就不参与服务，不该因为「界面开着它」就允许把它算进启用集合）。
+    """
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "后端启用状态格式无效")
+    known = list(known_backends())
+    flags = {}
+    for key, value in raw.items():
+        if key not in known:
+            raise HTTPException(400, f"未知后端：{key}")
+        if not isinstance(value, bool):
+            raise HTTPException(400, f"后端 {key} 的启用状态必须是布尔值")
+        flags[key] = value
+    # 缺失的后端按「启用」补齐：前端可能只提交变化过的键。
+    live = [name for name in known if not spec_for(name).env_disabled()]
+    enabled = [name for name in live if flags.get(name, True)]
+    if not enabled:
+        raise HTTPException(400, "至少需要保留一个后端启用")
+    return _dumps_backend_flags({name: name in enabled for name in live})
+
+
 class Store:
     def __init__(self, root, auth_dir, initial_key, admin_key):
         if len(admin_key) < 20:
@@ -159,6 +217,9 @@ class Store:
         self._dirty = {}  # 脏标记：值未变则跳过落库，避免每请求重写大 blob
         self.keys_dirty = False  # key 用量/管理改动等 save() 时才会落盘的字段
         self.log_buffer = []  # request_logs 批量缓冲，随 5 秒防抖落库
+        # 后端总闸的内存副本 {后端名: 是否启用}，缺键=启用。_load 会填。
+        # 私有属性 + backend_flags() 方法：同名会互相遮蔽（属性会盖掉方法）。
+        self._backend_flags: dict[str, bool] = {}
         self._load()
         if not self.data["accounts"] and not self.data["keys"]:
             # 全新部署（数据库为空）：优先从旧版 state.json 迁移（含 API Key，
@@ -206,6 +267,11 @@ class Store:
         settings = self.db.get_settings()
         # 池设置可能来自旧数据（缺新字段），用默认值补齐缺失项。
         self.data["pool"] = {**AccountPool.POOL_DEFAULTS, **(settings or {})}
+        # 总闸 map 单独解一份到内存（registry 的数据源）。同时给 pool 里的
+        # 原始 JSON 串兜底 —— save_settings 是整行 INSERT OR REPLACE、值从
+        # data["pool"] 取，键缺失会写 NULL 撞 NOT NULL（与 models_updated 同理）。
+        self._backend_flags = _decode_backend_flags(self.data["pool"].get("backend_enabled"))
+        self.data["pool"]["backend_enabled"] = _dumps_backend_flags(self._backend_flags)
         self.data["session_bindings"] = self.db.load_bindings()
 
     def _migrate_state_json(self):
@@ -429,9 +495,20 @@ class Store:
                        for it in self.data["accounts"].values())
 
     def account_rows(self):
+        """账号表格的数据源。**隐藏已禁用后端的账号**（用户拍板，2026-10-16）。
+
+        隐藏而不是置灰：禁用后端是「下线」，账号随之从界面上消失；重新启用
+        即刻原样回来（内存与数据库都不动它们）。总闸不变量保证至少一个后端
+        启用，所以这张表永远不为空。
+
+        只过滤**当前状态**——账本/日志/事件流不过滤，历史事实照常可查
+        （与「账本记事实，不记意图」同一条原则）。
+        """
         result = []
         for aid, item in self.data["accounts"].items():
             backend = item.get("backend", default_backend())
+            if not is_backend_enabled(backend):
+                continue
             row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "created": item["created"], "backend": backend}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
@@ -487,16 +564,19 @@ class Store:
 
         「可用」= 启用 + 凭据文件存在且可解析 + 未被标 auth_invalid。
         注意这里**不打上游接口**：health 必须廉价，不能每次调用都产生外部请求。
+
+        口径：**只统计可见账号**（account_rows 已隐藏禁用后端的），所以计数
+        与概览表格行数永远对得上。禁用后端的账号既不算 total 也不算异常——
+        它是被管理员下线了，不是坏了。
         """
         rows = self.account_rows()
         by_id = {row["id"]: row for row in rows}
         total = enabled = usable = auth_invalid = 0
-        for aid, item in self.data["accounts"].items():
+        for aid, row in by_id.items():
             total += 1
-            if not item["enabled"]:
+            if not row.get("enabled"):
                 continue
             enabled += 1
-            row = by_id.get(aid) or {}
             status = self.data["account_status"].get(aid) or {}
             # 必须与 pool.py 的判据一致：账号池标记认证失效用的是布尔字段
             # auth_invalid（不是 status="auth_invalid" 这个字符串，生产代码从不写它）。
@@ -542,6 +622,24 @@ class Store:
 
     def _today(self):
         return datetime.fromtimestamp(time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+    # -- 后端总闸 ----------------------------------------------------------
+
+    def backend_flags(self) -> dict:
+        """registry 的总闸数据源（注入点）。返回**副本**：调用方只读，
+        直接暴露内部 dict 的话，任何一处误改都会静默改掉全局启用状态。"""
+        with self.lock:
+            return dict(self._backend_flags)
+
+    def set_backend_flags(self, flags: dict) -> None:
+        """写入总闸。调用方需已按注册表校验过键名与「至少留一个」不变量。
+
+        两处必须同步：内存 map（registry 立刻生效，不等落库）与 pool 里的
+        JSON 串（save_settings 是整行重写，从这里取值）。
+        """
+        with self.lock:
+            self._backend_flags = {k: bool(v) for k, v in flags.items()}
+            self.data["pool"]["backend_enabled"] = _dumps_backend_flags(self._backend_flags)
 
     @staticmethod
     def key_unusable(item):
@@ -766,6 +864,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
     metrics = RequestMetrics()
+    # 后端总闸（settings.backend_enabled）注入 registry。registry 是 core 层，
+    # 不能反向 import admin（admin 依赖它，成环）——与上面的
+    # set_catalog_provider 同一模式。数据源是**内存字典**，因为 is_enabled
+    # 在请求路径上，不能每次查 SQLite。
+    set_enabled_provider(store.backend_flags)
     # 目录凭据：默认后端用 any_manager(默认后端)，其余后端各自按名字取。
     # 由 needs_own_credential_for_catalog / ModelRegistry.credential_getter_for 决定
     # 谁被用到 —— server 这里不再为某个具体后端留一个专用函数。
@@ -1379,6 +1482,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 1 <= keep <= 100:
                     raise HTTPException(400, "备份保留份数需在 1-100 之间")
                 settings["backup_keep"] = keep
+            if "backend_enabled" in body:
+                flags_json = _validate_backend_flags(body["backend_enabled"], store)
+                settings["backend_enabled"] = flags_json
+                # 同步内存 map：registry 立刻生效，不必等落库/重启。
+                store.set_backend_flags(_decode_backend_flags(flags_json))
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}

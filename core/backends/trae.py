@@ -1141,6 +1141,9 @@ class TraeBackend(BackendSpec):
     # 凭据：Unix 秒级 expiresAt（归一为毫秒要 ×1000）。
     credential_backend = "trae"
     expires_at_to_ms = 1000
+    # 环境逃生门（运维用，不经过 UI）：设成 0 即全链路禁用 Trae。
+    # 设置页总闸（settings.backend_enabled）是另一层，两者都为「开」才启用。
+    kill_switch_env = "CODEBUDDY_ENABLE_TRAE"
 
     # 积分/签到走 ug 接口，由 pool 分派到本后端的实现（_operate_nondefault）。
     account_ops_backend = "trae"

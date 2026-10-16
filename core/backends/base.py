@@ -13,6 +13,7 @@ astream 契约（所有后端必须遵守）：
 """
 from __future__ import annotations
 
+import os
 import sys
 from typing import AsyncIterator
 
@@ -94,6 +95,20 @@ class BackendSpec:
     expires_at_to_ms: int = 1
     #: 账号 doc 无 backend 字段时的默认归属（旧格式凭据）。None = 用本 spec 的 name。
     default_for_missing_backend: bool = False
+    #: 该后端的**环境逃生门**环境变量名（None = 没有）。设成 "0" 即全链路禁用。
+    #:
+    #: 为什么是声明而不是在 ``is_enabled`` 里写 ``if name == "trae"``：
+    #: 「这个名字有没有开关」是**每个后端自己的属性**，认名字等于把注册表
+    #: 变成名单。声明化后加后端不用改 registry，也让 arch guard 能守住
+    #: 「禁止按后端名分支」这条既有铁律（原先那个 if 是它的唯一例外）。
+    #:
+    #: 与设置页总闸（``settings.backend_enabled``）的关系：环境门优先级更高
+    #: （运维逃生用，不经过 UI），两者都为「开」才启用。见 registry.is_enabled。
+    kill_switch_env: str | None = None
+
+    def env_disabled(self) -> bool:
+        """环境逃生门是否关闭。读声明，不认名字。"""
+        return bool(self.kill_switch_env) and os.environ.get(self.kill_switch_env, "1") == "0"
 
     def credential_name(self) -> str:
         """凭据一致性闸门用的名字（见 core/converter.py 的 _selected_backend）。"""

@@ -353,6 +353,9 @@ class ModelRegistry:
     def fetch(self):
         """Pull the live product config. Returns True on success. Never raises.
 
+        守卫：默认后端被总闸关掉时不拉（specs/backend-toggle.md §2 第 4 条）。
+        放在方法内部而不是每个调用方，是为了让「不碰上游」这条规则只有一处。
+
         Endpoint: GET https://www.workbuddy.cn/v3/config — the gateway checks the
         CLI User-Agent (a fake bearer alone is not enough): without valid account
         credentials it answers with an empty shell (agents/models all null), so
@@ -362,6 +365,8 @@ class ModelRegistry:
         menu), data.models (credits/maxInputTokens/description...) and
         data.modelPromotions.
         """
+        if not is_backend_enabled(self._default):
+            return False
         try:
             headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
             # 未登录时上游只返回空壳（agents/models 全为 null），必须带账号凭据。
@@ -526,6 +531,10 @@ class ModelRegistry:
         存结果、算 updated/error —— 所以加后端时这个方法不用改。
         """
         spec = spec_for(backend)
+        # 总闸关掉的后端不拉目录（specs/backend-toggle.md §2 第 4 条）：
+        # 连上游都不碰 —— 拉回来也是白存一份没人用的数据，还白花一次请求。
+        if not is_backend_enabled(backend):
+            return False
         if not spec.refreshable_catalog or not spec.catalog_method:
             return False
         getter = self.credential_getter_for(backend)

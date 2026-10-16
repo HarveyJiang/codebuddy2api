@@ -27,6 +27,7 @@ from admin.rotation import WAF_IP_WINDOW, WafIpGate, backoff_after, is_waf_error
 from core.backends.registry import (
     backend_name_for,
     default_name as default_backend,
+    is_enabled as is_backend_enabled,
     spec_for,
 )
 
@@ -934,7 +935,9 @@ class AccountPool:
         with self.store.lock:
             cfg = dict(self.store.data["pool"])
             # 自动签到覆盖两后端（WorkBuddy 走 billing，Trae 走 ug checkin_credits）。
-            due = [aid for aid, item in self.store.data["accounts"].items() if spec_for(item.get("backend", default_backend())).supports_auto_checkin and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
+            # is_backend_enabled：总闸关掉的后端不签到（specs/backend-toggle.md
+            # §2 第 7 条）——后台定时任务不该去打一个用户已下线后端的上游。
+            due = [aid for aid, item in self.store.data["accounts"].items() if is_backend_enabled(item.get("backend", default_backend())) and spec_for(item.get("backend", default_backend())).supports_auto_checkin and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
         if cfg["auto_checkin"]:
             for aid in due:
                 _, due_time = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), 0)
@@ -963,7 +966,8 @@ class AccountPool:
             today = now.strftime("%Y-%m-%d")
             for aid, item in list(self.store.data["accounts"].items()):
                 status = self.store.data["account_status"].get(aid, {})
-                if not item["enabled"] or status.get("refresh_window_date") == today:
+                # 总闸关掉的后端不做凭据预刷新（同上：别去碰下线后端的上游）。
+                if not item["enabled"] or not is_backend_enabled(item.get("backend", default_backend())) or status.get("refresh_window_date") == today:
                     continue
                 # 每个账号每天抽一个时刻（默认统计时段内），到点后当天不再考虑。
                 slot = status.get("refresh_slot")

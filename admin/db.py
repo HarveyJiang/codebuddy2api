@@ -181,7 +181,23 @@ def _v8_to_v9(db):
                               (updated,))
 
 
-SCHEMA_VERSION = 9
+def _v9_to_v10(db):
+    """v9 → v10：给 settings 加 backend_enabled（设置页的后端总闸）。
+
+    **JSON 列而不是新表**（specs/backend-toggle.md §3）：settings 本来就是
+    「一行固定列 + 整行重写」，JSON 读改写零额外成本；后端数量是可变的，
+    按后端伸缩的东西装不进固定列结构。加新后端**零迁移**（缺键即启用）。
+
+    与 v9 的教训不冲突：v9 踩的是「运行时动态发明列名」（models_updated_<backend>），
+    这里列名固定、内容按后端伸缩，从头到尾不会触发那类错误。
+    无回填：列默认 '{}' 即「全部启用」，语义与升级前完全一致。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    if "backend_enabled" not in columns:
+        db._write.execute("ALTER TABLE settings ADD COLUMN backend_enabled TEXT NOT NULL DEFAULT '{}'")
+
+
+SCHEMA_VERSION = 10
 
 MICRO = 1_000_000
 
@@ -341,6 +357,7 @@ class Database:
             queue_hold_ms INTEGER NOT NULL DEFAULT 3000,
             queue_model_fallback INTEGER NOT NULL DEFAULT 1,
             queue_fallback_model TEXT NOT NULL DEFAULT 'fast-model',
+            backend_enabled TEXT NOT NULL DEFAULT '{}',
             backup_enabled INTEGER NOT NULL DEFAULT 0,
             backup_interval_hours INTEGER NOT NULL DEFAULT 24,
             backup_keep INTEGER NOT NULL DEFAULT 10,
@@ -528,7 +545,7 @@ class Database:
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
-                  (8, _v7_to_v8), (9, _v8_to_v9))
+                  (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -562,6 +579,9 @@ class Database:
         "sync_start", "sync_end", "batch_spread", "default_routing",
         "queue_failover", "queue_retry", "queue_cooldown", "queue_hold_ms",
         "queue_model_fallback", "queue_fallback_model", "models_updated",
+        # 后端总闸：{后端名: 是否启用}，缺键即启用（specs/backend-toggle.md）。
+        # JSON 存 TEXT 而不是加固定列 —— 后端数量可变，装不进固定列结构。
+        "backend_enabled",
         "backup_enabled", "backup_interval_hours", "backup_keep",
         "backup_last_at", "backup_last_name",
         "guard_reserve_credits", "guard_daily_token_limit",
