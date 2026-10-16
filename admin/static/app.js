@@ -474,17 +474,10 @@ function renderDashboard() {
   const fmt = value => Math.floor(Number(value)).toLocaleString("zh-CN");
   const rate = value => value === null || value === undefined ? "—" : value.toFixed(1) + "%";
   $("dash-available").textContent = accounts.filter(a=>a.pool_state === "available").length + " / " + accounts.length;
-  // 各后端积分是不同体系，分开汇总展示（如 WorkBuddy 积分 / Trae 积分）。
-  // 后端列表来自注册表：加后端后这里自动多一段，不必改代码。带后端名，
-  // 否则两段数字看不出各是谁的（用户 2026-10-16：总积分汇总要能读懂）。
+  // 账号总积分 = 各后端体系累加（用户 2026-10-16：就要一个总数）。
   const known = accounts.filter(a=>typeof a.remaining === "number");
-  const parts = backends.map(b => {
-    const own = known.filter(a=>(a.backend || backends[0]?.name)===b.name);
-    return own.length ? `${b.label || b.name} ${creditsFmt(own.reduce((s,a)=>s+a.remaining,0))}` : "";
-  }).filter(l=>l.length);
-  $("dash-credits").textContent = parts.length ? parts.join("  ·  ") : "—";
-  // 分开汇总后数字变长，字号随内容收缩，避免溢出换行。
-  $("dash-credits").style.fontSize = parts.length > 1 ? "26px" : "";
+  $("dash-credits").textContent = known.length ? creditsFmt(known.reduce((s,a)=>s+a.remaining,0)) : "—";
+  $("dash-credits").style.fontSize = "";
   $("dash-credit-note").textContent = known.length < accounts.length ? `已查询 ${known.length}/${accounts.length} 个账号，余额可能不完整` : accounts.some(a=>a.credits_stale) ? "包含待刷新余额，以最近一次查询为准" : "以最近一次上游查询为准";
   $("dash-requests").textContent = fmt(m.completed || 0);
   $("dash-request-note").textContent = `API ${m.api_count || 0} · 后台测试 ${m.test_count || 0}（历史累计）`;
@@ -572,8 +565,8 @@ function renderAccounts() {
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
     const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 签到 / 暂停 / 删除">⚙ 设置</button></td>`;
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}<td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td>${actions}</tr>`;
-  }).join("") || (overview.accounts.length ? '<tr><td colspan="7" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.earliest_expiry ? `<small class="cell-note">最早一批 ${esc(stamp(a.earliest_expiry*1000))} 过期（余 ${creditsFmt(a.earliest_expiry_remaining)}）</small>` : ""}${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${actions}</tr>`;
+  }).join("") || (overview.accounts.length ? '<tr><td colspan="5" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
 $("account-filter").addEventListener("change", () => { accountPage = 0; if(overview) renderAccounts(); });
