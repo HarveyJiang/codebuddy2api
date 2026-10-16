@@ -183,3 +183,7 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .model-tab .count-badge{font-size:10px;padding:1px 6px}
 .model-tab.selected .count-badge{background:#d8e6c5;color:#3c5c41}
 @media(max-width:760px){.model-tabs{gap:6px}.model-tab{padding:7px 11px;font-size:11px}}
+
+/* 密钥设置弹框：可用模型页签间距收紧（弹框里没有 16px 的余量）。 */
+#key-bind-dialog .model-tabs{margin:0 0 8px}
+#key-bind-dialog .model-tab{font-size:11px;padding:5px 11px}

@@ -1138,13 +1138,60 @@ function openKeyBind(k) {
     }));
     if (!items.length) { const p = document.createElement("p"); p.className = "muted"; p.textContent = "暂无可选项。"; host.replaceChildren(p); }
   };
-  const models = (overview.models?.models || []).filter(m => m.enabled).map(m => ({value:m.id, name:m.name || ""}));
-  list($("key-bind-models"), models, Array.isArray(k.models) ? k.models : [], m => m.name ? `${m.value}（${m.name}）` : m.value);
-  const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state}));
-  list($("key-bind-accounts"), accounts, Array.isArray(k.accounts) ? k.accounts : [], a => `${a.name}（${a.value.slice(0,6)}…）`);
+  const models = (overview.models?.models || []).filter(m => m.enabled);
+  const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state, backend:a.backend}));
+  // 可用模型按归属分页签（用户拍板）：同一份 check-list，页签只控制**哪些行
+  // 显示**，勾选状态保留 —— 切页签不丢已勾的项，保存时仍取全部勾选值。
+  // 页签数据来自注册表（/admin/api/backends），不写死后端名。
+  const selectedModels = Array.isArray(k.models) ? k.models : [];
+  const bindTabs = visibleBackends();
+  let bindTab = bindTabs[0]?.name || "";
+  const bindTabsBox = $("key-bind-model-tabs");
+  const paintBindTabs = () => {
+    bindTabsBox.innerHTML = bindTabs.map(b => {
+      const rows = models.filter(m => m.backend === b.name);
+      const on = rows.filter(m => selectedModels.includes(m.id)).length;
+      const sel = b.name === bindTab;
+      return `<button type="button" class="model-tab${sel ? " selected" : ""}" role="tab" aria-selected="${sel}"`
+        + ` data-bind-tab="${esc(b.name)}" title="只看 ${esc(b.label)} 的模型">${backendIconSvg(b.name)}<span>${esc(b.label)}</span>`
+        + `<span class="count-badge">${on} / ${rows.length}</span></button>`;
+    }).join("");
+  };
+  bindTabsBox.onclick = e => {
+    const btn = e.target.closest("[data-bind-tab]");
+    if (!btn) return;
+    bindTab = btn.dataset.bindTab;
+    paintBindTabs();
+    paintBindModels();
+  };
+  const paintBindModels = () => {
+    const rows = models.filter(m => m.backend === bindTab);
+    list($("key-bind-models"), rows, selectedModels, m => m.name ? `${m.value}（${m.name}）` : m.value);
+  };
+  bindTabsBox.hidden = !bindTabs.length || models.length < 2;
+  paintBindTabs();
+  paintBindModels();
+  // 可用账号：名字前带账号类型 icon（用户拍板）—— 多后端账号池里一眼分清
+  // 这是哪个上游的账号，与模型页签的 icon 口径一致。
+  list($("key-bind-accounts"), accounts, Array.isArray(k.accounts) ? k.accounts : [],
+    a => `${a.name}（${a.value.slice(0,6)}…）`);
+  $("key-bind-accounts").querySelectorAll(".check-item").forEach((el, i) => {
+    const a = accounts[i];
+    if (!a) return;
+    el.prepend(backendIconEl(a.backend));
+  });
   $("key-bind-routing").value = k.routing || "";
   $("key-bind-dialog").dataset.kid = k.id;
   $("key-bind-dialog").showModal();
+}
+// 独立 icon 元素（列表项用）：与 backendIconSvg 同源，颜色来自注册表声明。
+function backendIconEl(name) {
+  const span = document.createElement("span");
+  span.className = "account-icon-backend account-icon-inline";
+  span.style.color = backendMeta(name)?.color || "#888";
+  span.title = `${backendName(name)} 账号`;
+  span.innerHTML = backendIconSvg(name);
+  return span;
 }
 const checkedValues = host => [...host.querySelectorAll("input:checked")].map(b => b.value);
 $("key-bind-form").addEventListener("submit", async e => {
