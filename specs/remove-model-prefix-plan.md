@@ -194,7 +194,9 @@ model not in enabled_models() and model in snapshot_ids()  → 400「已在管�
 
 ## 六、不变量（改完必须成立）
 
-1. **`/v1/models` 无 `/`**；同名模型按后端各一条（`glm-5.3` 两条，`backend` 不同）。
+1. **`/v1/models` 无本项目自造的前缀**（准确说法见 §9.3：上游自带的 `/`
+   如 `openrouter/free` 是真实模型名，保留）；同名模型按后端各一条
+   （`glm-5.3` 两条，`backend` 不同，各报自己的 `owned_by`）。
 2. **禁用仍然有效**（§四坑 1）。
 3. **裸名路由正确**：`glm-5.3` 按策略落 `workbuddy`；调序后落 `trae`。
 4. **只有一个后端时完整可用**（§5.4）。
@@ -222,6 +224,8 @@ model not in enabled_models() and model in snapshot_ids()  → 400「已在管�
 5. **管理页页签**：HTML + CSS + JS + 前端测试。
 6. **文档 + arch guard**。
 
+> 六步均已完成，落地记录见 §九（含施工中发现的**两个真 bug** 与已改写的契约）。
+
 ---
 
 ## 八、决策记录（用户已拍板）
@@ -235,3 +239,90 @@ model not in enabled_models() and model in snapshot_ids()  → 400「已在管�
 | ⑤ | 迁移前备份？ | 是，按约定 `sqlite3 .backup` |
 
 **无待确认项，可开工。**
+
+---
+
+## 九、落地记录（2026-10-16 完成）
+
+六步全部完成，每步一次提交，全量测试每步跑过。最终：**后端 869 passed /
+1 skipped，前端 5/5**。
+
+| 步 | 提交 | 内容 |
+|---|---|---|
+| 1 | `3775544` | 回滚 v1/v2 遗留（revert `5445701`、丢弃 `wip-dedup`、删 `core/models_dedup.py` 与相关 spec/测试） |
+| 2 | `739e7cb` | `_v15_to_v16` 迁移 + 联合主键 `(model_id, backend)` |
+| 3 | `7557741` | 上游去前缀（写库 key / `enabled_models` / `snapshot_ids` / `snapshot`，一个提交） |
+| 4 | `0ef0110` | registry 去前缀（删 `prefix_for` / `strip_prefix` / `backend_name_for_prefix`） |
+| 5 | `5290b9c` | 管理页按上游分页签 |
+| 6 | （本次） | 文档 + arch guard |
+
+### 9.1 与 §六不变量的对照
+
+| # | 不变量 | 结果 |
+|---|---|---|
+| 1 | `/v1/models` 无自造 `/` | ✅ 生产库实测 0 条 `trae/`；上游自带的 `/`（`openrouter/free`）保留 —— **见 §9.3 的措辞修正** |
+| 2 | 禁用仍然有效 | ✅ 逐行读 `models.backend`；e2e 钉住 |
+| 3 | 裸名路由正确 | ✅ `glm-5.3` 按策略落 WB；调序后落 Trae（`test_bare_name_routing_e2e.py`） |
+| 4 | 只有一个后端时完整可用 | ✅ 单后端部署测试 + 前端单页签测试 |
+| 5 | Trae 独有模型能用裸名调 | ✅ 用 `Doubao-Seed-Code` 做判据（`glm-5.2` 两边都有，会走 WB） |
+| 6 | 归属由 `models.backend` 决定 | ✅ `ModelRegistry.load` 读列不猜前缀 |
+| 7 | 8 个同名模型不互相覆盖 | ✅ `load_model_rows()` 返回行列表（旧 `load_models()` 按 id 索引**会静默丢行**，已标注） |
+| 8 | 迁移保数据 | ✅ 生产 v9 副本 47 → 47 行 |
+| 9 | 迁移幂等 | ✅ 重复开库不重复剥 |
+| 10 | 生产长链可迁移 | ✅ v9 → v16 无报错 |
+| 11 | 日志与模型表同一套写法 | ✅ `request_logs.model_id` 等三表 `UPDATE` 剥前缀 |
+
+### 9.2 施工中发现并修掉的两个真 bug
+
+这两条都不在计划里，是改造过程中暴露出来的。**都被新测试钉住了**。
+
+1. **`load_models()` 按 `model_id` 索引会静默丢行**（`admin/db.py`）。
+   联合主键落地后，同名两行互相覆盖 —— 表现只是「模型少了一条」，不报错。
+   修法：新增 `load_model_rows()` 返回行列表，`ModelRegistry.load` 改用它；
+   老 `load_models()` 保留给先前的调用点并在 docstring 注明会丢行。
+
+2. **后端总闸的提示被模型门盖掉**（`admin/pool.py`，严重）。
+   原顺序是先按 `backend_name_for(模型名)` 判「该后端是否被禁用」，再跑模型门。
+   去前缀后 `backend_name_for` 对**所有裸名**都返回默认后端（同名模型两边都有，
+   静态判不出），于是关掉 Trae 后请求一个 Trae 独有模型会报
+   **「模型 X 已在管理页禁用」** —— 把「后端下线」说成「你禁用了某个模型」，
+   排障时会跑去模型页找一个从没动过的开关。
+   修法：**把归属解析提到模型门之前**。`_resolve_backend_for` 逐后端看候选，
+   能以 `NoCandidate` 给出逐条原因（「trae：后端已被管理员禁用」），这才是唯一
+   真相源；模型门降级为兜底（裸名路由被总闸关掉 / 无注册表时它仍是必须的）。
+
+   附带一个**行为变更**（正确行为，非回归）：关掉 Trae 后请求 `glm-5.2` 不再 400，
+   而是落到 WorkBuddy —— 因为「带前缀 = 用户点名后端」这个语义已随去前缀消失，
+   它现在只是一个普通裸名，策略会从候选里剔掉被禁用的 Trae 后选中 WB。
+
+### 9.3 已改写的契约
+
+- **`/v1/models` 同名行的 `owned_by`**（原 §六不变量 1 与 `model-routing-by-policy.md`
+  §9.6，用户 2026-10-16 拍板）：原来是「裸名 → 策略第一名的**单一**答案」。
+  现在**每条按自己的后端报** —— `glm-5.3` 列出两条，一条 `codebuddy`、一条
+  `trae-solo`。理由：`listed_models()` 逐行给出 `(id, backend)`，每条行本来就是
+  一个具体后端的模型，报别的后端的名字没有意义。
+  旧的单一答案路径保留为**兜底**（`converter._owner_backend_for`），只在拿不到
+  行清单时用（admin 未加载 / 独立跑 converter / 单测）。
+- **`/v1/models` 里「无 `/`」的措辞**：准确说法是「**无本项目自造的前缀**」。
+  上游自带的 `/`（如 `openrouter/free`）是**真实模型名**，必须保留 —— 已实测确认。
+- **§8 决策 ① 的 `canonical_for` 默认规则**：原文「不声明则默认 `model_id`
+  **剥前缀**即规范名」。去前缀后 `model_id` 本身就是裸名，默认规则退化为
+  「不声明即恒等」，不再需要剥前缀这一步。
+- **`BackendSpec.model_prefix` 的定位**：**保留但降级**。它被 `admin/db.py` 的
+  两个历史迁移正当使用（`_v11_to_v12` 按前缀回填 `backend` 列、`_v15_to_v16`
+  剥前缀）。删了迁移就无从知道 `trae/` 这个历史前缀 —— 只能写死字面量，而那正是
+  「加后端要改多处」。docstring 已改写为「仅供历史迁移读取，运行期禁止使用」，
+  并由 arch guard 拦截。
+
+### 9.4 管理页的新形态
+
+- 页签 = **可见后端**（`backends[].enabled`，即总闸 ∧ 环境逃生门），**不写死
+  后端名**（读 `/admin/api/backends`，顺序来自 `order`）；**无「全部」页签**。
+- 关掉一个上游 → 它的页签与它的行**一起**消失（而不是显示成空页签）；
+  当前页签被关闭时**自动切到**可见页签。
+- 单页里整列同一归属 → **不画归属 icon**；状态列是**逐行**开关（不再是
+  「一次作用到同名模型全部后端」的批量开关）。
+- **删除** `groupModelsByName` / `renderModelGroup` / `modelsInGroup` /
+  `modelBaseName` / `backendOrder`。合并展示的理由（同名两行看着像重复）随分页
+  一起消失 —— 它们本来就不会同屏了。

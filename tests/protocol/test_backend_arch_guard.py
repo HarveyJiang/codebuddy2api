@@ -314,6 +314,59 @@ def test_callers_do_not_route_by_model_prefix():
     )
 
 
+def test_callers_do_not_test_model_ids_for_a_backend_prefix():
+    """调用方**不得**对模型 id 做「带不带某后端前缀」的字符串判定。
+
+    去前缀前这类写法到处都是（`mid.startswith("trae/")` 判归属、
+    `model.split("/")[0]` 取后端名）。v16 后 id 就是上游裸名，这类判定
+    **恒为假**（不会有 `trae/` 了），却会静默把真正含斜杠的上游名
+    （`openrouter/free`）误判成「Trae 的模型」。
+
+    为什么必须守：这类代码**不会让任何行为测试变红** —— 今天没有部署真的用
+    含斜杠的上游名调过接口，所以误判永远走不到。它是纯粹的定时炸弹。
+
+    正确的来源：
+    - 某一行**存下来的**归属 → `models.backend` 列；
+    - 此刻**该走谁** → `admin/pool.py` 的裸名策略 / `registry.pinned_model_owner`。
+    """
+    offenders = []
+    # 判据要分清「模型 id」与「API 路径」：
+    #   - `mid.startswith("trae/")`、`mid.split("/")[0]` —— 模型 id 判据，**要拦**；
+    #   - `api("trae/flow/" + id)` —— 那是 **URL 路径**（登录流程端点），不是模型
+    #     id。它的 `"trae/"` 是路由前缀，与后端声明无关，**不能**拦。
+    # 区分方式：模型 id 的判据出现在 `.startswith(` / `.split("/")[0]` 里
+    # （下面两条），而 URL 拼接不是；单独的字面量 `"trae/"` 只在**没有** api( 前缀时
+    # 才算可疑。
+    id_prefix_check = re.compile(
+        r"""\.startswith\(\s*["'](?:%s)""" % "|".join(BACKEND_NAMES)
+        + r"""|\.split\(\s*["']/["']\s*\)\s*\[\s*0\s*\]"""
+    )
+    # 裸的前缀字面量（如 `"trae/" + mid`）：排除 URL 拼接（`api("trae/...")`）。
+    literal_prefix = re.compile(r"""["'](?:%s)/["']""" % "|".join(BACKEND_NAMES))
+    for rel, path in _caller_files():
+        if any(rel.startswith(a) for a in ALLOWED_FILES):
+            continue
+        for lineno, line, raw in _iter_code_lines(path):
+            if "arch-guard: ok" in raw:
+                continue
+            hit = id_prefix_check.search(line)
+            if not hit and literal_prefix.search(line):
+                # 排除 API 路径拼接：`api("trae/flow/" …)` / `"trae/callback/"` 等。
+                # 判据是「这个字面量紧跟在 `api(` 或一个 URL-ish 上下文里」。
+                if not re.search(r"""\bapi\(\s*["'](?:%s)/""" % "|".join(BACKEND_NAMES), line) \
+                        and not re.search(r"""["']/(?:admin/)?api/(?:%s)/""" % "|".join(BACKEND_NAMES), line):
+                    hit = literal_prefix.search(line)
+            if hit:
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "调用方按「模型 id 带某后端前缀」判归属（v16 已去前缀，这类判定恒假，"
+        "且会误伤含斜杠的真实上游名）：\n  "
+        + "\n  ".join(offenders)
+        + "\n\n请改用 `models.backend` 列（存下来的归属）或 pool 的裸名策略（此刻该走谁）；"
+          "确有必要时加 `# arch-guard: ok` 并注明理由。"
+    )
+
+
 def test_frontend_has_no_backend_literals():
     """前端不得自行登记后端元数据（图标 / 名称 / 顺序 / 前缀）。
 
@@ -332,8 +385,12 @@ def test_frontend_has_no_backend_literals():
         # 后端名当判据。
         if _compares_backend_name(code):
             offenders.append(f"admin/static/app.js:{i}: {line.strip()}")
-        # 硬编码的前缀剥离（应走 modelBaseName 读元数据）。
-        if re.search(r"replace\(/\^trae", code):
+        # 硬编码的前缀剥离（v16 已去前缀：id 就是上游裸名，没有前缀可剥）。
+        # 曾经这里靠 `replace(/^trae/, ...)` 与 `modelBaseName()` 剥前缀 —— 两者都删了。
+        # 拦住「有人再把前缀处理加回来」：那会把上游真实名（`openrouter/free`）误伤。
+        if re.search(r"replace\(/\^\s*(?:trae|workbuddy)", code):
+            offenders.append(f"admin/static/app.js:{i}: {line.strip()}")
+        if re.search(r"\bmodelBaseName\b", code):
             offenders.append(f"admin/static/app.js:{i}: {line.strip()}")
     assert not offenders, (
         "前端出现后端名硬编码 / 自留元数据表：\n  " + "\n  ".join(offenders)
