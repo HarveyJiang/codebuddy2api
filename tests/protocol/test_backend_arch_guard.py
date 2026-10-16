@@ -182,6 +182,9 @@ _IMPORTS_BACKEND = re.compile(
     r"\bfrom\s+core\.backends\.(?P<mod1>" + "|".join(BACKEND_NAMES) + r")\b"
     r"|\bimport\s+core\.backends\.(?P<mod2>" + "|".join(BACKEND_NAMES) + r")\b"
     r"|\bfrom\s+\.\s*import\s+(?P<mod3>" + "|".join(BACKEND_NAMES) + r")\b"
+    # 从包里直接取模块名（from core.backends import trae）。
+    # ``\b`` 边界保证不会误伤 ``from core.backends import trae_login``。
+    r"|\bfrom\s+core\.backends\s+import\s+(?P<mod4>" + "|".join(BACKEND_NAMES) + r")\b"
 )
 
 

@@ -14,6 +14,8 @@ pool / server / models / converter / 前端零改动。**
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from core.backends import registry
@@ -29,6 +31,273 @@ def test_every_backend_has_unique_prefix():
     prefixes = [registry.spec_for(n).model_prefix for n in registry.known_names()]
     nonempty = [p for p in prefixes if p]
     assert len(nonempty) == len(set(nonempty)), f"前缀重复：{prefixes}"
+
+
+def test_default_backend_comes_from_the_declaration(monkeypatch):
+    """默认后端由 ``default_for_missing_backend`` 决定，**不是**字面量兜底。
+
+    变异验证发现的漏洞：把 ``default_name()`` 末尾的
+    ``raise RuntimeError(...)`` 改回 ``return "workbuddy"``，全量 684 条**全绿**
+    —— 当前只有一个后端声明自己是默认后端，兜底分支永远走不到。这正是
+    「重构做了一半」最典型的形状：声称由声明驱动、实际由字面量兜底，
+    且没有任何测试能发现。
+
+    这里把「谁声明了默认归属」换掉，看 ``default_name()`` 是否跟着换。
+    """
+    class _Picker(BackendSpec):
+        name = "picker"
+        model_prefix = "pick/"
+        default_for_missing_backend = True
+
+        def chat_url(self):
+            return "https://pick.invalid"
+
+        def make_credential(self, path):
+            return None
+
+    class _PlainWB(BackendSpec):
+        """workbuddy 的替身：**不**声明自己是默认后端。"""
+
+        name = "workbuddy"
+        default_for_missing_backend = False
+
+        def chat_url(self):
+            return "https://wb.invalid"
+
+        def make_credential(self, path):
+            return None
+
+    specs = {"workbuddy": _PlainWB(), "picker": _Picker()}
+    monkeypatch.setattr(registry, "known_names", lambda: ("workbuddy", "picker"))
+    monkeypatch.setattr(registry, "spec_for", lambda name: specs.get(str(name), specs["workbuddy"]))
+
+    # 声明者是 picker，尽管 workbuddy 才是注册表里的第一个后端。
+    assert registry.default_name() == "picker", (
+        "default_name 没有跟着声明走 —— 它多半在某个地方兜底成了字面量"
+    )
+
+
+def test_default_name_refuses_when_nobody_declares():
+    """没有任何后端声明默认归属时宁可**报错**，也不要猜一个名字。
+
+    「猜」在生产里表现为：新后端接进来、忘了声明默认归属，于是所有无前缀模型名
+    被静默送给第一个注册的后端 —— 请求打到错的 endpoint，报的却是上游的错误。
+    """
+    class _NoDefault(BackendSpec):
+        name = "nodefault"
+
+        def chat_url(self):
+            return "https://x.invalid"
+
+        def make_credential(self, path):
+            return None
+
+    real_known, real_spec = registry.known_names, registry.spec_for
+    registry.known_names = lambda: ("nodefault",)
+    registry.spec_for = lambda name: _NoDefault()
+    try:
+        with pytest.raises(RuntimeError, match="default_for_missing_backend"):
+            registry.default_name()
+    finally:
+        registry.known_names, registry.spec_for = real_known, real_spec
+
+
+def test_registration_is_a_single_table():
+    """注册面收敛在 ``registry._REGISTRY`` 一张表上。
+
+    这是 P1 修过的形状：此前「注册一个新后端」要同时改 ``_load``（if name ==
+    "trae"）、``known_names``（order 字典）、``default_name``（return "workbuddy"）、
+    ``spec_for``（if name in ("trae",)）四处 —— 每处都要记得改，漏一处就是
+    「新后端能跑但顺序/默认/白名单不对」的静默故障。
+
+    现在这四个函数全部从 ``_REGISTRY`` 派生。这条测试钉死「表还在、且每个条目
+    自洽」，避免有人下次又在某个函数里回到按名字写 if。
+    """
+    table = registry._REGISTRY
+    assert len(table) >= 2, "注册表至少应有默认后端与一个带前缀的后端"
+    for entry in table:
+        assert set(entry) >= {"name", "order", "module", "attr", "lazy"}, entry
+        assert entry["module"].startswith("core.backends."), entry
+        assert isinstance(entry["lazy"], bool), entry
+    # 名字不重复、order 不重复（顺序要稳定）。
+    names = [e["name"] for e in table]
+    assert len(names) == len(set(names)), names
+    orders = [e["order"] for e in table]
+    assert len(orders) == len(set(orders)), orders
+
+
+def test_known_names_order_derives_from_the_table(monkeypatch):
+    """``known_names()`` 的顺序必须由 ``_REGISTRY`` 的 ``order`` 算出。
+
+    变异验证发现的漏洞：把 ``known_names`` 里的
+    ``order = {e["name"]: e["order"] for e in _REGISTRY}`` 改回硬编码字典
+    ``{"workbuddy": 0, "trae": 1}``，全量 686 条**全绿** —— 因为当前表的 order
+    恰好就是那两个值。「有表」和「表被用于派生」是两件事，测试必须验后者。
+    """
+    flipped = tuple({**e, "order": 1 - e["order"]} for e in registry._REGISTRY)
+    monkeypatch.setattr(registry, "_REGISTRY", flipped)
+    monkeypatch.setattr(registry, "_BACKENDS", {})
+    assert registry.known_names()[:2] == ("trae", "workbuddy"), (
+        "known_names 的顺序没有跟着 _REGISTRY 的 order 变 —— "
+        "它多半还在读内建的 order 字典"
+    )
+
+
+def test_default_backend_comes_from_the_declaration(monkeypatch):
+    """默认后端由 ``default_for_missing_backend`` 决定，**不是**字面量兜底。
+
+    变异验证发现的漏洞：把 ``default_name()`` 末尾的
+    ``raise RuntimeError(...)`` 改回 ``return "workbuddy"``，全量 684 条**全绿**
+    —— 当前只有一个后端声明自己是默认后端，兜底分支永远走不到。这正是
+    「重构做了一半」最典型的形状：声称由声明驱动、实际由字面量兜底，
+    且没有任何测试能发现。
+
+    这里把「谁声明了默认归属」换掉，看 ``default_name()`` 是否跟着换。
+    """
+    class _Picker(BackendSpec):
+        name = "picker"
+        model_prefix = "pick/"
+        default_for_missing_backend = True
+
+        def chat_url(self):
+            return "https://pick.invalid"
+
+        def make_credential(self, path):
+            return None
+
+    class _PlainWB(BackendSpec):
+        """workbuddy 的替身：**不**声明自己是默认后端。"""
+
+        name = "workbuddy"
+        default_for_missing_backend = False
+
+        def chat_url(self):
+            return "https://wb.invalid"
+
+        def make_credential(self, path):
+            return None
+
+    specs = {"workbuddy": _PlainWB(), "picker": _Picker()}
+    monkeypatch.setattr(registry, "known_names", lambda: ("workbuddy", "picker"))
+    monkeypatch.setattr(registry, "spec_for", lambda name: specs.get(str(name), specs["workbuddy"]))
+
+    # 声明者是 picker，尽管 workbuddy 才是注册表里的第一个后端。
+    assert registry.default_name() == "picker", (
+        "default_name 没有跟着声明走 —— 它多半在某个地方兜底成了字面量"
+    )
+
+
+def test_default_name_refuses_when_nobody_declares():
+    """没有任何后端声明默认归属时宁可**报错**，也不要猜一个名字。
+
+    「猜」在生产里表现为：新后端接进来、忘了声明默认归属，于是所有无前缀模型名
+    被静默送给第一个注册的后端 —— 请求打到错的 endpoint，报的却是上游的错误。
+    """
+    class _NoDefault(BackendSpec):
+        name = "nodefault"
+
+        def chat_url(self):
+            return "https://x.invalid"
+
+        def make_credential(self, path):
+            return None
+
+    real_known, real_spec = registry.known_names, registry.spec_for
+    registry.known_names = lambda: ("nodefault",)
+    registry.spec_for = lambda name: _NoDefault()
+    try:
+        with pytest.raises(RuntimeError, match="default_for_missing_backend"):
+            registry.default_name()
+    finally:
+        registry.known_names, registry.spec_for = real_known, real_spec
+
+
+def test_registration_is_a_single_table():
+    """注册面收敛在 ``registry._REGISTRY`` 一张表上。
+
+    这是 P1 修过的形状：此前「注册一个新后端」要同时改 ``_load``（if name ==
+    "trae"）、``known_names``（order 字典）、``default_name``（return "workbuddy"）、
+    ``spec_for``（if name in ("trae",)）四处 —— 每处都要记得改，漏一处就是
+    「新后端能跑但顺序/默认/白名单不对」的静默故障。
+
+    现在这四个函数全部从 ``_REGISTRY`` 派生。这条测试钉死「表还在、且每个条目
+    自洽」，避免有人下次又在某个函数里回到按名字写 if。
+    """
+    table = registry._REGISTRY
+    assert len(table) >= 2, "注册表至少应有默认后端与一个带前缀的后端"
+    for entry in table:
+        assert set(entry) >= {"name", "order", "module", "attr", "lazy"}, entry
+        assert entry["module"].startswith("core.backends."), entry
+        assert isinstance(entry["lazy"], bool), entry
+    # 名字不重复、order 不重复（顺序要稳定）。
+    names = [e["name"] for e in table]
+    assert len(names) == len(set(names)), names
+    orders = [e["order"] for e in table]
+    assert len(orders) == len(set(orders)), orders
+
+
+def test_known_names_order_derives_from_the_table(monkeypatch):
+    """``known_names()`` 的顺序必须由 ``_REGISTRY`` 的 ``order`` 算出。
+
+    变异验证发现的漏洞：把 ``known_names`` 里的
+    ``order = {e["name"]: e["order"] for e in _REGISTRY}`` 改回硬编码字典
+    ``{"workbuddy": 0, "trae": 1}``，全量 686 条**全绿** —— 因为当前表的 order
+    恰好就是那两个值。「有表」和「表被用于派生」是两件事，测试必须验后者。
+    """
+    monkeypatch.setattr(registry, "_REGISTRY", tuple(
+        {"name": e["name"], "order": 99 - e["order"] if False else e["order"],
+         "module": e["module"], "attr": e["attr"], "lazy": e["lazy"]}
+        for e in registry._REGISTRY))
+    # 把 workbuddy 的 order 改到 trae 后面，输出顺序必须跟着翻。
+    flipped = []
+    for e in registry._REGISTRY:
+        e = dict(e)
+        e["order"] = {0: 1, 1: 0}.get(e["order"], e["order"])
+        flipped.append(e)
+    monkeypatch.setattr(registry, "_REGISTRY", tuple(flipped))
+    monkeypatch.setattr(registry, "_BACKENDS", {})
+    assert registry.known_names()[:2] == ("trae", "workbuddy"), (
+        "known_names 的顺序没有跟着 _REGISTRY 的 order 变 —— "
+        "它多半还在读内建的 order 字典"
+    )
+
+
+def test_registry_modules_have_no_stray_backend_branches():
+    """注册表里除白名单外的「按后端名分支」应已收敛。
+
+    review 指出注册表自己就是硬编码后端名的重灾区（``known_names`` 的 order 字典、
+    ``default_name`` 的 ``return "workbuddy"``、``spec_for`` 的 ``if name in ("trae",)``）。
+    现在 ``_REGISTRY`` 是唯一允许出现后端名的地方；剩下的两处按名字判断是
+    **有意保留**的，各自有理由，这条测试把它们记下来，多出来的就是新的渗透点：
+
+    1. ``is_enabled`` —— 每个后端的 kill switch 是**环境变量**，与能力无关，
+       按名字查是「这个名字有没有开关」的白名单；
+    2. ``resolve_backend`` —— 某个后端的模型名映射（``map_model``）是它私有的
+       归一规则，形状各后端差异大，不适合塞进声明。
+    """
+    import re
+    src = (registry.__file__ and Path(registry.__file__).read_text(encoding="utf-8")) or ""
+    # 只看代码行（剥注释与 docstring）。
+    import ast
+    tree = ast.parse(src)
+    doc_lines = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", None) or []
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                doc_lines.update(range(body[0].lineno, body[0].end_lineno + 1))
+    hits = []
+    for i, line in enumerate(src.splitlines(), 1):
+        if i in doc_lines:
+            continue
+        code = line.split("#", 1)[0]
+        if re.search(r'==\s*["\'](?:workbuddy|trae)["\']|in\s*\(\s*["\'](?:workbuddy|trae)["\']', code):
+            hits.append(f"registry.py:{i}: {code.strip()}")
+    # 允许 is_enabled 与 resolve_backend 各一处（见 docstring）。
+    assert len(hits) <= 2, (
+        "注册表出现新的按后端名分支（应改为从 _REGISTRY / 声明派生）：\n  " + "\n  ".join(hits)
+    )
 
 
 def test_at_most_one_default_backend():
@@ -369,6 +638,32 @@ def test_only_account_ops_backend_implements_checkin_claim():
     # 可重试的上游拒绝码（9074/9004）→ 判为可重试。
     ok, msg, retryable = trae.interpret_checkin_claim({"code": 9074, "message": "高峰限流"})
     assert ok is False and retryable is True and "高峰" in msg
+
+
+def test_upstream_error_class_rejects_misdeclared_name():
+    """``error_class_name`` 指向非异常类时必须显式报错。
+
+    这段代码跑在**异常处理路径**上（pool 的 except 匹配）：若名字写错、或指向
+    别的模块的名字，裸 ``AttributeError`` 会在这里炸成二次异常，极难定位。
+    所以约定「必须与后端同模块」，并在违反时给一句能读懂的话。
+    """
+
+    class _Misdeclared(BackendSpec):
+        name = "misdeclared"
+        error_class_name = "Nope"           # 同模块里没有这个名字
+
+    with pytest.raises(TypeError) as ei:
+        _Misdeclared().upstream_error_class()
+    assert "Nope" in str(ei.value) and "不同于" not in str(ei.value)
+
+    class _NotAnException(BackendSpec):
+        name = "notexc"
+        error_class_name = "not_an_exception_here"
+
+    # 模块里有个同名的非异常对象（下面这行）→ 也要被拒。
+    globals()["not_an_exception_here"] = "我是字符串"
+    with pytest.raises(TypeError):
+        _NotAnException().upstream_error_class()
 
 
 def test_base_spec_defaults_are_the_plainest_backend():

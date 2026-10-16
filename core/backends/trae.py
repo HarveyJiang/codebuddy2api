@@ -139,9 +139,9 @@ def trae_model_catalog() -> list[dict]:
 
 def set_catalog_provider(provider):
     """兼容旧入口：把提供者注入注册表里的 Trae 单例。"""
-    from .registry import trae_backend
+    from .registry import spec_for
 
-    trae_backend().set_catalog_provider(provider)
+    spec_for("trae").set_catalog_provider(provider)
 
 
 class UnknownTraeModel(Exception):

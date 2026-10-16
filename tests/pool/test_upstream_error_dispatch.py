@@ -151,9 +151,17 @@ def test_checkin_claim_retryable_code_is_retried(trae_pool, monkeypatch):
 
 
 def test_workbuddy_account_does_not_take_nondefault_path(tmp_path, monkeypatch):
-    """腾讯账号不走非默认后端那条路 —— 分派是按声明、不是按「有没有 trae」。"""
+    """腾讯账号不走非默认后端那条路 —— 分派是按声明、不是按「有没有 trae」。
+
+    上游返回一份**合法**的腾讯账单响应，让这条用例只验分派、不依赖
+    「上游会失败」这种隐式前提（否则腾讯路径哪天变得容忍空 body，测试仍绿
+    但语义已经漂移）。
+    """
     def handler(request):
-        return httpx.Response(200, json={})
+        return httpx.Response(200, json={
+            "code": 0,
+            "data": {"Response": {"Data": {"TotalCount": 0, "Accounts": []}}},
+        })
 
     pool = build_pool(tmp_path, [_workbuddy_info(tmp_path)], handler)
     aid = next(iter(pool.store.data["accounts"]))

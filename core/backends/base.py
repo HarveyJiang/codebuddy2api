@@ -95,17 +95,6 @@ class BackendSpec:
     #: 账号 doc 无 backend 字段时的默认归属（旧格式凭据）。None = 用本 spec 的 name。
     default_for_missing_backend: bool = False
 
-    # --- 凭据 ------------------------------------------------------------
-
-    #: 凭据管理器的「所属后端」标识。池选号后用它与请求后端比对做一致性闸门
-    #: （防独立部署下 A 后端账号收到 B 后端请求）。None = 用本 spec 的 name。
-    credential_backend: str | None = None
-    #: 账号 doc 里 expiresAt 的单位换算到毫秒的倍数。
-    #: WorkBuddy=1（本来就是毫秒）；Trae=1000（Unix 秒）。
-    expires_at_to_ms: int = 1
-    #: 账号 doc 无 backend 字段时的默认归属（旧格式凭据）。None = 用本 spec 的 name。
-    default_for_missing_backend: bool = False
-
     def credential_name(self) -> str:
         """凭据一致性闸门用的名字（见 core/converter.py 的 _selected_backend）。"""
         return self.credential_backend or self.name
@@ -197,11 +186,24 @@ class BackendSpec:
     error_class_name: str = "BackendHTTPError"
 
     def upstream_error_class(self):
-        """本后端上游错误的异常类（用于 pool 的 except 类型化兜底）。"""
+        """本后端上游错误的异常类（用于 pool 的 except 类型化兜底）。
+
+        约定：``error_class_name`` 指向的类必须与 BackendSpec 子类**同模块**
+        （即 ``type(self).__module__``）。写别的模块的名字会解析失败 ——
+        这里显式报错而不是让 ``getattr`` 抛裸 ``AttributeError``：这段代码跑在
+        **异常处理路径**上，最不该在这种地方出现难懂的二次异常。
+        """
         if self.error_class_name == "BackendHTTPError":
             return BackendHTTPError
-        module = type(self).__module__
-        return getattr(sys.modules[module], self.error_class_name)
+        module_name = type(self).__module__
+        module = sys.modules.get(module_name)
+        cls = getattr(module, self.error_class_name, None) if module else None
+        if not isinstance(cls, type) or not issubclass(cls, BaseException):
+            raise TypeError(
+                f"{type(self).__name__}.error_class_name={self.error_class_name!r} "
+                f"在模块 {module_name} 里不是异常类；该名字必须指向与后端同模块的异常类型"
+            )
+        return cls
 
     def interpret_checkin_claim(self, data: dict):
         """签到 claim 响应的业务码 → ``(成功?, 消息, 可重试?)``。
