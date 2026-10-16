@@ -1542,11 +1542,16 @@ def test_checkin_status_and_claim_and_ent_usage(tmp_path):
             # UgHeaders：Cloud-IDE-JWT + X-User-Region + 设备三头 + x-app-version
             assert req.headers["Authorization"] == "Cloud-IDE-JWT TRAE-ACCESS"
             assert req.headers["X-User-Region"] == "CN"
-            assert req.headers["X-Device-Id"] == "d" * 32
+            # ug 链路设备号必须是 16 位纯数字：hex32 的 deviceId 会被上游风控拒签（9074）
+            assert req.headers["X-Device-Id"] == "1249607945172505"
             assert req.headers["x-device-brand"] == "PC"
             assert req.headers["x-device-type"] == "Linux"
             assert req.headers["x-app-version"] == "1.0.0"
-            assert req.headers["User-Agent"] == T.CLIENT_UA
+            assert req.headers["x-app-type"] == "trae"
+            assert req.headers["Origin"] == T.CONSOLE_HOST
+            assert req.headers["Referer"] == T.CONSOLE_HOST + "/"
+            # ug 链路由 VSCode 插件进程发起，UA 与 chat 的 IDE 主进程不同
+            assert req.headers["User-Agent"] == T.UG_UA
             # body 必须带 req_source，空 body 会被上游按"订单参数不正确"拒绝
             assert json.loads(req.content) == {"req_source": 1}
             return httpx.Response(200, json={"checked_in": True, "credits": 66, "enable": False})
@@ -1568,23 +1573,42 @@ def test_checkin_status_and_claim_and_ent_usage(tmp_path):
 
 
 def test_ug_headers_device_trio_and_req_source(tmp_path):
-    """ug_headers 必须带设备三头 + x-app-version；签到 body 必须带 req_source=1。"""
+    """ug_headers 必须带设备三头 + x-app-version；签到 body 必须带 req_source=1。
+
+    设备号归一化为 16 位纯数字（生产实测：hex32 的 deviceId 会让 claim 恒返回 9074）。
+    """
     assert T.CHECKIN_BODY == {"req_source": 1}
     doc = trae_credential()
     p = tmp_path / "t.info"
     p.write_text(json.dumps(doc), encoding="utf-8")
     h = T.TraeCredentialManager(p).ug_headers()
-    assert h["X-Device-Id"] == "d" * 32
+    assert h["X-Device-Id"] == "1249607945172505"  # md5("d"*32) 派生，16 位纯数字
     assert h["x-device-brand"] == "PC" and h["x-device-type"] == "Linux"
     assert h["x-app-version"] == "1.0.0"
-    # deviceId 缺失时不发设备三头（x-app-version 仍发），由上游返回 9004 暴露
+    assert h["x-app-type"] == "trae"
+    assert h["Origin"] == T.CONSOLE_HOST and h["Referer"] == T.CONSOLE_HOST + "/"
+    assert h["User-Agent"] == T.UG_UA
+    # deviceId 已是 16 位纯数字时原样透传，不重复派生
+    doc_digit = trae_credential()
+    doc_digit["auth"]["deviceId"] = "2320418618741168"
+    p_digit = tmp_path / "t_digit.info"
+    p_digit.write_text(json.dumps(doc_digit), encoding="utf-8")
+    assert T.TraeCredentialManager(p_digit).ug_headers()["X-Device-Id"] == "2320418618741168"
+    # uid 是数字且 deviceId 非数字时，优先用 uid 补位到 16 位
+    doc_uid = trae_credential(uid="2320418618")
+    p_uid = tmp_path / "t_uid.info"
+    p_uid.write_text(json.dumps(doc_uid), encoding="utf-8")
+    assert T.TraeCredentialManager(p_uid).ug_headers()["X-Device-Id"] == "2320418618000000"
+    # deviceId 缺失时不再裸奔：由 uid/md5 派生数字设备号，三头照发
     doc2 = trae_credential()
     doc2["auth"].pop("deviceId")
     p2 = tmp_path / "t2.info"
     p2.write_text(json.dumps(doc2), encoding="utf-8")
     h2 = T.TraeCredentialManager(p2).ug_headers()
-    assert "X-Device-Id" not in h2 and "x-device-brand" not in h2 and "x-device-type" not in h2
+    assert h2["X-Device-Id"] == "2271192794839258"  # md5("trae-user") 派生
+    assert h2["x-device-brand"] == "PC" and h2["x-device-type"] == "Linux"
     assert h2["x-app-version"] == "1.0.0"
+    assert h2["User-Agent"] == T.UG_UA
 
 
 def test_manager_fetch_models_uses_solo_headers(tmp_path):
@@ -1632,7 +1656,7 @@ def test_manager_fetch_models_uses_ug_headers(tmp_path):
     assert [m["id"] for m in models] == ["glm-5.2"]
     assert "/api/remote/v1/models" in seen["url"] and "solo_agent_remote" in seen["url"]
     assert seen["auth"] == "Cloud-IDE-JWT TRAE-ACCESS"
-    assert seen["region"] == "CN" and seen["device"] == "d" * 32
+    assert seen["region"] == "CN" and seen["device"] == "1249607945172505"
 
 
 def test_ug_api_error_paths():
