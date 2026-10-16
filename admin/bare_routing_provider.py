@@ -48,3 +48,35 @@ def strategy_winner_for(model):
         return _strategy_winner(model)
     except Exception:
         return None
+
+
+#: admin 启动时注入：`() -> list[(model_id, backend)] | None`，返回 `/v1/models`
+#: 要列的**每一行及其归属后端**。None 表示「查不到」（未注入/未加载）——调用方
+#: 回落到扁平名字列表（`converter.get_available_models`），展示路径不会因此报错。
+_listed_rows = None
+
+
+def set_listed_rows_provider(provider) -> None:
+    """注入 `/v1/models` 的行来源（`admin/server.py` 启动时调用）。"""
+    global _listed_rows
+    _listed_rows = provider
+
+
+def listed_rows_for():
+    """`/v1/models` 要列出的 (model_id, backend) 行；不可用时返回 None。
+
+    **为什么要单开一个入口**：去前缀后同名模型在两个后端各有一行（不变量 1），
+    `/v1/models` 的 `owned_by` 要按**每行自己的后端**报（用户 2026-10-16 拍板）。
+    扁平的名字列表（`get_available_models()`）丢掉了这一信息，只能给出「这个名字
+    的归属」；而 `/admin/api/test` 的模型门要的正是那个扁平集合。两个用途不同，
+    不能合并成一个返回值。
+
+    异常吞掉返回 None（与 :func:`strategy_winner_for` 同理）：展示路径不该因为
+    registry 出问题而 500。
+    """
+    if _listed_rows is None:
+        return None
+    try:
+        return _listed_rows()
+    except Exception:
+        return None

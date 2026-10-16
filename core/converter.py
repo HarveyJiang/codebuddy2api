@@ -625,25 +625,41 @@ def list_models(
     x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
 ):
     _check_auth(authorization, x_api_key)
-    models = get_available_models()
+    # 每行 = (id, 归属后端)。去前缀后同名模型在两个后端各有一行，`owned_by`
+    # 按**这一行自己的后端**报（用户 2026-10-16 拍板）——`glm-5.3` 因此列出两条，
+    # 一条 `codebuddy`、一条 `trae-solo`。查不到行清单（未注入/独立跑 converter）
+    # 时回落到扁平名字列表，归属仍按 §9.6 的策略判定。
+    #
+    # 用 `is None` 判「查不到」而不是 `or`：空目录（[]）是**合法结果**
+    # （上游还没拉过、全被禁用），不该被当成「没注入」而回落 —— 那会让两条
+    # 不同来源的语义混在一起，且回落出来的名字列表本就是空的，行为看起来一样，
+    # 等到有数据时才暴露分叉。
+    rows = _listed_rows()
+    if rows is None:
+        rows = [(m, None) for m in get_available_models()]
     data = [
         {
-            "id": m,
+            "id": mid,
             "object": "model",
             "created": 1700000000,
-            # owned_by 取自**后端自己的声明**（BackendSpec.owned_by），不再用
-            # `m.startswith("trae/")` 猜——那是把「谁是我」的判断硬编码在调用方，
-            # 加/改后端时这里会悄悄失效（声明里改了 owned_by 也同步不过来）。
-            # backend_name_for 是「模型名 → 后端名」的唯一判定处（先 pinned 后前缀）。
-            #
-            # 裸名条目（不带任何后端前缀）额外按**当前策略**报归属（§9.6）：
-            # 客户端拿这个字段判断「这个 id 实际会路由到谁」。带前缀的条目本来就是
-            # 用户点名的后端，不需要也不该被策略覆盖。
-            "owned_by": spec_for(_owner_backend_for(m)).owned_by,
+            # owned_by 取自**后端自己的声明**（BackendSpec.owned_by），不用
+            # `m.startswith("trae/")` 猜——那是把「谁是我」的判断硬编码在调用方。
+            # 行自带 backend 时直接用它（每行一个后端）；否则按 §9.6 判策略第一名
+            # （客户端拿这个判断「这个 id 实际会路由到谁」）。
+            "owned_by": spec_for(backend or _owner_backend_for(mid)).owned_by,
         }
-        for m in models
+        for mid, backend in rows
     ]
     return {"object": "list", "data": data}
+
+
+def _listed_rows():
+    """`/v1/models` 的行清单 (id, backend)；admin 未加载时返回 None。"""
+    try:
+        from admin.bare_routing_provider import listed_rows_for
+        return listed_rows_for()
+    except Exception:
+        return None
 
 
 def _owner_backend_for(model) -> str:

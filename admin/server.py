@@ -1174,15 +1174,30 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     # 的决策方法**，不另写一套 —— 两套排序迟早分叉，表现为「列表说走 A，请求
     # 实际走 B」。这里只把「决定后端」这一步暴露出去，「决定模型名/凭据」仍是
     # 请求路径的事。
-    from .bare_routing_provider import set_strategy_winner
+    from .bare_routing_provider import set_strategy_winner, set_listed_rows_provider
 
     _routing_mw = PoolMiddleware.__new__(PoolMiddleware)
     _routing_mw.pool, _routing_mw.model_registry = pool, model_registry
     set_strategy_winner(lambda model: _routing_mw._resolve_backend_for(model, None))
+    # `/v1/models` 的**行清单**：每行是 (裸名, 后端)。去前缀后同名模型在两个后端
+    # 各有一行，`owned_by` 要按每行自己的后端报（用户 2026-10-16 拍板）——
+    # 扁平的名字列表给不出这个信息。
+    set_listed_rows_provider(model_registry.listed_models)
 
-    async def payload(req):
+    async def payload(req, optional=False):
+        """解析 JSON body。
+
+        `optional=True`：**没有 body** 时返回 None（DELETE 这类可能不带 body
+        的请求）。「有 body 但不是合法 JSON」仍然 400 —— 那是调用方写错了，
+        静默当成没给会让前端以为 backend 生效了。
+        """
+        raw = await req.body()
+        if not raw:
+            if optional:
+                return None
+            raise HTTPException(400, "请求不是有效 JSON")
         try:
-            body = await req.json()
+            body = json.loads(raw)
         except ValueError:
             raise HTTPException(400, "请求不是有效 JSON")
         if not isinstance(body, dict):
@@ -1465,15 +1480,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             raise HTTPException(502, snapshot.get("error") or "拉取失败")
         return {"ok": True, "count": len(snapshot["models"])}
 
-    # mid 用 :path——Trae 模型 id 带斜杠（trae/glm-5.2），单段 {mid} 匹配不到。
+    # mid 用 :path——模型 id 可能是自定义的带斜杠 id（上游也有 `openrouter/free`
+    # 这类），单段 {mid} 匹配不到。
     @app.patch("/admin/api/models/{mid:path}")
     async def model_toggle(mid: str, req: Request):
         store.require_admin(req)
         body = await payload(req)
         if type(body.get("enabled")) is not bool:
             raise HTTPException(400, "enabled 需为布尔值")
+        # `backend` 由前端显式给：v16 起 id 是裸名，同名模型两边都有
+        # （`glm-5.3`），只凭 id 猜不出要改哪一行。缺省时回落声明兜底。
         try:
-            model_registry.set_enabled(mid, body["enabled"])
+            model_registry.set_enabled(mid, body["enabled"], backend=body.get("backend"))
         except KeyError:
             raise HTTPException(404, "模型不存在")
         model_registry.persist(store.db)
@@ -1516,7 +1534,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         enabled = body.get("enabled", True)
         if type(enabled) is not bool:
             raise HTTPException(400, "enabled 需为布尔值")
-        source = model_registry.add(mid, enabled=enabled, name=(name or None),
+        # `backend` 由前端归属多选展开时逐次带上（见 app.js）；缺省回落声明兜底。
+        source = model_registry.add(mid, enabled=enabled, backend=body.get("backend"),
+                                    name=(name or None),
                                     description=description, credits=credits,
                                     max_input_tokens=max_in)
         model_registry.persist(store.db)
@@ -1526,14 +1546,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def model_delete(mid: str, req: Request):
         """删除模型。只允许删自定义项。
 
-        `:path` 转换器是**必需**的：模型 id 可以带后端前缀（`trae/kimi-k3`），
-        `{mid}` 的默认转换器不匹配斜杠，前端 `encodeURIComponent` 送来的 `%2F`
-        也没法变成路径分隔符 —— 结果是带前缀的自定义模型**删不掉**（404）。
-        归属多选让这类行变得常见，所以这里必须收。
+        `:path` 转换器是**必需**的：模型 id 可能是带斜杠的自定义 id
+        （上游也有 `openrouter/free` 这类），`{mid}` 的默认转换器不匹配斜杠，
+        前端 `encodeURIComponent` 送来的 `%2F` 也没法变成路径分隔符 ——
+        结果是这类自定义模型**删不掉**（404）。
+
+        `backend` 语义同 toggle：同名多后端下由前端显式给。
         """
         store.require_admin(req)
+        body = await payload(req, optional=True)
         try:
-            model_registry.remove(mid, db=store.db)
+            model_registry.remove(mid, db=store.db,
+                                  backend=(body or {}).get("backend"))
         except KeyError:
             raise HTTPException(404, "模型不存在")
         except ValueError:

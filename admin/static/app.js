@@ -306,12 +306,10 @@ function groupModelsByName(list) {
   return out;
 }
 
-// 模型 id 去掉后端前缀后的本名。前缀表来自注册表（后端可声明任意前缀），
-// 不再写死 `trae/`。
+// 模型名（**已是上游裸名**）。v16 去前缀后 id 不再带后缀，这里只是保留一个
+// 明确的「裸名」概念给归组用；不再读 `backends[].prefix`（那个字段已删）。
 function modelBaseName(id) {
-  let s = String(id || "");
-  for (const b of backends) if (b.prefix && s.startsWith(b.prefix)) s = s.slice(b.prefix.length);
-  return s;
+  return String(id || "");
 }
 
 // 某个组包含哪些条目 —— **渲染与批量操作共用这一处判断**。
@@ -377,7 +375,7 @@ function renderModelGroup(g) {
   // 多后端时不再在按钮上写后端名（用户 2026-10-16 拍板）：归并行的每个后端各有一个
   // 删除按钮，写出来就是「删除 WB」「删除 Trae」并排两行 —— 归属已经由该列上方的
   // 归属 icon 表达，按钮只留「删除」二字，后端名靠 `title` 提示。
-  const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}"${multi ? ` title="删除 ${esc(backendName(m.backend))} 下的 ${esc(m.id)}"` : ""}>删除</button>`).join("");
+  const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"${multi ? ` title="删除 ${esc(backendName(m.backend))} 下的 ${esc(m.id)}"` : ""}>删除</button>`).join("");
 
   // 多后端行的行名：当各成员的**裸名不一致**时用官方展示名，否则用裸名。
   //
@@ -1061,7 +1059,7 @@ $("models-body").addEventListener("click", async e => {
     try {
       // 逐个串行：任一失败要能定位到具体模型，已成功的保持生效（PATCH 幂等，可重试）。
       for (const m of targets) {
-        await api("models/" + encodeURIComponent(m.id), {method:"PATCH", body:{enabled}});
+        await api("models/" + encodeURIComponent(m.id), {method:"PATCH", body:{enabled, backend: m.backend}});
         done += 1;
       }
       await refresh();
@@ -1078,7 +1076,9 @@ $("models-body").addEventListener("click", async e => {
     const mid = del.dataset.modelDelete;
     if (!confirm(`删除自定义模型 ${mid}？`)) return;
     del.disabled = true;
-    try { await api("models/" + encodeURIComponent(mid), {method:"DELETE"}); await refresh(); toast(`已删除 ${mid}`); }
+    // backend 由渲染时写进 dataset：同名模型两边都有，删除必须指名是哪一行。
+    const backend = del.dataset.modelBackend || undefined;
+    try { await api("models/" + encodeURIComponent(mid), {method:"DELETE", body:{backend}}); await refresh(); toast(`已删除 ${mid}`); }
     catch (err) { toast(err.message); del.disabled = false; }
   }
 });
@@ -1103,18 +1103,11 @@ $("models-add").addEventListener("click", () => {
   renderBackendPicker();
   $("model-dialog").showModal();
 });
-// 带前缀的 ID 已显式指定归属 → 收敛多选框为仅那一个后端（§4.3）。
+// v16：id 是上游裸名，不再有「带前缀 ⇒ 自带归属」这回事 —— 归属一律由多选框
+// 决定，所以这个 input 监听**不再收敛选项**，只负责把「被环境禁用的后端」置灰。
 $("model-id").addEventListener("input", () => {
-  const value = $("model-id").value.trim();
-  const named = backends.find(b => b.prefix && value.startsWith(b.prefix));
   $("model-backend-options").querySelectorAll("[data-model-backend]").forEach(input => {
-    if (!named) {
-      input.disabled = backends.find(x => x.name === input.dataset.modelBackend)?.enabled === false;
-      return;
-    }
-    const isTarget = input.dataset.modelBackend === named.name;
-    input.checked = isTarget;
-    input.disabled = !isTarget;
+    input.disabled = backends.find(x => x.name === input.dataset.modelBackend)?.enabled === false;
   });
 });
 $("model-form").addEventListener("submit", async e => {
@@ -1135,13 +1128,10 @@ $("model-form").addEventListener("submit", async e => {
     max_input_tokens: num($("model-ctx")),
     enabled: $("model-enabled").checked,
   };
-  // 带前缀的 ID 自带归属（后端按前缀判定），除此之外按多选框展开。
-  // 前缀拼接规则来自 backends[].prefix，不是手写 "trae/"。
-  const explicit = backends.find(b => b.prefix && id.startsWith(b.prefix));
-  const chosen = explicit
-    ? [explicit]
-    : backends.filter(b => b.enabled !== false
-        && $("model-backend-options")?.querySelector(`[data-model-backend="${b.name}"]`)?.checked);
+  // 归属完全由多选框决定：v16 起 id 是**上游裸名**（不再有 `trae/` 之类的前缀
+  // 能自带归属），所以「带前缀的 ID 自动收敛为一个后端」那段逻辑已删除。
+  const chosen = backends.filter(b => b.enabled !== false
+      && $("model-backend-options")?.querySelector(`[data-model-backend="${b.name}"]`)?.checked);
   const targets = chosen.length ? chosen : [backends[0]];
   const button = $("model-submit");
   button.disabled = true;
@@ -1149,10 +1139,9 @@ $("model-form").addEventListener("submit", async e => {
   let saved = 0;
   try {
     for (const backend of targets) {
-      // 默认后端前缀为空串，直接用裸名；其它后端带自己的前缀。
-      const targetId = explicit ? id : (backend.prefix || "") + id;
       try {
-        await api("models", {method: "POST", body: {id: targetId, ...fields}});
+        // id 是裸名，归属靠 body 的 `backend` 指定（同名模型两边各一行）。
+        await api("models", {method: "POST", body: {id, backend: backend.name, ...fields}});
         saved += 1;
       } catch (err) {
         failed.push(`${backend.label || backend.name}：${err.message}`);

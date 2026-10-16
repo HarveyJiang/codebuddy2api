@@ -159,26 +159,43 @@ class BareNameRoutingEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self._last_log_backend(), "trae")
 
-    async def test_models_list_bare_name_reports_the_strategy_winner(self):
-        """§9.6：`/v1/models` 里裸名条目的 `owned_by` = **当前策略第一名**。
+    async def test_models_list_lists_every_backend_row_with_its_owner(self):
+        """`/v1/models` 每行按**自己的后端**报 `owned_by`（用户 2026-10-16 拍板）。
 
-        构造：把 Trae 提到第一位（显式配序）→ 裸名条目必须改报 Trae 的 owned_by。
-        这条把「展示层复用同一套策略」钉住：若 `owned_by` 退回静态
-        `backend_name_for`（恒为默认后端），它会仍然说 codebuddy 而红。
+        去前缀后同名模型在两个后端各有一行（不变量 1），`owned_by` 因此必须逐行取
+        自己的后端，而不是按 id 判一个「策略第一名」——后者对两条同 id 的条目
+        只能给同一个答案，客户端分不出来。
+
+        历史：这里原先断言「裸名条目 owned_by = 当前策略第一名」（§9.6）。那条
+        契约建立在「一个 id 一条」之上；改成「按后端各一条」后它不再成立，
+        故整体改写（不是删掉 —— 「展示层要说清会走谁」这个诉求由裸名**请求**路径
+        的测试继续守着）。
         """
         r0 = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
-        before = {m["id"]: m["owned_by"] for m in r0.json()["data"]}
-        self.assertEqual(before["glm-5.3"], spec_for("workbuddy").owned_by,
-                         "默认顺序下裸名归默认后端")
+        data = r0.json()["data"]
+        glm53 = [m for m in data if m["id"] == "glm-5.3"]
+        self.assertEqual(len(glm53), 2, "glm-5.3 两边都有 → 应列出两条")
+        self.assertEqual({m["owned_by"] for m in glm53},
+                         {spec_for("workbuddy").owned_by, spec_for("trae").owned_by})
+        # 逐行对照 registry 的行清单：任何一行报错归属都会红。
+        rows = self.app.state.model_registry.listed_models()
+        self.assertEqual([(m["id"], m["owned_by"]) for m in data],
+                         [(mid, spec_for(b).owned_by) for mid, b in rows])
 
-        # 用户把 Trae 调到第一位（显式配序）。
+    async def test_models_list_owned_by_unaffected_by_backend_order(self):
+        """行归属来自**它属于哪个后端**，与用户配的后端顺序无关。
+
+        对比旧契约：那时裸名的 `owned_by` 会随 `model_backend_order` 变（因为它报的是
+        「策略第一名」）。现在报的是「这一行是谁的」，调序不该改变它 ——
+        调序影响的是**请求**落到谁（由 `test_bare_name_routing` 系列守着）。
+        """
+        r0 = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        before = {(m["id"], m["owned_by"]) for m in r0.json()["data"]}
+
         self.app.state.store.data["pool"]["model_backend_order"] = ["trae", "workbuddy"]
         r1 = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
-        after = {m["id"]: m["owned_by"] for m in r1.json()["data"]}
-        self.assertEqual(after["glm-5.3"], spec_for("trae").owned_by,
-                         "用户调序后，裸名条目的 owned_by 必须跟着变")
-        # 带前缀的条目**不受策略影响**（用户已点名后端）。
-        self.assertEqual(after["trae/glm-5.3"], spec_for("trae").owned_by)
+        after = {(m["id"], m["owned_by"]) for m in r1.json()["data"]}
+        self.assertEqual(before, after, "调序不该改变 /v1/models 的行归属")
 
     async def test_models_list_never_errors_when_no_candidate(self):
         """展示路径不因「此刻没有可用候选」而失败（它列的是目录，不是可用性）。
@@ -191,6 +208,29 @@ class BareNameRoutingEndToEnd(unittest.IsolatedAsyncioTestCase):
         r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["data"])
+
+    async def test_models_list_ids_have_no_slash(self):
+        """不变量 1：`/v1/models` 里**不允许出现任何带 `/` 的 id**。
+
+        `trae/xxx` 这类前缀是我们自己拼的（上游只返回裸名），去前缀改造的
+        核心诉求就是让它从系统里消失。允许有 `/` 的只有上游真实模型名
+        （如 `openrouter/free`）—— 那是它们的原名，不是我们的前缀。
+        """
+        r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        data = r.json()["data"]
+        prefixed = [m["id"] for m in data if m["id"].startswith("trae/")]
+        self.assertEqual(prefixed, [], f"不得再有 trae/ 前缀的 id：{prefixed}")
+
+    async def test_bare_name_is_actually_routed_by_strategy(self):
+        """裸名 `glm-5.3` 两边都有 → 请求按策略落到默认后端（WB）。
+
+        与展示层对照：`/v1/models` 会**列出两条** `glm-5.3`（每后端一条），
+        但一次**请求**只能落一处 —— 这里用实际选中的账号钉住那处是 WB
+        （默认顺序下 order 0）。
+        """
+        r = await self._post("glm-5.3")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._last_log_backend(), "workbuddy")
 
     async def test_unknown_model_lists_every_rejection(self):
         """§5.1 末段：候选为空 → 400，且逐条说明每个后端为什么出局。"""

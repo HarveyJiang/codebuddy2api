@@ -114,34 +114,51 @@ class BackendColumnTests(unittest.TestCase):
         return registry
 
     def test_persist_writes_backend_column(self):
+        """persist 写的 `backend` 列必须与「目录来自哪个后端」一致。
+
+        v16 前这里拿 `backend_name_for(mid)`（前缀推导）对照；去前缀后前缀没了，
+        权威反而是**目录归属**本身 —— 用 registry 的 per-backend 目录反查。
+        """
         registry = self._fetched()
         registry.persist(self.db)
         rows = self.db.load_models(only_available=True)
         self.assertTrue(rows)
+        # 每个后端的目录里的裸名，其行必须标着该后端。
+        expected = {}
+        for backend in ("workbuddy", "trae"):
+            for mid in registry._state_for(backend)["available"]:
+                expected[mid] = backend
         for mid, row in rows.items():
-            self.assertEqual(row["backend"], backend_name_for(mid),
-                             f"{mid} 的 backend 列与归属不一致")
+            if mid in expected:
+                self.assertEqual(row["backend"], expected[mid],
+                                 f"{mid} 的 backend 列与它所在的目录不一致")
 
-    def test_load_reads_column_not_prefix(self):
-        """列是权威：带前缀的 id 若列声称归别的后端，就以列为准。
+    def test_load_reads_column_not_guess(self):
+        """列是权威：同名两行靠 `backend` 列分派到各自的后端目录。
 
-        构造 `trae/glm-5.2` 但列写 `workbuddy`（与前缀矛盾）。若 load 还在按前缀
-        推导，这行会进 Trae 目录；读列则进 WorkBuddy 目录。断言后者。
+        v16 起 id 是裸名，`glm-5.2` 在两个后端都有 —— 谁归谁**只能**看列。
+        构造同一个裸名两行、列分别写两个后端，断言各进各的目录。
         """
         self.db.save_models({
-            "trae/glm-5.2": {"name": "GLM-5.2", "source": "upstream",
-                             "available": 1, "enabled": 1, "backend": "workbuddy"},
+            "glm-5.2": {"name": "GLM-5.2", "source": "upstream",
+                        "available": 1, "enabled": 1, "backend": "workbuddy"},
         })
+        # save_models 的字典键是 model_id（裸名）；同名第二行直接经底层写入，
+        # 因为它与第一行的键相同。这正是联合主键存在的场景。
+        self.db._write.execute(
+            "INSERT INTO models (model_id,name,source,available,enabled,backend)"
+            " VALUES ('glm-5.2','GLM-5.2','upstream',1,1,'trae')")
         fresh = self._registry()
         fresh.load(self.db)
-        # 读列 → 归 WorkBuddy；此时前缀 "trae/" 不被剥离，bare 就是完整 id。
-        self.assertIn("trae/glm-5.2", fresh._state_for("workbuddy")["catalog"])
-        self.assertNotIn("glm-5.2", fresh._state_for("trae")["catalog"])
+        self.assertIn("glm-5.2", fresh._state_for("workbuddy")["catalog"])
+        self.assertIn("glm-5.2", fresh._state_for("trae")["catalog"])
 
-    def test_load_ignores_prefix_when_column_is_set(self):
-        """反向对照：列与前缀一致时，行为与从前（按前缀分派）完全相同。
+    def test_load_ignores_prefix_style_id(self):
+        """历史遗留的带前缀 id 不再被「剥前缀」—— v16 迁移已把它们改写成裸名。
 
-        两条合起来证明「换成读列」对既有数据零行为变化。
+        万一有老库的行漏了迁移（前缀还在），load 会把它当**完整的裸名**装进
+        按列指定的后端目录（`trae/glm-5.2` 这个字面 id）。这里钉住那个事实：
+        load 层**不做**前缀解析，前缀的清理只在迁移里做一次。
         """
         self.db.save_models({
             "trae/kimi-k3": {"name": "Kimi", "source": "upstream",
@@ -149,23 +166,27 @@ class BackendColumnTests(unittest.TestCase):
         })
         fresh = self._registry()
         fresh.load(self.db)
-        self.assertIn("kimi-k3", fresh._state_for("trae")["catalog"])
-        self.assertNotIn("kimi-k3", fresh._state_for("workbuddy")["catalog"])
+        self.assertIn("trae/kimi-k3", fresh._state_for("trae")["catalog"])
+        self.assertNotIn("kimi-k3", fresh._state_for("trae")["catalog"])
 
-    def test_no_drift_between_column_and_prefix(self):
-        """drift 断言：全表不得存在「列值与前缀推导不符」的行。
+    def test_no_drift_between_column_and_directory(self):
+        """drift 断言：persist 写进库的每一行，其 `backend` 必须等于它来源的目录。
 
-        这是结构性断言——将来有人加了一条写模型的路径而忘了设列，它先红。
-        例外只有 `pinned_models`：它们的权威是声明而不是前缀（今天两者结论一致）。
+        这是结构性断言 —— 将来有人加了一条写模型的路径而忘了设列，它先红。
+        去前缀后**没有前缀可对照**，所以对照的权威换成「registry 的各后端目录」：
+        同一份内存目录 persist 出去，读回来必须能按列还原出同样的归属。
         """
         registry = self._fetched()
         registry.persist(self.db)
-        pinned = {m for name in ("workbuddy", "trae") for m in spec_for(name).pinned_models}
+        # 内存目录：{model_id: backend}
+        expected = {}
+        for backend in ("workbuddy", "trae"):
+            for mid in registry._state_for(backend)["available"]:
+                expected[mid] = backend
         for mid, row in self.db.load_models().items():
-            if mid in pinned:
-                continue
-            self.assertEqual(row["backend"], backend_name_for(mid),
-                             f"{mid}：列={row['backend']} 前缀推导={backend_name_for(mid)}")
+            if mid in expected:
+                self.assertEqual(row["backend"], expected[mid],
+                                 f"{mid}：列={row['backend']} 目录={expected[mid]}")
 
     def test_fresh_database_has_the_column(self):
         """新库走 CREATE TABLE 而不是 ALTER —— 漏改 DDL 会 no such column。

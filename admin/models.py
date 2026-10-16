@@ -28,7 +28,6 @@ from core.backends.registry import (
     is_enabled as is_backend_enabled,
     known_names as known_backends,
     spec_for,
-    strip_prefix,
 )
 
 BACKEND = "https://copilot.tencent.com"
@@ -56,19 +55,36 @@ SOURCE_CUSTOM = "custom"
 _SOURCE_RANK = {SOURCE_CUSTOM: 0, SOURCE_BUILTIN: 1, SOURCE_UPSTREAM: 2}
 
 
-def backend_for_model_id(mid):
-    """对外模型 id → 所属后端名（按各后端声明的前缀）。
+def backend_for_model_id(mid, backend=None):
+    """模型 id → 所属后端名。
 
-    取代原先散落各处的 ``mid.startswith("trae/")`` 判断：前缀是后端自己的声明，
-    加后端时这里不用改。
+    v16 去前缀后，`model_id` 是**裸名**（上游原名），它**不再唯一确定后端**：
+    生产库里实测有 8 组同名（`glm-5.3` 两边都有）。所以「这条属于谁」有两个来源，
+    优先级从高到低：
+
+    1. **调用方显式给的 `backend`**（管理页操作走这条：API 请求里带着 `backend`）。
+       这是唯一在「同名多后端」下正确的答案。
+    2. **声明兜底**：`pinned_models`（三档智能路由这类无前缀虚拟模型）→ 声明它的后端；
+       此外一律归**默认后端**。给的是「静态归属」，读请求路径的答案请用
+       `admin/pool.py` 的裸名策略（§5）—— 那里才知道此刻该走谁。
+
+    为什么保留第二路而不是强制调用方必传：请求路径（`converter` / `pool`）拿到的是
+    裸名 + 已算好的归属，管理页的删除/启用也大多只碰默认后端的自定义模型；
+    强制必传会让每个调用点都要先回答一个它未必知道的问题。但**写操作**（`add`/
+    `remove`/`set_enabled`）必须显式传 —— 它们改的是某一行的状态，猜错就改错行。
     """
-    name = backend_name_for(mid)
-    return name
+    if backend:
+        return backend
+    return backend_name_for(mid)
 
 
 def strip_model_prefix(mid):
-    """对外模型 id → bare id（内存里各后端目录用的键）。"""
-    return strip_prefix(mid)
+    """模型 id → 上游原名。
+
+    去前缀后两者**已经是同一个东西**（`model_id` 存的就是上游裸名），这里只是
+    给老调用点留的恒等函数 —— 新代码直接用 id 即可，不必经过它。
+    """
+    return mid if isinstance(mid, str) else ""
 
 
 def normalize_source(value):
@@ -101,7 +117,8 @@ class ModelRegistry:
     updated/error。默认后端（workbuddy）与 Trae 对称存放，加第三个后端时这里一行不用改
     —— 结构从 ``BackendSpec`` 的后端列表上长出来。
 
-    对外的 id 带后端前缀（``trae/glm-5.2``）以便客户端路由；内存里存 bare id。
+    对外的 id 就是**上游裸名**（v16 去前缀后），归属由 `backend` 列/各后端的目录
+    表达；同名模型在两个后端各有一行（联合主键 `(model_id, backend)`）。
     """
 
     def __init__(self, get_credential=None, clock=time.time, backend_credential_getter=None):
@@ -263,16 +280,17 @@ class ModelRegistry:
         否则 snapshot_ids() 会把它们算成「已知」，PoolMiddleware 就会把「上游已下线」
         误报成「管理页已禁用」而拒掉请求。
 
-        各后端的模型同表存放，model_id 带各自前缀（与对外暴露的 id 一致），
-        加载时按前缀分派到对应后端的目录。
+        各后端的模型同表存放，`model_id` 是上游裸名，归属**只读 `backend` 列**
+        （v16 后它已回填，见 `_v11_to_v12`、`_v15_to_v16`）。
         """
         with self._lock:
             # include_custom：手工添加的行可能 available=0（上游没返回它），
             # 只按 available=1 加载会让它们在重启后消失。
-            rows = db.load_models(only_available=True, include_custom=True)
+            # 用 **load_model_rows**（行列表）而不是 load_models（id 索引字典）：
+            # 后者在同名多后端时会丢掉其中一行 —— 重启后一个后端的模型消失。
+            rows = db.load_model_rows(only_available=True, include_custom=True)
             settings = db.get_settings() or {}
             for backend in list(self._state):
-                prefix = spec_for(backend).model_prefix
                 state = self._ensure_state(backend)
                 state["catalog"], state["available"], state["disabled"] = {}, [], set()
                 if backend == self._default:
@@ -280,14 +298,14 @@ class ModelRegistry:
                 # 「上次拉取时刻」记在目录行自己身上（models.synced_at），
                 # 而不是 settings 的固定列 —— 后端数量是可变的，settings 留不出列。
                 state["updated"] = 0
-                # 带前缀的后端只吃自己的行；默认后端吃所有**没有别的前缀**的行。
-                # 归属读的是持久化的 `backend` 列（§3.1：列管存下来的行），
-                # 不再逐行解析 model_id —— 前缀推导只留给请求路径。
-                own = {mid: row for mid, row in rows.items()
-                       if (row.get("backend") or backend_for_model_id(mid)) == backend}
-                order_rows = sorted(own.items(), key=lambda kv: kv[1].get("sort_order", 0))
+                # 归属读持久化的 `backend` 列（§3.1：列管存下来的行）。
+                # v16 起 `model_id` 是裸名，无法再从它推出归属（同名多后端），
+                # 所以这里**只**认列；列缺失才回落到声明兜底（老库的少量行）。
+                own = [(row["model_id"], row) for row in rows
+                       if (row.get("backend") or backend_for_model_id(row["model_id"])) == backend]
+                order_rows = sorted(own, key=lambda kv: kv[1].get("sort_order", 0))
                 for mid, row in order_rows:
-                    bare = mid[len(prefix):] if prefix else mid
+                    bare = mid
                     source = normalize_source(row.get("source"))
                     # available=0 的行不进 registry —— 否则 snapshot_ids() 会把它
                     # 算成「已知」，PoolMiddleware 会把「上游已下线」误报成「管理页
@@ -326,14 +344,14 @@ class ModelRegistry:
         fetch() 拉到的 available 列表之外、上次存在但这次没出现的模型标 available=0 保留，
         保证 request_logs.model_id 长期可 join。用户禁用状态 enabled 只由用户操作改写。
 
-        Trae 目录以 `trae/` 前缀 id 写入同一张表，available/enabled 语义与
-        WorkBuddy 行一致（禁用 = enabled=0）。
+        各后端的模型同表存放，`model_id` 是**上游裸名**（v16 去前缀后的形状），
+        归属由 `backend` 列表达。同名模型在两个后端各占一行 —— 联合主键
+        `(model_id, backend)` 让它们并存（实测生产 8 组同名）。
         """
         with self._lock:
             rows = {}
             for backend in list(self._state):
                 state = self._ensure_state(backend)
-                prefix = spec_for(backend).model_prefix
                 catalog, available = state["catalog"], state["available"]
                 disabled, custom = state["disabled"], state["custom"]
                 # 不在 available 的行从末尾开始编号，保持稳定（同一序位会让 reload
@@ -350,7 +368,7 @@ class ModelRegistry:
                     else:
                         tail += 1
                         sort_order = tail
-                    rows[prefix + bare] = {
+                    rows[bare] = {
                         "name": info.get("name") or bare,
                         "description": info.get("description"),
                         "credits": info.get("credits"),
@@ -656,12 +674,11 @@ class ModelRegistry:
                 if not is_backend_enabled(backend):
                     continue
                 state = self._state_for(backend)
-                prefix = spec_for(backend).model_prefix
                 available, catalog = state["available"], state["catalog"]
                 for bare in available:
                     if bare not in catalog:
                         continue
-                    entry = dict(catalog[bare], id=prefix + bare,
+                    entry = dict(catalog[bare], id=bare,
                                  enabled=bare not in state["disabled"],
                                  backend=backend)
                     # 精确单价（整数 micro）：路由层的价格红线用它做**精确比较**
@@ -679,7 +696,7 @@ class ModelRegistry:
                     stored = entry.pop("_promo", None)
                     # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
                     # 在读取时算，两者不一致时以内置表为准。
-                    promo = active_promo(prefix + bare, now)
+                    promo = active_promo(bare, now)
                     if promo and isinstance(entry.get("credits"), (int, float)):
                         entry["promo"] = {"label": promo[0] or stored or "折扣", "factor": promo[1],
                                           "credits": round(entry["credits"] * promo[1], 4)}
@@ -694,7 +711,7 @@ class ModelRegistry:
                     # `kimi-k3-1` 与字节的 `kimi-k3` 分到两组（上游 id 命名不一致），
                     # 用户会看到两个「Kimi K3」。canonical 由各后端按 `canonical_for`
                     # 声明（registry.canonical_name），是分组与自动选后端共用的键。
-                    entry["canonical"] = canonical_name(prefix + bare)
+                    entry["canonical"] = canonical_name(bare)
                     models.append(entry)
                 if backend == self._default:
                     updated, error = state["updated"], state["error"]
@@ -724,15 +741,23 @@ class ModelRegistry:
             return {"updated": updated, "error": error, "models": models}
 
     def enabled_models(self):
-        """Ids available to API clients: 各后端 enabled 的模型（带各自前缀）。"""
+        """Ids available to API clients: 各后端 enabled 的模型。
+
+        v16 起 id 是**上游裸名**（不再拼前缀）。同名模型在两边都启用时，
+        这个列表里会出现两次同一个名字 —— 这是**故意的**：它是「可调用的名字」的
+        集合式快照，去重会让人以为只有一个来源。归属由
+        `bare_name_candidates()` 给出（请求路径经 §5 策略选一个）。
+
+        **与 `snapshot_ids()` 必须同进同退**（specs/remove-model-prefix-plan.md §4 坑 1）：
+        `admin/pool.py` 用两者的差集判定「禁用 vs 未知」，只改一个会让禁用**静默失效**。
+        """
         with self._lock:
             out = []
             for backend in known_backends():
                 if not is_backend_enabled(backend):
                     continue
                 state = self._state_for(backend)
-                prefix = spec_for(backend).model_prefix
-                out += [prefix + mid for mid in state["available"] if mid not in state["disabled"]]
+                out += [mid for mid in state["available"] if mid not in state["disabled"]]
             return out
 
     def snapshot_ids(self):
@@ -741,8 +766,29 @@ class ModelRegistry:
             out = set()
             for backend in known_backends():
                 state = self._state_for(backend)
-                prefix = spec_for(backend).model_prefix
-                out |= {prefix + mid for mid in state["available"]}
+                out |= set(state["available"])
+            return out
+
+    def listed_models(self):
+        """`/v1/models` 用：启用中的 **(model_id, backend)** 行，按注册表后端顺序。
+
+        **为什么返回配对而不是名字列表**：v16 去前缀后，同名模型在两个后端各有一行
+        （不变量 1「按后端各一条」），只给名字会丢掉「这条属于谁」——而 `/v1/models`
+        的 `owned_by` 正是按**每行自己的后端**报的（用户 2026-10-16 拍板：
+        `glm-5.3` 列出两条，一条 `codebuddy`、一条 `trae-solo`）。
+
+        `enabled_models()` 仍是**扁平名字列表**（供 `pool.py` 的模型门查集合），
+        两者不能合并：那个门要判「这个名字能不能调」（有任一行启用即可），
+        这里要判「有哪些行」（每行都要露出来）。
+        """
+        with self._lock:
+            out = []
+            for backend in known_backends():
+                if not is_backend_enabled(backend):
+                    continue
+                state = self._state_for(backend)
+                out += [(mid, backend) for mid in state["available"]
+                        if mid not in state["disabled"]]
             return out
 
     def bare_name_candidates(self, model):
@@ -757,18 +803,17 @@ class ModelRegistry:
         不会出现「渲染说有、路由说没有」。
 
         匹配用**规范名**（`canonical_name`），所以请求 `kimi-k3` 能同时命中
-        `kimi-k3-1`(WB) 与 `trae/kimi-k3`(trae) —— 这正是 §4 用户侧契约要的效果。
+        `kimi-k3-1`(WB) 与 `kimi-k3`(trae) —— 这正是 §4 用户侧契约要的效果。
         """
         wanted = canonical_name(model)
         with self._lock:
             out = {}
             for backend in known_backends():
                 state = self._state_for(backend)
-                prefix = spec_for(backend).model_prefix
                 for bare in state["available"]:
                     if bare not in state["catalog"]:
                         continue
-                    mid = prefix + bare
+                    mid = bare
                     if canonical_name(mid) != wanted:
                         continue
                     entry = state["catalog"][bare]
@@ -782,10 +827,16 @@ class ModelRegistry:
                     break   # 一个后端一个规范名只取第一条（同一后端不可能有两条同规范名）
             return out
 
-    def set_enabled(self, mid, enabled):
-        backend = backend_for_model_id(mid)
-        prefix = spec_for(backend).model_prefix
-        bare = mid[len(prefix):] if prefix else mid
+    def set_enabled(self, mid, enabled, backend=None):
+        """启用/禁用某个后端上的一条模型。
+
+        `backend` 在「同名多后端」下**必须显式给**（管理页的请求里带着它）：
+        `glm-5.3` 在两边都有，只凭裸名猜不出要改哪一行。省略时按声明兜底
+        （`pinned_models` → 声明它的后端，其余归默认后端）——那是老调用点的
+        兼容路径，新代码请传。
+        """
+        backend = backend_for_model_id(mid, backend)
+        bare = mid
         with self._lock:
             state = self._state_for(backend)
             if bare not in state["catalog"] and bare not in state["available"]:
@@ -795,7 +846,7 @@ class ModelRegistry:
             else:
                 state["disabled"].add(bare)
 
-    def add(self, mid, enabled=True, **fields):
+    def add(self, mid, enabled=True, backend=None, **fields):
         """添加或更新一个模型。
 
         两种语义：
@@ -807,12 +858,14 @@ class ModelRegistry:
 
         返回最终的 source。
 
+        `backend` 语义同 `set_enabled`：同名多后端下必须显式给（管理页的
+        「归属多选」展开成 N 次调用，每次都带着自己的 backend）。
+
         自定义模型只对**默认后端**有意义：其它后端的目录完全由上游决定
         （用户不该往 Trae 目录里塞一个上游没有的模型 —— 那个模型调不通）。
         """
-        backend = backend_for_model_id(mid)
-        prefix = spec_for(backend).model_prefix
-        bare = mid[len(prefix):] if prefix else mid
+        backend = backend_for_model_id(mid, backend)
+        bare = mid
         with self._lock:
             state = self._state_for(backend)
             catalog, available = state["catalog"], state["available"]
@@ -836,7 +889,7 @@ class ModelRegistry:
                 state["disabled"].add(bare)
             return source
 
-    def remove(self, mid, db=None):
+    def remove(self, mid, db=None, backend=None):
         """删除模型。只允许删自定义项。
 
         上游模型删了没用：下一次 fetch() 会把它原地带回来，而且会让
@@ -847,10 +900,11 @@ class ModelRegistry:
         写不到它 —— 库里会留着上一次写的 available=1，重启时 `load()`（只读
         available=1）把它**原样装回来**，删除形同虚设。所以要在这里就地把它
         落成 available=0（保留行供 request_logs join）。
+
+        `backend` 语义同 `set_enabled`（同名多后端下必须显式给）。
         """
-        backend = backend_for_model_id(mid)
-        prefix = spec_for(backend).model_prefix
-        bare = mid[len(prefix):] if prefix else mid
+        backend = backend_for_model_id(mid, backend)
+        bare = mid
         with self._lock:
             state = self._state_for(backend)
             if bare not in state["catalog"]:
@@ -878,17 +932,15 @@ class ModelRegistry:
                 "deleted": 1,
             }})
 
-    def is_custom(self, mid):
-        backend = backend_for_model_id(mid)
-        prefix = spec_for(backend).model_prefix
-        bare = mid[len(prefix):] if prefix else mid
+    def is_custom(self, mid, backend=None):
+        backend = backend_for_model_id(mid, backend)
+        bare = mid
         with self._lock:
             return bare in self._state_for(backend)["custom"]
 
-    def info(self, mid):
-        backend = backend_for_model_id(mid)
-        prefix = spec_for(backend).model_prefix
-        bare = mid[len(prefix):] if prefix else mid
+    def info(self, mid, backend=None):
+        backend = backend_for_model_id(mid, backend)
+        bare = mid
         with self._lock:
             return dict(self._state_for(backend)["catalog"].get(bare) or {})
 

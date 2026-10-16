@@ -554,32 +554,51 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
         assert r.status_code == 200
         data = r.json()["data"]
-        trae = [m for m in data if m["id"].startswith("trae/")]
-        assert len(trae) == 20
+        # v16：id 是裸名，不再靠 `trae/` 前缀筛；改用 owned_by 声明筛出 Trae 的行。
+        trae = [m for m in data if m["owned_by"] == "trae-solo"]
+        # 数量对齐 registry 里 Trae 目录的实际条数（静态兜底表，非硬编码数字）。
+        reg = self.app.state.model_registry
+        assert len(trae) == len(reg._state_for("trae")["available"])
         assert all(m["owned_by"] == "trae-solo" for m in trae)
-        assert any(m["id"] == "trae/glm-5.2" for m in trae)
+        # Trae 的 Doubao-Seed-Code 出现在列表里（裸名）。
+        assert any(m["id"] == "Doubao-Seed-Code" for m in trae)
 
     async def test_owned_by_comes_from_backend_declaration(self):
         """`/v1/models` 的 owned_by 必须来自**后端声明**（BackendSpec.owned_by）。
 
         回归：这里原先是 `"trae-solo" if m.startswith("trae/") else "codebuddy"`，
-        把「这个模型归哪个后端」硬编码在调用方。后果是——改了某后端的 owned_by
-        声明，`/v1/models` 不会跟着变；加一个后端也会悄悄落到 else 分支。
-        现在走 backend_name_for（先 pinned 后前缀）+ spec_for().owned_by。
-        这条逐条对照声明，任一处退回硬编码就会红。
+        把「这个模型归哪个后端」硬编码在调用方。现在每行自带它的 backend
+        （`model_registry.listed_models()`），归属 = `spec_for(该 backend).owned_by`。
+
+        去前缀后同名模型在两后端各有一行（`glm-5.3` 两条），所以这条**逐行**对照
+        它自己的后端，而不是「按 id 判归属」——后者对同名 id 只能给一个答案。
         """
         from core.backends.registry import spec_for
 
         r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
         data = r.json()["data"]
         assert data
-        for m in data:
-            expected = spec_for(backend_name_for(m["id"])).owned_by
-            assert m["owned_by"] == expected, (
-                f"{m['id']} 的 owned_by={m['owned_by']}，声明是 {expected}")
-        # 两个后端的 owned_by 确实不同（否则上一条会退化成恒真）。
+        # registry 的行清单是唯一真相源：逐行对照即可发现任何硬编码回落。
+        rows = self.app.state.model_registry.listed_models()
+        assert [(m["id"], m["owned_by"]) for m in data] == [
+            (mid, spec_for(backend).owned_by) for mid, backend in rows]
+        # 两个后端的 owned_by 确实都出现了（否则上一条会退化成只验一个后端）。
         assert {m["owned_by"] for m in data} == {
             spec_for("workbuddy").owned_by, spec_for("trae").owned_by}
+
+    async def test_models_list_lists_each_backend_row(self):
+        """同名模型在两个后端各列一条 —— 不变量 1「按后端各一条」。
+
+        `glm-5.3` 在 WB 与 Trae 都有：应出现**两条**同 id 的条目，各自的
+        `owned_by` 不同（用户 2026-10-16 拍板：`codebuddy` 与 `trae-solo`）。
+        """
+        r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        data = r.json()["data"]
+        glm53 = [m for m in data if m["id"] == "glm-5.3"]
+        assert len(glm53) == 2, f"glm-5.3 应有两行（每后端一条），实际 {len(glm53)}"
+        assert {m["owned_by"] for m in glm53} == {"codebuddy", "trae-solo"}
+        # id 里不含 `/`（不变量 1）。
+        assert all("/" not in m["id"] for m in data)
 
     async def test_account_rows_trae_expiry_milliseconds(self):
         rows = {r["backend"]: r for r in self.app.state.store.account_rows()}
@@ -622,7 +641,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
     async def test_e2e_chat_stream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+                                   json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}], "stream": True})
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/event-stream")
         assert r.text.strip().endswith("data: [DONE]")
@@ -632,7 +651,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
     async def test_e2e_chat_nonstream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+                                   json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 200, r.text
         body = r.json()
         msg = body["choices"][0]["message"]
@@ -662,7 +681,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
             orig_astream = T.TraeBackend.astream
             T.TraeBackend.astream = fake_astream
             try:
-                r = await self.client.post("/admin/api/test", json={"model": "trae/glm-5.2", "prompt": "请只回复：连接成功"}, headers=H)
+                r = await self.client.post("/admin/api/test", json={"model": "Doubao-Seed-Code", "prompt": "请只回复：连接成功"}, headers=H)
             finally:
                 T.TraeBackend.astream = orig_astream
             assert r.status_code == 200, r.text
@@ -675,7 +694,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
     async def test_e2e_responses_stream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/responses", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "input": "hi", "stream": True})
+                                   json={"model": "Doubao-Seed-Code", "input": "hi", "stream": True})
         assert r.status_code == 200
         assert "response.completed" in r.text
         assert "Hello" in r.text
@@ -683,21 +702,21 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
     async def test_e2e_responses_nonstream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/responses", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "input": "hi"})
+                                   json={"model": "Doubao-Seed-Code", "input": "hi"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "completed"
 
     async def test_e2e_anthropic_stream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/messages", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "stream": True})
+                                   json={"model": "Doubao-Seed-Code", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "stream": True})
         assert r.status_code == 200
         assert "event: message_stop" in r.text
 
     async def test_e2e_anthropic_nonstream_trae(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
         r = await self.client.post("/v1/messages", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "stream": False})
+                                   json={"model": "Doubao-Seed-Code", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "stream": False})
         assert r.status_code == 200, r.text
         assert r.json()["role"] == "assistant"
 
@@ -706,7 +725,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("count_tokens 默认不应打上游")
         self.patch_upstream(handler)
         r = await self.client.post("/v1/messages/count_tokens", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "x" * 400}]})
+                                   json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "x" * 400}]})
         assert r.status_code == 200
         assert r.json()["input_tokens"] == 100
 
@@ -720,7 +739,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         os.environ["CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM"] = "1"
         try:
             r = await self.client.post("/v1/messages/count_tokens", headers={"Authorization": "Bearer " + API},
-                                       json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+                                       json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
         finally:
             os.environ.pop("CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM", None)
         assert r.status_code == 200
@@ -731,7 +750,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.patch_upstream(lambda req: httpx.Response(401, content=b'{"message":"session dead"}'))
         aid = self.trae_aid()
         r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+                                   json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 401
         assert self.app.state.store.data["account_status"][aid]["cooldown_until"] > 0
 
@@ -739,7 +758,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.patch_upstream(lambda req: httpx.Response(200, content=b'event:error\ndata:{"code":1005,"message":"plan limit"}\n\n'))
         aid = self.trae_aid()
         r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+                                   json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}], "stream": True})
         assert r.status_code == 200  # SSE 已开始
         assert '"code": 402' in r.text
         assert self.app.state.store.data["account_status"][aid]["cooldown_until"] > 0
@@ -756,7 +775,7 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_trae_model_400(self):
         self.patch_upstream(lambda req: httpx.Response(200, content=b""))
         r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                                   json={"model": "trae/bogus", "messages": [{"role": "user", "content": "hi"}]})
+                                   json={"model": "bogus-nonexistent", "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 400
 
     # ---- 管理页 Trae 登录入口 ----
@@ -1672,16 +1691,20 @@ def test_registry_trae_builtin_seed_and_disable():
     reg = _registry()
     reg.ensure_static_catalog("trae")
     ids = reg.snapshot_ids()
-    assert "trae/glm-5.2" in ids and len([i for i in ids if i.startswith("trae/")]) == 20
+    # v16：id 是上游裸名（`glm-5.2`），不再有 `trae/` 前缀。
+    assert "glm-5.2" in ids
+    assert reg._state_for("trae")["available"], "静态兜底表应有 20 条"
     enabled = reg.enabled_models()
-    assert "trae/glm-5.2" in enabled
+    assert "glm-5.2" in enabled
     snap = reg.snapshot()["models"]
     trae_rows = [m for m in snap if m.get("backend") == "trae"]
     assert len(trae_rows) == 20 and all(m["enabled"] for m in trae_rows)
-    # 禁用 trae/glm-5.2
-    reg.set_enabled("trae/glm-5.2", False)
-    assert "trae/glm-5.2" not in reg.enabled_models()
-    assert "trae/glm-5.2" in reg.snapshot_ids()  # 仍「已知」→ 中间件报禁用而非未知
+    # 禁用 trae 的 glm-5.2（**显式给 backend** —— 该裸名在两后端都有）
+    reg.set_enabled("glm-5.2", False, backend="trae")
+    assert "glm-5.2" in reg.snapshot_ids()  # 仍「已知」→ 中间件报禁用而非未知
+    trae_rows = [m for m in reg.snapshot()["models"]
+                 if m.get("backend") == "trae" and m["id"] == "glm-5.2"]
+    assert trae_rows and not trae_rows[0]["enabled"]
     # 落库 / 重启加载往返保留禁用态
     import tempfile
     from pathlib import Path
@@ -1691,10 +1714,10 @@ def test_registry_trae_builtin_seed_and_disable():
     reg2 = _registry()
     reg2.load(db)
     db.close()
-    assert "trae/glm-5.2" not in reg2.enabled_models()
+    assert "glm-5.2" in reg2._state_for("trae")["disabled"], "重启后禁用态必须保留"
     # 未知 trae 模型 → KeyError
     with pytest.raises(KeyError):
-        reg2.set_enabled("trae/nope", True)
+        reg2.set_enabled("nope", True, backend="trae")
 
 
 def test_registry_refresh_trae_models_replaces_builtin():
@@ -1708,8 +1731,7 @@ def test_registry_refresh_trae_models_replaces_builtin():
 
     reg.backend_credential_getter = lambda _b: FakeManager()
     assert reg.refresh_catalog("trae") is True
-    ids = {i for i in reg.snapshot_ids() if i.startswith("trae/")}
-    assert ids == {"trae/dyn-a", "trae/dyn-b"}  # 静态兜底表被动态表替换
+    assert set(reg._state_for("trae")["available"]) == {"dyn-a", "dyn-b"}  # 静态兜底表被动态表替换
     assert reg.catalog_entries("trae")[0] == {"id": "dyn-a", "name": "DynA", "context_length": 2048}
     # 失败保留上次快照
     class Boom:
@@ -1717,11 +1739,11 @@ def test_registry_refresh_trae_models_replaces_builtin():
             raise T.TraeAPIError("boom", status=500)
     reg.backend_credential_getter = lambda _b: Boom()
     assert reg.refresh_catalog("trae") is False
-    assert {i for i in reg.snapshot_ids() if i.startswith("trae/")} == {"trae/dyn-a", "trae/dyn-b"}
+    assert set(reg._state_for("trae")["available"]) == {"dyn-a", "dyn-b"}
     # 无 Trae 账号 → 静默保留
     reg.backend_credential_getter = lambda _b: None
     assert reg.refresh_catalog("trae") is False
-    assert "trae/dyn-a" in reg.snapshot_ids()
+    assert "dyn-a" in reg.snapshot_ids()
 
 
 def test_registry_trae_credits_reach_snapshot():
@@ -1735,7 +1757,7 @@ def test_registry_trae_credits_reach_snapshot():
     reg.backend_credential_getter = lambda _b: FakeManager()
     assert reg.refresh_catalog("trae") is True
     rows = {m["id"]: m for m in reg.snapshot()["models"]}
-    row = rows["trae/glm-5.3"]
+    row = rows["glm-5.3"]
     assert row["backend"] == "trae" and row["credits"] == 0.39
     assert row["max_input_tokens"] == 200000 and row["name"] == "GLM-5.3"
 
@@ -1743,9 +1765,12 @@ def test_registry_trae_credits_reach_snapshot():
 def test_registry_kill_switch_hides_trae(monkeypatch):
     import os
     reg = _registry()
+    reg.ensure_builtin()            # 默认后端也要有行，否则「空快照」会让断言恒真
     reg.ensure_static_catalog("trae")
     monkeypatch.setenv("CODEBUDDY_ENABLE_TRAE", "0")
-    assert all(not m.startswith("trae/") for m in reg.enabled_models())
+    # 注意：不能再用 `startswith("trae/")` —— 去前缀后它恒真，测试会静默失效。
+    # 判据换成「快照里没有任何 backend=trae 的行」。
+    assert reg.snapshot()["models"], "默认后端应仍有行，否则这条断言恒真"
     assert all(m.get("backend") != "trae" for m in reg.snapshot()["models"])
 
 
@@ -1753,29 +1778,32 @@ def test_registry_kill_switch_hides_trae(monkeypatch):
 
 async def _e2e_disable_trae_model(self):
     headers = await self.login_admin()
-    # 管理页禁用 trae/glm-5.2
-    r = await self.client.patch("/admin/api/models/trae/glm-5.2", json={"enabled": False}, headers=headers)
+    # 管理页禁用 Trae 的 Doubao-Seed-Code（v16：id 是裸名，靠 body 的 backend 指定归属）
+    r = await self.client.patch("/admin/api/models/Doubao-Seed-Code",
+                                json={"enabled": False, "backend": "trae"}, headers=headers)
     assert r.status_code == 200, r.text
-    assert "trae/glm-5.2" not in self.app.state.model_registry.enabled_models()
-    # /v1/models 不再出现
+    reg = self.app.state.model_registry
+    assert "Doubao-Seed-Code" in reg._state_for("trae")["disabled"]
+    # /v1/models 不再出现该 Trae 行
     models = (await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})).json()["data"]
-    assert "trae/glm-5.2" not in [m["id"] for m in models]
+    assert "Doubao-Seed-Code" not in [m["id"] for m in models]
     # 调用被中间件拒绝（400，不打上游）
     self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
     r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                               json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+                               json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400 and "禁用" in r.json()["detail"]
     # 恢复启用
-    r = await self.client.patch("/admin/api/models/trae/glm-5.2", json={"enabled": True}, headers=headers)
+    r = await self.client.patch("/admin/api/models/Doubao-Seed-Code",
+                                json={"enabled": True, "backend": "trae"}, headers=headers)
     assert r.status_code == 200
-    assert "trae/glm-5.2" in self.app.state.model_registry.enabled_models()
+    assert "Doubao-Seed-Code" not in reg._state_for("trae")["disabled"]
 
 
 async def _e2e_trae_404_soft_cooldown(self):
     self.patch_upstream(lambda req: httpx.Response(404, content=b'{"message":"config not found"}'))
     aid = self.trae_aid()
     r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                               json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+                               json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 404
     status = self.app.state.store.data["account_status"][aid]
     # 软冷却：cooldown_until 置位、不计入连续失败、不触发积分重查
@@ -1837,21 +1865,21 @@ async def _e2e_dynamic_catalog_replaces_static(self):
     finally:
         self.admin_server.httpx.Client = real
     assert r.status_code == 200, r.text
-    # 动态表替换静态表：/v1/models 只剩 trae/dyn-x
+    # 动态表替换静态表：Trae 目录只剩 dyn-x
     models = (await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})).json()["data"]
-    assert [m["id"] for m in models if m["id"].startswith("trae/")] == ["trae/dyn-x"]
+    assert [m["id"] for m in models if m["owned_by"] == "trae-solo"] == ["dyn-x"]
     # 管理页模型表出现 Trae 行
     overview = await self.client.get("/admin/api/overview", headers=headers)
     trae_rows = [m for m in overview.json()["models"]["models"] if m.get("backend") == "trae"]
-    assert [m["id"] for m in trae_rows] == ["trae/dyn-x"]
+    assert [m["id"] for m in trae_rows] == ["dyn-x"]
     # map_model 接受动态 id：chat 路由不再 400
     self.patch_upstream(lambda req: httpx.Response(200, content=SOLO_SSE))
     r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                               json={"model": "trae/dyn-x", "messages": [{"role": "user", "content": "hi"}]})
+                               json={"model": "dyn-x", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200, r.text
-    # 静态 glm-5.2 不在动态表里 → 未知模型 400
+    # 静态 Doubao-Seed-Code 不在动态表里 → 未知模型 400
     r = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + API},
-                               json={"model": "trae/glm-5.2", "messages": [{"role": "user", "content": "hi"}]})
+                               json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400
 
 

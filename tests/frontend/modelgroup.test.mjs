@@ -44,12 +44,14 @@ const check = (label, got, want) => {
 };
 
 // 用线上真实数据：7 个重名模型里最危险的是 step-5-preview（免费 vs 0.48）。
+// v16 去前缀后，两条同名行的 `id` **相同**（`step-5-preview`），靠 `backend` 区分 ——
+// 这正是「同 id 两行」的新形状，归组必须仍然把它们合到一起。
 const list = [
-  { id: "step-5-preview", backend: "workbuddy", credits: 0.0, max_input_tokens: 200000 },
-  { id: "trae/step-5-preview", backend: "trae", credits: 0.48, max_input_tokens: 200000 },
-  { id: "hy3", backend: "workbuddy", credits: 1, max_input_tokens: 128000 },
-  { id: "trae/kimi-k2.6", backend: "trae", credits: 0.75, max_input_tokens: 200000 },
-  { id: "kimi-k2.6", backend: "workbuddy", credits: 0.52, max_input_tokens: 256000 },
+  { id: "step-5-preview", backend: "workbuddy", credits: 0.0, max_input_tokens: 200000, canonical: "step-5-preview" },
+  { id: "step-5-preview", backend: "trae", credits: 0.48, max_input_tokens: 200000, canonical: "step-5-preview" },
+  { id: "hy3", backend: "workbuddy", credits: 1, max_input_tokens: 128000, canonical: "hy3" },
+  { id: "kimi-k2.6", backend: "trae", credits: 0.75, max_input_tokens: 200000, canonical: "kimi-k2.6" },
+  { id: "kimi-k2.6", backend: "workbuddy", credits: 0.52, max_input_tokens: 256000, canonical: "kimi-k2.6" },
 ];
 
 const groups = groupModelsByName(list);
@@ -62,8 +64,8 @@ check("组内保留 workbuddy 免费价 0.0",
       step.items.find(m => m.backend === "workbuddy").credits, 0);
 check("组内保留 trae 价 0.48",
       step.items.find(m => m.backend === "trae").credits, 0.48);
-check("两条 id 都还在（未被改写成同一个）",
-      step.items.map(m => m.id).sort(), ["step-5-preview", "trae/step-5-preview"]);
+check("两条的 id 现在相同（靠 backend 区分）",
+      step.items.map(m => m.id).sort(), ["step-5-preview", "step-5-preview"]);
 
 const kimi = groups.find(g => g.key === "kimi-k2.6");
 check("kimi-k2.6 合并两条", kimi.items.length, 2);
@@ -74,22 +76,22 @@ check("hy3 单独成组（没有同名后端）",
       groups.find(g => g.key === "hy3").items.length, 1);
 
 // ---- 跨后端归并靠**规范名**（canonical，用户 2026-10-16 拍板）----
-// 上游两边 id 命名不一致（腾讯 `kimi-k3-1` vs 字节 `trae/kimi-k3`），
+// 上游两边 id 命名不一致（腾讯 `kimi-k3-1` vs 字节 `kimi-k3`），
 // 只按裸名分组会显示成两行。且**不能按展示名猜**：hy3 / hy3-x 展示名都是
 // 「Hy3」却是两个真模型。规范名由服务端按各后端 `canonical_for` 声明算好。
 const aliasList = [
   // 裸名不同、规范名相同 → 应该合（服务端已把 canonical 都算成 kimi-k3）。
   { id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
-  { id: "trae/kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
+  { id: "kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
   // 反例：展示名相同、**规范名不同** → 绝不能合（同一后端的两个模型，倍率 0 vs 0.05）。
   { id: "hy3", backend: "workbuddy", credits: 0, name: "Hy3", canonical: "hy3", max_input_tokens: 200000 },
   { id: "hy3-x", backend: "workbuddy", credits: 0.05, name: "Hy3", canonical: "hy3-x", max_input_tokens: 200000 },
 ];
 const aliasGroups = groupModelsByName(aliasList);
-check("同规范名合成一行（kimi-k3-1 + trae/kimi-k3）", aliasGroups.length, 3);
-const k3 = aliasGroups.find(g => g.items.some(m => m.id === "trae/kimi-k3"));
+check("同规范名合成一行（kimi-k3-1 + kimi-k3）", aliasGroups.length, 3);
+const k3 = aliasGroups.find(g => g.items.some(m => m.id === "kimi-k3"));
 check("归并行的两条都在（不是只留下一侧）",
-      k3.items.map(m => m.id).sort(), ["kimi-k3-1", "trae/kimi-k3"]);
+      k3.items.map(m => m.id).sort(), ["kimi-k3", "kimi-k3-1"]);
 check("归并行的组键就是规范名", k3.key, "kimi-k3");
 // 这是最容易写错的一条：展示名相同**不是**同一个模型的判据。
 check("展示名相同但规范名不同 → 不合并（hy3 / hy3-x 必须分开）",
@@ -99,10 +101,10 @@ check("hy3 与 hy3-x 各自成组、倍率未被混",
       [aliasGroups.find(g => g.items[0].id === "hy3").items[0].credits,
        aliasGroups.find(g => g.items[0].id === "hy3-x").items[0].credits], [0, 0.05]);
 
-// canonical 缺失（老库迁移后尚未同步）时回落到裸名：各自成组而不是全挤一组。
+// canonical 缺失（老库迁移后尚未同步）时回落到裸名：同名两行仍同组（id 相同）。
 const legacyList = [
   { id: "glm-5.3", backend: "workbuddy", credits: 0.1 },
-  { id: "trae/glm-5.3", backend: "trae", credits: 0.2 },
+  { id: "glm-5.3", backend: "trae", credits: 0.2 },
   { id: "kimi-k2.6", backend: "workbuddy", credits: 0.5 },
 ];
 const legacyGroups = groupModelsByName(legacyList);
@@ -113,7 +115,7 @@ check("canonical 缺失时不把所有行挤成一组", legacyGroups.length, 2);
 // modelsInGroup 必须与分组结果一致（渲染与批量操作共用它，见 app.js 的说明）。
 // 归并行的成员来自两个不同裸名，按裸名过滤只会切到一条 —— 这条钉住那个 bug。
 check("modelsInGroup 对归并行返回全部成员",
-      modelsInGroup(aliasList, k3.key).map(m => m.id).sort(), ["kimi-k3-1", "trae/kimi-k3"]);
+      modelsInGroup(aliasList, k3.key).map(m => m.id).sort(), ["kimi-k3", "kimi-k3-1"]);
 check("modelsInGroup 对普通组仍按规范名命中",
       modelsInGroup(list, "step-5-preview").length, 2);
 check("modelsInGroup 对不存在的组返回空", modelsInGroup(list, "没有这个").length, 0);
@@ -134,21 +136,13 @@ check("组间顺序 = 输入顺序（后端不再重排）",
 check("trae 组不会因为后端顺序被提到最前",
       ordered[0].key, "zzz-custom");
 
-// 前缀剥离只针对后端声明的前缀，不能误伤名字里带相同字样的模型。
-check("modelBaseName 剥 trae/ 前缀", modelBaseName("trae/kimi-k2.6"), "kimi-k2.6");
-check("modelBaseName 不剥非前缀", modelBaseName("mytrae/x"), "mytrae/x");
+// modelBaseName 现在是**恒等函数**：v16 去前缀后 id 就是上游裸名，
+// 没有前缀可剥。保留它是给归组一个明确的「裸名」概念（且不再读 backends[].prefix）。
+check("modelBaseName 不再剥任何前缀", modelBaseName("trae/kimi-k2.6"), "trae/kimi-k2.6");
+check("modelBaseName 原样返回", modelBaseName("glm-5.3"), "glm-5.3");
 check("modelBaseName 对空值安全", modelBaseName(null), "");
-// 前缀来自元数据而非写死：换一个前缀声明，剥离行为随之改变。
-applyBackends([
-  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", order: 0, prefix: "" },
-  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", order: 1, prefix: "solo-" },
-]);
-check("前缀由元数据驱动", modelBaseName("solo/kimi"), "solo/kimi");
-check("前缀由元数据驱动（命中新前缀）", modelBaseName("trae/kimi"), "trae/kimi");
-applyBackends([
-  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", order: 0, prefix: "" },
-  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", order: 1, prefix: "trae/" },
-]);
+// 上游自带 `/` 的名字也是原样（`openrouter/free` 不是我们的前缀）。
+check("上游自带斜杠的名字原样", modelBaseName("openrouter/free"), "openrouter/free");
 
 // 倍率措辞：0 必须显示「免费」而不是「×0」，否则用户以为收费但为 0。
 check("倍率 0 显示免费", creditsText({ credits: 0 }), "免费");

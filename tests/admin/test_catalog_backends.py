@@ -123,7 +123,7 @@ class PerBackendCatalogTests(unittest.TestCase):
         """上游下线的模型不再保留禁用状态：重新上线时默认可用。"""
         reg = registry()
         reg.ensure_static_catalog("trae")
-        reg.set_enabled("trae/glm-5.2", False)
+        reg.set_enabled("glm-5.2", False, backend="trae")
         self.assertIn("glm-5.2", reg._state_for("trae")["disabled"])
 
         class FakeManager:
@@ -215,29 +215,42 @@ class SyncTimestampTests(unittest.TestCase):
 
 
 class CatalogToggleTests(unittest.TestCase):
-    """禁用/启用按 id 分派到正确的后端目录。"""
+    """禁用/启用按 **backend** 分派到正确的后端目录。
 
-    def test_set_enabled_routes_by_prefix(self):
+    v16 起模型 id 是裸名，`glm-5.2` 在两个后端都有 —— 只凭 id 无法分派，
+    所以 `set_enabled` 收 `backend`。这里守住「两个后端的开关互不影响」。
+    """
+
+    def test_set_enabled_routes_by_backend(self):
         reg = registry()
         reg.ensure_builtin()
         reg.ensure_static_catalog("trae")
-        reg.set_enabled("glm-5.2", False)
-        reg.set_enabled("trae/glm-5.2", False)
+        reg.set_enabled("glm-5.2", False, backend="workbuddy")
+        reg.set_enabled("glm-5.2", False, backend="trae")
         self.assertIn("glm-5.2", reg._state_for("workbuddy")["disabled"])
         self.assertIn("glm-5.2", reg._state_for("trae")["disabled"])
         # 两个开关互不影响：只放开默认后端那一个，Trae 的仍是禁用。
-        reg.set_enabled("glm-5.2", True)
+        reg.set_enabled("glm-5.2", True, backend="workbuddy")
         self.assertNotIn("glm-5.2", reg._state_for("workbuddy")["disabled"])
         self.assertIn("glm-5.2", reg._state_for("trae")["disabled"])
         # 反向同理。
-        reg.set_enabled("trae/glm-5.2", True)
+        reg.set_enabled("glm-5.2", True, backend="trae")
         self.assertNotIn("glm-5.2", reg._state_for("trae")["disabled"])
+
+    def test_set_enabled_same_name_on_two_backends_does_not_cross(self):
+        """同名两行必须能被分开操作 —— 这是联合主键/去前缀的**核心不变量**。"""
+        reg = registry()
+        reg.ensure_builtin()
+        reg.ensure_static_catalog("trae")
+        reg.set_enabled("glm-5.2", False, backend="trae")
+        self.assertNotIn("glm-5.2", reg._state_for("workbuddy")["disabled"],
+                         "禁 Trae 的那行不该把 WB 的同名行也禁掉")
 
     def test_set_enabled_unknown_raises(self):
         reg = registry()
         reg.ensure_static_catalog("trae")
         with self.assertRaises(KeyError):
-            reg.set_enabled("trae/nope", True)
+            reg.set_enabled("nope", True, backend="trae")
         with self.assertRaises(KeyError):
             reg.set_enabled("nope", True)
 

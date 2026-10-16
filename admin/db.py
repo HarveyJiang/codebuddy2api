@@ -972,16 +972,24 @@ class Database:
             self._write.execute("DELETE FROM session_bindings WHERE account_id=?", (account_id,))
 
     # -- models -------------------------------------------------------------
-    def load_models(self, only_available=False, include_custom=False):
-        """读模型目录。include_custom 时额外带上手工添加的行。
+    def load_model_rows(self, only_available=False, include_custom=False):
+        """读模型目录，返回**行列表**（每行带 `model_id` 与 `backend`）。
 
-        两类条件的连接词是 OR：自定义模型可能 available=0（上游根本没返回它），
-        用 AND 会把它们全过滤掉，用户保存的模型重启后消失。
+        include_custom 时额外带上手工添加的行。两类条件的连接词是 OR：自定义模型
+        可能 available=0（上游根本没返回它），用 AND 会把它们全过滤掉，用户保存的
+        模型重启后消失。
 
-        **已删除的行（deleted=1）一律不返回**：它们只为 request_logs 的 join
-        留在表里，不该再进任何目录。没有这个过滤，删除会在重启后复活
-        （`available=0` 表达不了「已删除」——那条语义已被「上游没返回的自定义
-        模型要保留」占用）。
+        **已删除的行（deleted=1）一律不返回**：它们只为 request_logs 的 join 留在
+        表里，不该再进任何目录。没有这个过滤，删除会在重启后复活（`available=0`
+        表达不了「已删除」——那条语义已被「上游没返回的自定义模型要保留」占用）。
+
+        **为什么返回列表而不是 id 索引的字典**：v16 起主键是 `(model_id, backend)`，
+        同名模型在两个后端各有一行（生产实测 8 组）。按 `model_id` 索引的字典
+        会让其中一行**静默覆盖**另一行 —— 重启后一个后端的模型凭空消失，
+        且没有任何报错。需要完整目录的调用方（`ModelRegistry.load`）必须用这个。
+
+        `load_models()` 保留给「按 id 取一行」的老调用点（它是 id 索引的，
+        同名多后端时只留最后一行）——新代码请用本方法。
         """
         sql = "SELECT * FROM models WHERE deleted=0"
         where = []
@@ -991,7 +999,7 @@ class Database:
             where.append("source='custom'")
         if where:
             sql += " AND (" + " OR ".join(where) + ")"
-        result = {}
+        rows = []
         for row in self.query(sql):
             item = {key: row[key] for key in row.keys()}
             # 精确值（整数 micro）**保留**在内存里：路由层的价格红线要精确比较
@@ -1000,8 +1008,17 @@ class Database:
             # 两者是同一个 DB 值，只是精度不同，不新增存储。
             item["credits_micro"] = item.get("credits_micro")
             item["credits"] = _from_micro(item.get("credits_micro"))
-            result[row["model_id"]] = item
-        return result
+            rows.append(item)
+        return rows
+
+    def load_models(self, only_available=False, include_custom=False):
+        """读模型目录，按 `model_id` 索引（**同名多后端时只留最后一行**）。
+
+        需要完整目录（含每条归属后端）请用 :meth:`load_model_rows` ——
+        这个字典会丢行，见那里的说明。
+        """
+        return {item["model_id"]: item
+                for item in self.load_model_rows(only_available, include_custom)}
 
     def save_models(self, models):
         """UPSERT 不删行：上游消失的模型由调用方标 available=0 保留。
