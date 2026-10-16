@@ -153,7 +153,12 @@ function render() {
     const expired = !!k.expires_at && k.expires_at <= now;
     const scope = (list, noun) => (Array.isArray(list) && list.length)
       ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${k.last_used_at ? `<span class="mono">${esc(stamp(k.last_used_at * 1000))}</span>` : '<span class="muted">从未使用</span>'}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型、可用账号与分配策略">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
+    // 操作收敛（用户 2026-10-16）：停用/撤销/限额都进「设置」弹框 —— 撤销与
+    // 停用语义上不同（撤销不可逆、停用可恢复），但都是低频操作，占表格按钮位
+    // 冗余；表格只留「设置」「请求」两个高频入口。
+    const actions = `<td class="align-right"><div class="actions">${revoked ? `<button data-requests="${k.id}">请求</button>`
+      : `<button data-bind="${k.id}" title="可用模型、可用账号、分配策略、限额与有效期">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button>`}</div></td>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${k.last_used_at ? `<span class="mono">${esc(stamp(k.last_used_at * 1000))}</span>` : '<span class="muted">从未使用</span>'}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td>${actions}</tr>`;
   }).join("");
   paintKeysSort();
   const shown = keys.length, total = (overview.keys || []).length;
@@ -1105,17 +1110,21 @@ $("keys-body").addEventListener("click", e => {
   if (chip) { openKeyBind(overview.keys.find(x => x.id === chip.dataset.routingEdit)); return; }
   const bind = e.target.closest("[data-bind]");
   if (bind) { openKeyBind(overview.keys.find(x => x.id === bind.dataset.bind)); return; }
-  const limit = e.target.closest("[data-limit]");
-  if (limit) { const k = overview.keys.find(x => x.id === limit.dataset.limit); confirmAction("设置每日请求上限", "该密钥每天最多可发起的请求数。留空或填 0 表示不限制。超限后新请求返回 429，次日北京时间 00:00 自动重置。只统计进入转发的对话接口，成功与失败都计入；被限流、被模型白名单拒绝的不计入。", () => api("keys/" + k.id, {method:"PATCH", body:{daily_limit:Number($("rename-value").value) || null}}), {value:k.daily_limit ?? "", label:"每日请求上限（次）", type:"number", min:0, placeholder:"留空或 0 = 不限制"}); return; }
-  const toggle = e.target.closest("[data-toggle]");
-  if (toggle) { const k = overview.keys.find(x => x.id === toggle.dataset.toggle); const next = !k.enabled; confirmAction(next ? "恢复这枚密钥？" : "停用这枚密钥？", next ? `恢复后「${k.name}」可再次发起请求。` : `停用后「${k.name}」立即无法发起新请求，可随时恢复。`, () => api("keys/" + k.id, {method:"PATCH", body:{enabled: next}})); return; }
-  const b = e.target.closest("[data-revoke]"); if (!b) return; const k = overview.keys.find(x => x.id === b.dataset.revoke); confirmAction("撤销客户端密钥？", `使用「${k.name}」的客户端将无法发起新请求。此操作不可撤销。`, () => api("keys/" + k.id, {method:"DELETE"}));
+  // 限额 / 停用 / 撤销的表格按钮已收敛进「设置」弹框（用户 2026-10-16），
+  // 对应的 data-limit / data-toggle / data-revoke 入口随之删除。
 });
 $("add-key").addEventListener("click", () => { $("key-form").hidden = false; $("created-key").hidden = true; $("key-dialog").showModal(); });
 function openKeyBind(k) {
   if (!k) return;
   $("key-bind-name").textContent = `密钥「${k.name}」· ${k.hint}`;
   $("key-bind-error").textContent = "";
+  // 限额与有效期（用户 2026-10-16：都收进设置弹框）。
+  $("key-bind-limit").value = k.daily_limit ?? "";
+  $("key-bind-expires").value = k.expires_at ? toLocalInput(k.expires_at) : "";
+  const toggle = $("key-bind-toggle");
+  toggle.textContent = k.enabled ? "停用密钥" : "恢复密钥";
+  toggle.hidden = false;
+  $("key-bind-revoke").hidden = false;
   const list = (host, items, selected, render) => {
     host.replaceChildren(...items.map(item => {
       const label = document.createElement("label");
@@ -1145,12 +1154,37 @@ $("key-bind-form").addEventListener("submit", async e => {
     await api("keys/" + kid, {method:"PATCH", body:{
       models: checkedValues($("key-bind-models")),
       accounts: checkedValues($("key-bind-accounts")),
-      routing: $("key-bind-routing").value || null}});
+      routing: $("key-bind-routing").value || null,
+      daily_limit: $("key-bind-limit").value === "" ? null : Number($("key-bind-limit").value),
+      expires_at: $("key-bind-expires").value ? fromLocalInput($("key-bind-expires").value) : null}});
     $("key-bind-dialog").close(); await refresh(); toast("密钥权限已保存");
   } catch (err) { $("key-bind-error").textContent = err.message; }
   finally { e.submitter.disabled = false; }
 });
 $("key-dialog").addEventListener("close", () => { $("key-form").reset(); $("new-key-value").textContent = ""; $("key-error").textContent = ""; });
+// datetime-local 值 <-> unix 秒。密钥过期时刻按浏览器本地时区理解，
+// 与管理页其余时间戳的展示口径一致。
+const toLocalInput = sec => {
+  const d = new Date(sec * 1000), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+const fromLocalInput = v => Math.floor(new Date(v).getTime() / 1000);
+// 停用/恢复与撤销收进设置弹框（用户 2026-10-16）：语义不同（停用可逆、
+// 撤销不可逆）所以都保留，但不再各占表格按钮位。
+$("key-bind-toggle").addEventListener("click", e => {
+  e.preventDefault();
+  const k = overview.keys.find(x => x.id === $("key-bind-dialog").dataset.kid); if (!k) return;
+  const next = !k.enabled;
+  confirmAction(next ? "恢复这枚密钥？" : "停用这枚密钥？",
+    next ? `恢复后「${k.name}」可再次发起请求。` : `停用后「${k.name}」立即无法发起新请求，可随时恢复。`,
+    async () => { await api("keys/" + k.id, {method:"PATCH", body:{enabled: next}}); $("key-bind-dialog").close(); });
+});
+$("key-bind-revoke").addEventListener("click", e => {
+  e.preventDefault();
+  const k = overview.keys.find(x => x.id === $("key-bind-dialog").dataset.kid); if (!k) return;
+  confirmAction("撤销客户端密钥？", `使用「${k.name}」的客户端将无法发起新请求。此操作不可撤销。`,
+    async () => { await api("keys/" + k.id, {method:"DELETE"}); $("key-bind-dialog").close(); });
+});
 $("key-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { const d = await api("keys", {method:"POST",body:{name:$("key-name").value}}); $("key-form").hidden = true; $("created-key").hidden = false; $("new-key-value").textContent = d.key; await refresh(); } catch (err) { $("key-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 async function copy(value) { try { await navigator.clipboard.writeText(value); toast("已复制"); } catch { toast("无法自动复制，请手动选择文本复制"); } }
 $("copy-key").addEventListener("click", () => copy($("new-key-value").textContent));

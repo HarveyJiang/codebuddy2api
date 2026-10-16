@@ -7,7 +7,7 @@
    「设置」按钮，用户 2026-10-16 拍板）。 */
 .account-settings-actions{display:flex;gap:9px;margin:16px 0 4px}
 .account-settings-actions button{flex:1}
-.account-settings-footer .spacer{flex:1}
+.account-settings-footer .spacer,.dialog-actions .spacer{flex:1}
 .account-settings-footer button.danger{background:none;border:1px solid var(--line)}
 /* 概览账号池表：小号内联 icon + 账号名，就这两样（用户拍板：徽标与昵称
    都是冗余）。 */
