@@ -328,14 +328,19 @@ Codex CLI / Claude Code 这类客户端**只能改 `model` 字段**，改不了 
   已足够；阶段三自带 kill switch，回滚成本同样是「一个设置项」。代价是不写
   `events` 影子记录 —— 替代方式是 §5.1 的「出局原因」做进 400 报错、并在 dev
   实测「裸名落点 == `request_logs.backend`」。
-- **阶段三** ✅ 已实现（`2ee4f0c` 接线；§9.6 的 `/v1/models` 归属由随后的提交补上）：
+- **阶段三** ✅ 已实现（`2ee4f0c` 接线；§9.6 的 `/v1/models` 归属由 `658e7ca` 补上；
+  设置入口与 v15 迁移由 `f7a8863` 补上）：
   `_resolve_backend_for`
   是唯一决策点、kill switch `settings.bare_name_routing` **默认开**（§8 原文；
   与 `queue_failover` 默认关的差异见施工图「决策」表的说明）。
+- **dev 实测** ✅ 通过（2026-10-16）：`glm-5.3` 两边都有，调序前后
+  「`/v1/models` 的 owned_by」与「请求落点」始终一致且随调序变化。逐条数据见
+  `specs/bare-name-routing-plan.md` §四之四。**尚未上生产。**
 - **变异验证**（本轮实际执行，全部抓到）：中间件退回硬编码默认后端（§8 点名的
   那个场景，2 红）、converter 不消费 `routed`（1 红）、kill switch 失效（1 红）、
   `owned_by` 退回静态归属（1 红）、admin 不注入策略 provider（1 红）、
-  provider 不再吞异常（1 红）。
+  provider 不再吞异常（1 红）、设置接口静默 no-op（2 红）、
+  `_load` 不归一顺序 / 开关（各 1 红）。
 
 ---
 
