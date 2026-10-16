@@ -80,8 +80,9 @@
 .model-check,.model-check-cell input{width:15px;height:15px;cursor:pointer;accent-color:var(--accent,#4a7dff)}
 /* 模型名单元格：id + 展示名 + （仅自定义）删除按钮。删除是次要操作，
    平时淡显、悬停行才醒目 —— 一列红按钮比数据还抢眼。 */
-.model-name-cell{white-space:normal}
-.model-name-cell .model-del{margin-top:7px;font-size:10px;padding:3px 9px;opacity:.55}
+.model-name-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.model-name-cell small{display:block;white-space:normal}
+.model-name-cell .model-del{margin-left:8px;font-size:10px;padding:3px 9px;opacity:.55;vertical-align:middle}
 tr:hover .model-name-cell .model-del{opacity:1}
 /* 状态列即开关：pill 样式复用，但它是 <button> —— 补上「可点」的指针与悬停反馈，
    并清掉 button 的默认边框/背景（全局 button 只有 transition，没有外观重置）。 */
