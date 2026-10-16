@@ -1152,7 +1152,8 @@ function openKeyBind(k) {
     }));
     if (!items.length) { const p = document.createElement("p"); p.className = "muted"; p.textContent = "暂无可选项。"; host.replaceChildren(p); }
   };
-  const models = (overview.models?.models || []).filter(m => m.enabled);
+  const models = (overview.models?.models || []).filter(m => m.enabled)
+    .map(m => ({value: m.id, name: m.name || "", backend: m.backend}));
   const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state, backend:a.backend}));
   // 可用模型按归属分页签（用户拍板）：同一份 check-list，页签只控制**哪些行
   // 显示**，勾选状态保留 —— 切页签不丢已勾的项，保存时仍取全部勾选值。
