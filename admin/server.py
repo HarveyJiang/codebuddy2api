@@ -1388,12 +1388,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         model_registry.persist(store.db)
         return {"ok": True, "id": mid, "source": source}
 
-    @app.delete("/admin/api/models/{mid}")
+    @app.delete("/admin/api/models/{mid:path}")
     async def model_delete(mid: str, req: Request):
-        """删除模型。只允许删自定义项。"""
+        """删除模型。只允许删自定义项。
+
+        `:path` 转换器是**必需**的：模型 id 可以带后端前缀（`trae/kimi-k3`），
+        `{mid}` 的默认转换器不匹配斜杠，前端 `encodeURIComponent` 送来的 `%2F`
+        也没法变成路径分隔符 —— 结果是带前缀的自定义模型**删不掉**（404）。
+        归属多选让这类行变得常见，所以这里必须收。
+        """
         store.require_admin(req)
         try:
-            model_registry.remove(mid)
+            model_registry.remove(mid, db=store.db)
         except KeyError:
             raise HTTPException(404, "模型不存在")
         except ValueError:

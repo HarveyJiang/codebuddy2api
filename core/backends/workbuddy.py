@@ -43,6 +43,12 @@ class WorkBuddyBackend(BackendSpec):
     # 而不是在 admin 里写死「用 workbuddy 账号」。
     needs_own_credential_for_catalog = True
 
+    # 三档智能路由（fast / balanced / deep）是**本后端私有**的虚拟模型：
+    # 无前缀，且不参与裸名自动选择（那种请求只会命中默认后端＝本后端）。
+    # 声明出来是防将来路由策略改动把它们选到别的后端去 —— 这不是「无前缀
+    # 所以恰好归我」，而是「本来就只可能归我」。
+    pinned_models = ("fast-model", "balanced-model", "deep-model")
+
     def chat_url(self) -> str:
         from .. import converter  # 延迟 import 防循环
 

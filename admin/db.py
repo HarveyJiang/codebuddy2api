@@ -211,7 +211,56 @@ def _v10_to_v11(db):
         db._write.execute("ALTER TABLE keys ADD COLUMN last_used_at INTEGER")
 
 
-SCHEMA_VERSION = 11
+def _v11_to_v12(db):
+    """v11 → v12：给 models 补 backend（模型归属显式化）。
+
+    specs/model-backend-attribution.md §3.1：`persist()` 里 backend 是循环变量
+    （写盘时已知），今天却拼进 `model_id` 再反解回来。列把已知事实直接存下来。
+
+    **回填按前缀推导**，且只做这一次 —— 之后列即权威，读路径不再解析字符串。
+    回填用 `db._write`（迁移运行在事务里）而不是 `query()`。
+
+    为什么默认值是 'workbuddy' 而不是空串：与 `accounts.backend` 同一口径
+    （那张表也这么干，有先例）。前缀推导对无前缀行给出的正是默认后端，两者一致。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(models)")}
+    if "backend" not in columns:
+        db._write.execute("ALTER TABLE models ADD COLUMN backend TEXT NOT NULL DEFAULT 'workbuddy'")
+    # 历史行按前缀回填：带 trae/ 前缀的归 trae，其余归默认后端。
+    # 只回填**前缀能表达**的行；pinned_models（三档）本来就在默认后端名下，无需特判。
+    from core.backends.registry import default_name, known_names, spec_for
+
+    default = default_name()
+    for name in known_names():
+        prefix = spec_for(name).model_prefix
+        if prefix and name != default:
+            db._write.execute(
+                "UPDATE models SET backend=? WHERE model_id LIKE ? AND backend=?",
+                (name, f"{prefix}%", "workbuddy" if default == "workbuddy" else default),
+            )
+
+
+def _v12_to_v13(db):
+    """v12 → v13：给 models 补 deleted（删除的持久化标记）。
+
+    **为什么是单独一个迁移**：它原本被写进 `_v11_to_v12` 里（那次提交还没发布），
+    但任何已经跑过 v12 的库（本地测试库、dev）版本号已是 12，迁移不会再执行，
+    于是 `load_models` 查一个不存在的列而报 `no such column: deleted`。
+    编辑**已应用过**的迁移是本项目明令避免的事 —— 这里就是它咬人的样子。
+    拆成独立版本号后，无论 v12 是哪个版本的 `_v11_to_v12` 写的，这条都会跑到。
+
+    语义：`deleted=1` 的行只为 request_logs 的 join 留在表里，`load_models`
+    不再返回。**不能**用 `available=0` 代替 —— 那个语义归「上游没返回的自定义
+    模型要保留」所有（见 `test_custom_model_loads_when_available_zero`），
+    混用会让「删除」与「保留」互相打架（实测：删除重启后复活）。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(models)")}
+    if "deleted" not in columns:
+        db._write.execute("ALTER TABLE models ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+
+
+SCHEMA_VERSION = 13
+
 
 MICRO = 1_000_000
 
@@ -253,7 +302,7 @@ KEY_COLUMNS = (
 
 MODEL_COLUMNS = (
     "name", "description", "credits_micro", "max_input_tokens", "source", "available",
-    "enabled", "sort_order", "promo", "synced_at",
+    "enabled", "sort_order", "promo", "synced_at", "backend", "deleted",
 )
 
 LOG_COLUMNS = (
@@ -290,6 +339,20 @@ def _to_micro(value):
 
 def _from_micro(value):
     return None if value is None else value / MICRO
+
+
+def _require_backend(value, model_id):
+    """模型归属列的值：缺值即报错，不兜默认。
+
+    ``models.backend`` 是「写入时已知的事实」（见 specs/model-backend-attribution.md
+    §3.1）。写模型的路径只有两处（``ModelRegistry.persist`` 与 ``add`` 后的 persist），
+    两处都能给出该值。这里**故意**不做 `or "workbuddy"` 这类兜底：一旦兜了，
+    「新增写入路径忘了带 backend」就会静默写成默认后端，而 drift 断言之外的
+    任何测试都不会红。宁可让它在写入点当场炸。
+    """
+    if not value:
+        raise ValueError(f"模型 {model_id} 缺少 backend（归属列必须显式给出）")
+    return str(value)
 
 
 def _to_float(value):
@@ -395,7 +458,9 @@ class Database:
             source TEXT NOT NULL DEFAULT 'builtin',
             available INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 0, promo TEXT,
-            synced_at INTEGER NOT NULL DEFAULT 0)""",
+            synced_at INTEGER NOT NULL DEFAULT 0,
+            backend TEXT NOT NULL DEFAULT 'workbuddy',
+            deleted INTEGER NOT NULL DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS request_logs (
             id INTEGER PRIMARY KEY,
             time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api', path TEXT NOT NULL,
@@ -563,7 +628,8 @@ class Database:
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
-                  (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11))
+                  (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
+                  (12, _v11_to_v12), (13, _v12_to_v13))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -730,15 +796,20 @@ class Database:
 
         两类条件的连接词是 OR：自定义模型可能 available=0（上游根本没返回它），
         用 AND 会把它们全过滤掉，用户保存的模型重启后消失。
+
+        **已删除的行（deleted=1）一律不返回**：它们只为 request_logs 的 join
+        留在表里，不该再进任何目录。没有这个过滤，删除会在重启后复活
+        （`available=0` 表达不了「已删除」——那条语义已被「上游没返回的自定义
+        模型要保留」占用）。
         """
-        sql = "SELECT * FROM models"
+        sql = "SELECT * FROM models WHERE deleted=0"
         where = []
         if only_available:
             where.append("available=1")
         if include_custom:
             where.append("source='custom'")
         if where:
-            sql += " WHERE " + " OR ".join(where)
+            sql += " AND (" + " OR ".join(where) + ")"
         result = {}
         for row in self.query(sql):
             item = {key: row[key] for key in row.keys()}
@@ -765,7 +836,15 @@ class Database:
                          item.get("source") or "upstream",
                          _to_int(item.get("available"), 1), _to_int(item.get("enabled"), 1),
                          _to_int(item.get("sort_order")), item.get("promo"),
-                         _to_int(item.get("synced_at"))))
+                         _to_int(item.get("synced_at")),
+                         # 归属：调用方（ModelRegistry）写入时已知，直接存列（§3.1）。
+                         # **缺值即报错**，不给默认值 —— 给了的话「persist 忘了写列」
+                         # 这类回归会静默写成 workbuddy 而测试全绿（变异测试实测抓到
+                         # 这个盲区）。列自身的 DEFAULT 'workbuddy' 只兜迁移期的历史行，
+                         # 那条路径不经过这里。
+                         _require_backend(item.get("backend"), mid),
+                         # 删除标记：1 = 用户删掉的保留行（供日志 join，不加载）。
+                         _to_int(item.get("deleted"), 0)))
         with self.transaction():
             self._write.executemany(
                 f"INSERT INTO models ({', '.join(columns)}) VALUES ({marks})"
@@ -789,8 +868,11 @@ class Database:
 
         不按 available 过滤：自定义模型不在上游目录里，过滤掉会让它们被当成
         「未知」而绕过禁用检查。
+        已删除（deleted=1）的不算已知：用户删掉它就是想让它不可用，
+        留着反而会把它当「已知但禁用」而给出误导性的报错。
         """
-        return {row["model_id"] for row in self.query("SELECT model_id FROM models")}
+        return {row["model_id"] for row in self.query(
+            "SELECT model_id FROM models WHERE deleted=0")}
 
     # -- request logs -------------------------------------------------------
     def append_request_logs(self, rows):

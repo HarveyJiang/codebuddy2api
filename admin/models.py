@@ -49,6 +49,11 @@ SOURCE_UPSTREAM = "upstream"
 SOURCE_BUILTIN = "builtin"
 SOURCE_CUSTOM = "custom"
 
+#: 排序第一层用的来源序号（specs/model-backend-attribution.md §6）：
+#: 自定义最前、内置其次、上游最后。自定义排在前面是因为它们最需要被看见
+#: —— 上游没列出、随时可能被误当成「已下线」；动态拉来的几百条垫底。
+_SOURCE_RANK = {SOURCE_CUSTOM: 0, SOURCE_BUILTIN: 1, SOURCE_UPSTREAM: 2}
+
 
 def backend_for_model_id(mid):
     """对外模型 id → 所属后端名（按各后端声明的前缀）。
@@ -275,11 +280,24 @@ class ModelRegistry:
                 # 而不是 settings 的固定列 —— 后端数量是可变的，settings 留不出列。
                 state["updated"] = 0
                 # 带前缀的后端只吃自己的行；默认后端吃所有**没有别的前缀**的行。
-                own = {mid: row for mid, row in rows.items() if backend_for_model_id(mid) == backend}
+                # 归属读的是持久化的 `backend` 列（§3.1：列管存下来的行），
+                # 不再逐行解析 model_id —— 前缀推导只留给请求路径。
+                own = {mid: row for mid, row in rows.items()
+                       if (row.get("backend") or backend_for_model_id(mid)) == backend}
                 order_rows = sorted(own.items(), key=lambda kv: kv[1].get("sort_order", 0))
                 for mid, row in order_rows:
                     bare = mid[len(prefix):] if prefix else mid
                     source = normalize_source(row.get("source"))
+                    # available=0 的行不进 registry —— 否则 snapshot_ids() 会把它
+                    # 算成「已知」，PoolMiddleware 会把「上游已下线」误报成「管理页
+                    # 已禁用」而拒掉请求（见本方法 docstring）。
+                    # 例外：**自定义模型**即使 available=0 也要加载 —— 上游没返回它
+                    # 正是它的定义（用户手动加的），丢掉就等于删除。
+                    # 真正「已删除」的行由 `deleted=1` 表达，load_models 已过滤掉，
+                    # 不会走到这里。
+                    if not row.get("available", 1) and source != SOURCE_CUSTOM:
+                        state["updated"] = max(state["updated"], int(row.get("synced_at") or 0))
+                        continue
                     state["catalog"][bare] = {"name": row.get("name") or bare,
                                               "description": row.get("description"),
                                               "credits": row.get("credits"),
@@ -340,6 +358,9 @@ class ModelRegistry:
                         "available": 1 if bare in available else 0,
                         "enabled": 0 if bare in disabled else 1,
                         "sort_order": sort_order,
+                        # 归属：循环变量在这里**已知**，直接存列（§3.1）。
+                        # 与 model_id 前缀同源同值，drift 防护测试钉住这一点。
+                        "backend": backend,
                         "promo": info.get("_promo") if backend == self._default else None,
                         # 每份目录的「上次拉取时刻」写在行上，重启后各后端各归各的。
                         "synced_at": state["updated"],
@@ -592,9 +613,17 @@ class ModelRegistry:
     def snapshot(self):
         """Full catalog with management flags and current promo, for the admin UI.
 
-        排序规则：按后端（注册表顺序，默认后端在最前）；每个后端内启用的在前、
-        禁用的在后；同组内按单价（credits）升序，None（按标准计费）视为 0，
-        与免费模型并列最前。
+        排序规则（四层，specs/model-backend-attribution.md §6，用户已拍板）：
+
+        1. **来源**：custom(0) → builtin(1) → upstream(2)。自定义永远在最前，
+           内置其次，动态拉取的最后；
+        2. **归属**：注册表顺序（``BackendSpec.order``，默认后端在最前）；
+        3. **启用**：启用的在前，禁用的沉底；
+        4. **倍率**：``credits`` 升序；``None``（按标准计费）视为 0，与免费并列最前。
+           同分用目录原顺序（``available`` 下标）稳定决胜。
+
+        来源之所以是**第一层**：用户手动加的、上游没列出的模型最需要被看见
+        （它们随时可能被误当成「上游没了」而找不到）；动态拉来的几百条垫底。
 
         后端顺序来自注册表声明，不再是「默认后端 + 追加 Trae」的写死两段式。
         """
@@ -608,7 +637,6 @@ class ModelRegistry:
                 state = self._state_for(backend)
                 prefix = spec_for(backend).model_prefix
                 available, catalog = state["available"], state["catalog"]
-                group = []
                 for bare in available:
                     if bare not in catalog:
                         continue
@@ -627,15 +655,21 @@ class ModelRegistry:
                                           "credits": round(entry["credits"] * promo[1], 4)}
                     elif stored and isinstance(entry.get("credits"), (int, float)):
                         entry["promo"] = {"label": stored, "factor": 1.0, "credits": entry["credits"]}
-                    group.append(entry)
-                group.sort(key=lambda m: (
-                    not m["enabled"],
-                    m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,
-                    available.index(m["id"][len(prefix):] if prefix else m["id"]),
-                ))
-                models.extend(group)
+                    # 目录原顺序（稳定决胜用）：取该后端 available 里的下标。
+                    entry["_seq"] = available.index(bare)
+                    models.append(entry)
                 if backend == self._default:
                     updated, error = state["updated"], state["error"]
+
+            models.sort(key=lambda m: (
+                _SOURCE_RANK[m["source"]],          # ① 来源
+                spec_for(m["backend"]).order,       # ② 归属（注册表顺序）
+                not m["enabled"],                   # ③ 启用优先
+                m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,  # ④ 倍率
+                m["_seq"],                          # 稳定决胜：同分保持目录原顺序
+            ))
+            for m in models:
+                m.pop("_seq", None)
             # updated/error 报告**默认后端**的刷新状态：管理页的「上次拉取」提示
             # 说的是主目录；各后端的细节在各自的目录提供者里。
             return {"updated": updated, "error": error, "models": models}
@@ -716,12 +750,17 @@ class ModelRegistry:
                 state["disabled"].add(bare)
             return source
 
-    def remove(self, mid):
+    def remove(self, mid, db=None):
         """删除模型。只允许删自定义项。
 
         上游模型删了没用：下一次 fetch() 会把它原地带回来，而且会让
         request_logs.model_id 的 join 断掉（表里保留 available=0 的行正是为此）。
         自定义项必须同时从 custom 移除，否则下次合并又把它加回来。
+
+        ``db`` 必须传：删除后这个 id 已不在内存 catalog 里，`persist()` 再也
+        写不到它 —— 库里会留着上一次写的 available=1，重启时 `load()`（只读
+        available=1）把它**原样装回来**，删除形同虚设。所以要在这里就地把它
+        落成 available=0（保留行供 request_logs join）。
         """
         backend = backend_for_model_id(mid)
         prefix = spec_for(backend).model_prefix
@@ -732,10 +771,26 @@ class ModelRegistry:
                 raise KeyError(mid)
             if bare not in state["custom"]:
                 raise ValueError("upstream")
+            entry = dict(state["catalog"][bare])
             state["custom"].discard(bare)
             state["catalog"].pop(bare, None)
             state["available"] = [x for x in state["available"] if x != bare]
             state["disabled"].discard(bare)
+        if db is not None:
+            # 行保留（供 request_logs join），但标 deleted=1：load_models 不再返回它，
+            # 重启也不会复活。**不能**只标 available=0 —— 那个语义归「上游没返回
+            # 的自定义模型要保留」所有，两者混用会让删除与保留互相打架。
+            db.save_models({mid: {
+                "name": entry.get("name") or mid,
+                "description": entry.get("description"),
+                "credits": entry.get("credits"),
+                "max_input_tokens": entry.get("max_input_tokens"),
+                "source": SOURCE_CUSTOM,
+                "available": 0,
+                "enabled": 0,
+                "backend": backend,
+                "deleted": 1,
+            }})
 
     def is_custom(self, mid):
         backend = backend_for_model_id(mid)

@@ -495,6 +495,23 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("my-hidden-model", await catalog())
         self.assertEqual((await self.client.delete("/admin/api/models/" + upstream_id)).status_code, 400)
 
+    async def test_delete_prefixed_custom_model(self):
+        """带后端前缀的自定义模型必须能删（`{mid:path}` 转换器）。
+
+        模型 id 的线上格式可以带前缀（`trae/xxx`）。默认路径转换器不匹配斜杠，
+        前端 `encodeURIComponent` 送来的 `%2F` 也变不成分隔符 —— 路由不改成
+        `:path` 就会 404。归属多选让这类行变得常见，所以这条必须有。
+        """
+        await self.login()
+        created = await self.client.post("/admin/api/models",
+                                         json={"id": "trae/probe-model", "name": "探针"})
+        self.assertEqual(created.status_code, 200)
+        catalog = self.app.state.model_registry
+        self.assertIn("trae/probe-model", catalog.snapshot_ids())
+        resp = await self.client.delete("/admin/api/models/trae%2Fprobe-model")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertNotIn("trae/probe-model", catalog.snapshot_ids())
+
     async def test_custom_model_is_callable(self):
         """上游菜单没列出的模型：加进来之后能调，禁用才被拦。"""
         await self.login()

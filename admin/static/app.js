@@ -291,6 +291,11 @@ function renderModelGroup(g) {
 
   // 后端标记：单后端直接打标；多后端在每个值前面标，读得出「哪个数属于哪个后端」。
   const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))} ${esc(backendLabel(m.backend))}</span>`;
+  // 行前归属 icon（specs/model-backend-attribution.md §4.1）：纯 icon 无 pill
+  // （复用账号表同款 .account-icon-backend），颜色由后端声明经 /admin/api/backends
+  // 提供。多后端组按后端顺序并排，一眼看出这行跨了几条链路。
+  const attrIcon = m => `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(m.backend)?.color || "#888")}" title="${esc(backendName(m.backend))}">${esc(backendIcon(m.backend))}</span>`;
+  const attrIcons = items.map(attrIcon).join("");
 
   const creditsCell = multi
     ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span></div>`).join("")
@@ -315,8 +320,8 @@ function renderModelGroup(g) {
     : "";
 
   const idCell = multi
-    ? `<strong>${esc(g.key)}</strong><small class="cell-note">${items.length} 个后端：${esc(items.map(m => backendName(m.backend)).join(" / "))}</small>`
-    : `<strong>${esc(primary.id)}</strong><small class="cell-note">${esc(primary.name || "")}</small>`;
+    ? `<span class="model-id-line">${attrIcons}</span><strong>${esc(g.key)}</strong><small class="cell-note">${items.length} 个后端：${esc(items.map(m => backendName(m.backend)).join(" / "))}</small>`
+    : `<span class="model-id-line">${attrIcons}</span><strong>${esc(primary.id)}</strong><small class="cell-note">${esc(primary.name || "")}</small>`;
 
   const stateCell = multi
     ? `<span class="pill ${allEnabled ? "green" : anyEnabled ? "amber" : ""}">${allEnabled ? "启用" : anyEnabled ? `${enabledCount}/${items.length} 启用` : "禁用"}</span>`
@@ -996,11 +1001,39 @@ $("models-body").addEventListener("click", async e => {
   }
 });
 // -- 添加模型 -------------------------------------------------------------
+// 归属多选（specs/model-backend-attribution.md §4.3）：选项来自注册表
+// （/admin/api/backends），加后端自动多一项，前端不登记任何后端名。
+// 提交语义是「前端展开调 N 次」——后端 ModelRegistry.add 的语义不变，
+// 部分失败逐个报告（Trae 侧 400 不影响 WorkBuddy 落盘）。
+function renderBackendPicker() {
+  const box = $("model-backends");
+  const list = $("model-backend-options");
+  if (!box || !list) return;
+  // 只有多于一个后端时才需要选：单后端时归属别无选择，藏起来减少噪音。
+  if (backends.length < 2) { box.hidden = true; list.innerHTML = ""; return; }
+  box.hidden = false;
+  list.innerHTML = backends.map(b => `<label class="model-backend-option"><input type="checkbox" data-model-backend="${esc(b.name)}"${b.enabled === false ? " disabled" : ""}${b.enabled === false ? "" : " checked"}> ${esc(backendIcon(b.name))} ${esc(b.label || b.name)}</label>`).join("");
+}
 $("models-add").addEventListener("click", () => {
   $("model-form").reset();
   $("model-enabled").checked = true;
   $("model-error").textContent = "";
+  renderBackendPicker();
   $("model-dialog").showModal();
+});
+// 带前缀的 ID 已显式指定归属 → 收敛多选框为仅那一个后端（§4.3）。
+$("model-id").addEventListener("input", () => {
+  const value = $("model-id").value.trim();
+  const named = backends.find(b => b.prefix && value.startsWith(b.prefix));
+  $("model-backend-options").querySelectorAll("[data-model-backend]").forEach(input => {
+    if (!named) {
+      input.disabled = backends.find(x => x.name === input.dataset.modelBackend)?.enabled === false;
+      return;
+    }
+    const isTarget = input.dataset.modelBackend === named.name;
+    input.checked = isTarget;
+    input.disabled = !isTarget;
+  });
 });
 $("model-form").addEventListener("submit", async e => {
   e.preventDefault();
@@ -1013,22 +1046,47 @@ $("model-form").addEventListener("submit", async e => {
     return;
   }
   const num = el => { const v = el.value.trim(); return v === "" ? null : Number(v); };
+  const fields = {
+    name: $("model-name").value.trim() || null,
+    description: $("model-desc").value.trim() || null,
+    credits: num($("model-credits")),
+    max_input_tokens: num($("model-ctx")),
+    enabled: $("model-enabled").checked,
+  };
+  // 带前缀的 ID 自带归属（后端按前缀判定），除此之外按多选框展开。
+  // 前缀拼接规则来自 backends[].prefix，不是手写 "trae/"。
+  const explicit = backends.find(b => b.prefix && id.startsWith(b.prefix));
+  const chosen = explicit
+    ? [explicit]
+    : backends.filter(b => b.enabled !== false
+        && $("model-backend-options")?.querySelector(`[data-model-backend="${b.name}"]`)?.checked);
+  const targets = chosen.length ? chosen : [backends[0]];
   const button = $("model-submit");
   button.disabled = true;
+  const failed = [];
+  let saved = 0;
   try {
-    await api("models", {method: "POST", body: {
-      id,
-      name: $("model-name").value.trim() || null,
-      description: $("model-desc").value.trim() || null,
-      credits: num($("model-credits")),
-      max_input_tokens: num($("model-ctx")),
-      enabled: $("model-enabled").checked,
-    }});
-    $("model-dialog").close();
-    await refresh();
-    toast(`已保存 ${id}`);
-  } catch (err) {
-    error.textContent = err.message;
+    for (const backend of targets) {
+      // 默认后端前缀为空串，直接用裸名；其它后端带自己的前缀。
+      const targetId = explicit ? id : (backend.prefix || "") + id;
+      try {
+        await api("models", {method: "POST", body: {id: targetId, ...fields}});
+        saved += 1;
+      } catch (err) {
+        failed.push(`${backend.label || backend.name}：${err.message}`);
+      }
+    }
+    if (saved) {
+      $("model-dialog").close();
+      await refresh();
+    }
+    if (failed.length) {
+      // 部分成功必须如实报告（Trae 上游没这个模型时后端会 400）。
+      const message = `已保存 ${saved} 个；${failed.join("；")}`;
+      if (saved) toast(message); else error.textContent = message;
+    } else {
+      toast(`已保存 ${targets.length} 个后端：${id}`);
+    }
   } finally {
     button.disabled = false;
   }

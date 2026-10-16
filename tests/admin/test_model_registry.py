@@ -105,11 +105,13 @@ class ModelRegistryTests(unittest.TestCase):
         snap = registry.snapshot()
         ids = [m["id"] for m in snap["models"]]
         # disabled 上游模型与不在 cli agent 列表里的 ghost 均不出现；
-        # 三档智能路由固定附加；展示按单价升序（None 视为 0）。
-        self.assertEqual(ids, ["step-5-preview", "space-bunny", "fast-model",
-                               "balanced-model", "glm-5.2", "deep-model"])
+        # 三档智能路由固定附加（source=builtin），展示按四层排序
+        # （specs/model-backend-attribution.md §6）：builtin 整体排在 upstream 之前。
+        self.assertEqual(ids, ["fast-model", "balanced-model", "deep-model",
+                               "step-5-preview", "space-bunny", "glm-5.2"])
         # 上游无 descriptionZh 时用内置中文描述兜底，且不掺英文。
-        self.assertEqual(snap["models"][0]["description"],
+        step = next(m for m in snap["models"] if m["id"] == "step-5-preview")
+        self.assertEqual(step["description"],
                          BUILTIN_MODELS["step-5-preview"]["description"])
         glm = next(m for m in snap["models"] if m["id"] == "glm-5.2")
         self.assertEqual(glm["credits"], 0.79)
@@ -140,21 +142,31 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(desc["glm-5.2"], "旗舰模型，擅长复杂软件工程")
         self.assertEqual(desc["space-bunny"], BUILTIN_MODELS["space-bunny"]["description"])
 
-    def test_snapshot_orders_disabled_last(self):
-        """展示排序：启用的在前、禁用的在后；组内按单价升序（None 视为 0）。"""
+    def test_snapshot_orders_by_source_then_enabled_then_credits(self):
+        """四层排序（specs/model-backend-attribution.md §6）：
+
+        ① 来源 custom(0) → builtin(1) → upstream(2)
+        ② 归属（注册表顺序；本用例单后端）
+        ③ 启用的在前、禁用的沉底
+        ④ 倍率升序（None 视为 0）
+        """
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         response = unittest.mock.Mock(status_code=200)
         response.json.return_value = upstream_payload()
         with patch("admin.models.httpx.Client") as client_cls:
             client_cls.return_value.__enter__.return_value.get.return_value = response
             registry.fetch()
-        # 禁用掉最便宜（step-5-preview ×0.00）与最贵（deep-model ×1.20）的。
+        # 各禁用一条：一段内置（deep-model）、一段上游（最便宜的 step-5-preview）。
+        # 取这两条正是为了证明「来源」压过「启用」——被禁用的内置仍在上游之前。
         registry.set_enabled("step-5-preview", False)
         registry.set_enabled("deep-model", False)
         ids = [m["id"] for m in registry.snapshot()["models"]]
-        # 启用组按单价升序；禁用组排在最后，也按单价升序。
-        self.assertEqual(ids, ["space-bunny", "fast-model", "balanced-model", "glm-5.2",
-                               "step-5-preview", "deep-model"])
+        # 第①层先把 builtin（三档）全部提到 upstream 之前，与启用状态无关：
+        # 被禁用的 deep-model 仍排在所有上游模型之前。builtin 组内再按
+        # ③启用 ④倍率排（三档同级同倍率 → 保持目录原顺序）；upstream 组内
+        # 被禁用的 step-5-preview 沉底。
+        self.assertEqual(ids, ["fast-model", "balanced-model", "deep-model",
+                               "space-bunny", "glm-5.2", "step-5-preview"])
 
     def test_fetch_failure_keeps_previous_snapshot(self):
         registry = ModelRegistry(get_credential=lambda: FakeManager())
@@ -237,7 +249,7 @@ class ModelRegistryTests(unittest.TestCase):
         path = Path(root) / "state.db"
         db = Database(path)
         db.save_models({"ghost-model": {"name": "幽灵", "source": "custom",
-                                        "available": 0, "enabled": 1}})
+                                        "available": 0, "enabled": 1, "backend": "workbuddy"}})
         registry = ModelRegistry(get_credential=lambda: None)
         registry.load(db)
         self.assertIn("ghost-model", registry.enabled_models())
@@ -348,6 +360,54 @@ class ModelRegistryTests(unittest.TestCase):
             registry.remove("hy3")
         with self.assertRaises(KeyError):
             registry.remove("never-existed")
+
+    def test_removed_custom_model_does_not_come_back_on_reload(self):
+        """删除必须落库 available=0，否则**重启后复活**。
+
+        既有测试只验了「fetch 后不回来」——那条走内存，抓不住这个 bug
+        （实测：删完重启，模型原样回来）。这条走 load(db)，是真路径。
+        """
+        import tempfile
+        from admin.db import Database
+        path = Path(tempfile.mkdtemp()) / "state.db"
+        db = Database(path)
+        try:
+            registry = ModelRegistry(get_credential=lambda: FakeManager())
+            registry.ensure_builtin()
+            registry.add("doomed-model", name="待删")
+            registry.persist(db)
+            registry.remove("doomed-model", db=db)
+            # 库里列为保留行（供日志 join），但必须 deleted=1。
+            row = db.query("SELECT deleted, available FROM models WHERE model_id='doomed-model'")[0]
+            self.assertEqual(row["deleted"], 1)
+            self.assertNotIn("doomed-model", db.load_models(only_available=False))
+            # 重启：重新 load，模型不得复活。
+            fresh = ModelRegistry(get_credential=lambda: FakeManager())
+            fresh.load(db)
+            self.assertNotIn("doomed-model", fresh.snapshot_ids())
+            self.assertNotIn("doomed-model", fresh.enabled_models())
+        finally:
+            db.close()
+
+    def test_removed_prefixed_custom_model_does_not_come_back_on_reload(self):
+        """带前缀的自定义模型同样要能删掉且不复活（`:path` 路由 + 落库）。"""
+        import tempfile
+        from admin.db import Database
+        path = Path(tempfile.mkdtemp()) / "state.db"
+        db = Database(path)
+        try:
+            registry = ModelRegistry(get_credential=lambda: FakeManager())
+            registry.ensure_builtin()
+            registry.add("trae/doomed-k3", name="待删 K3")
+            registry.persist(db)
+            registry.remove("trae/doomed-k3", db=db)
+            row = db.query("SELECT deleted FROM models WHERE model_id='trae/doomed-k3'")[0]
+            self.assertEqual(row["deleted"], 1)
+            fresh = ModelRegistry(get_credential=lambda: FakeManager())
+            fresh.load(db)
+            self.assertNotIn("trae/doomed-k3", fresh.snapshot_ids())
+        finally:
+            db.close()
 
     def test_removed_custom_model_does_not_come_back_on_fetch(self):
         """删除必须同时清掉 _custom，否则下一次合并又把它加回来。"""

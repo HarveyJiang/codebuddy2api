@@ -46,8 +46,8 @@ class DatabaseTests(unittest.TestCase):
 
     def _write_models(self, db):
         db.save_models({
-            "hy3": {"name": "Hy3", "description": "混元", "credits": 0.05, "available": 1, "enabled": 1, "sort_order": 2},
-            "gone": {"name": "Gone", "credits": 0.5, "available": 0, "enabled": 1, "sort_order": 9},
+            "hy3": {"name": "Hy3", "description": "混元", "credits": 0.05, "available": 1, "enabled": 1, "sort_order": 2, "backend": "workbuddy"},
+            "gone": {"name": "Gone", "credits": 0.5, "available": 0, "enabled": 1, "sort_order": 9, "backend": "workbuddy"},
         })
 
     def test_no_kv_table_and_version_written(self):
@@ -354,7 +354,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("gone", models)
         self.assertEqual(models["gone"]["available"], 0)
         # 再写一次不删行。
-        db.save_models({"hy3": {"name": "Hy3 v2", "credits": 0.06, "available": 1, "enabled": 1}})
+        db.save_models({"hy3": {"name": "Hy3 v2", "credits": 0.06, "available": 1, "enabled": 1, "backend": "workbuddy"}})
         self.assertIn("gone", db.load_models())
         self.assertEqual(db.load_models()["hy3"]["name"], "Hy3 v2")
         db.close()

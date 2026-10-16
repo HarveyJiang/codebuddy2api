@@ -190,11 +190,24 @@ def is_enabled(name: str) -> bool:
 
 
 def backend_name_for(model) -> str:
-    """中间件/池用：模型名 → 后端名（不 raise）。无前缀 → 默认后端。"""
-    for name in known_names():
-        prefix = spec_for(name).model_prefix
-        if prefix and isinstance(model, str) and model.startswith(prefix):
-            return name
+    """中间件/池用：模型名 → 后端名（不 raise）。无前缀 → 默认后端。
+
+    判定顺序（两处都读**声明**，不认后端名）：
+
+    1. **私有模型**（``BackendSpec.pinned_models``）：无前缀的虚拟模型（三档
+       智能路由）由声明指定归属，不走「无前缀 ⇒ 默认后端」的兜底；
+    2. **前缀**：带前缀的 id 归声明了该前缀的后端。
+
+    两处都没有 ⇒ 默认后端（``auto`` 及一切裸名走这里）。
+    """
+    if isinstance(model, str):
+        for name in known_names():
+            if model in spec_for(name).pinned_models:
+                return name
+        for name in known_names():
+            prefix = spec_for(name).model_prefix
+            if prefix and model.startswith(prefix):
+                return name
     return default_name()
 
 

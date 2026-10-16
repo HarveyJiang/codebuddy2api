@@ -131,6 +131,20 @@ class BackendSpec:
     #: 空列表表示该后端没有静态兜底（目录只能来自上游）。
     static_catalog: list = []
 
+    #: 本后端**私有的虚拟模型**（bare id）：不走上游目录、永远归属本后端、
+    #: 不参与裸名自动选择候选（见 specs/model-routing-by-policy.md）。
+    #:
+    #: 为什么是声明而不是在 backend_name_for 里写死名字：同名模型在多个后端
+    #: 都可能有，但「它属于谁」是后端自己的属性。声明化后加后端不用改判定处
+    #: （``backend_name_for`` 是**前缀**判定，读的是各后端自己的 ``model_prefix``），
+    #: 也让「不得出现 ``== "fast-model"`` 这类字面量分支」能被 arch guard 顺带守住。
+    #:
+    #: 与 `model_prefix` 的关系：前缀只能表达「本后端接管哪些**带前缀**的 id」，
+    #: 表达不了「一个无前缀 id 固定属于我这个后端」（否则就要抢默认后端的名额）。
+    #: 今天这些无前缀 id 恰好落到默认后端（``backend_name_for`` 的兜底分支），
+    #: 加这个声明后它从「巧合」变成「保证」。
+    pinned_models: tuple = ()
+
     #: 凭据管理器上「拉取本后端模型目录」的方法名。
     #: 目录的传输细节属于凭据（登录态在它手里），所以约定它是
     #: ``manager.<catalog_method>()-> list[{id, name, context_length, ...}] | None``。

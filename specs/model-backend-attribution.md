@@ -1,10 +1,11 @@
-# 模型归属显式化：行前 icon、三档路由归类、自定义模型多选归属（设计方案，未实现）
+# 模型归属显式化：行前 icon、三档路由归类、自定义模型多选归属（**已实现**，2026-10-16）
 
-> 状态：**方案讨论中**（2026-10-16）。用户需求三条：
+> 状态：**已实现**（2026-10-16）。用户需求三条：
 > 1. 模型管理页，模型名前面加 icon 区分归属；
 > 2. `fast-model` / `balanced-model` / `deep-model` 归类到腾讯；
 > 3. 添加自定义模型时**选归属，可多选**（Trae / WorkBuddy）。
-> 本文档只做方案设计，**不实现**，待用户确认后再排期。
+>
+> 实现记录见 §10。方案讨论期的原文保留在下面，便于对照「当时怎么想的」。
 
 ---
 
@@ -292,3 +293,91 @@ pinned_models = ("fast-model", "balanced-model", "deep-model")
    前置依赖 `backend-toggle.md`（总闸先落，本方案沿用它的「行按 `is_enabled` 隐藏」
    惯例，不另定一套）；本方案又是裸名自动选后端（`model-routing-by-policy.md`）
    的输入（`backend` 列 + 多行结构）。
+
+---
+
+## 10. 实现记录（2026-10-16）
+
+方案三条全部落地，不需要新接口、不动 `model_id` 格式、不改客户端行为。
+
+### 10.1 落地清单
+
+| 文件 | 改动 |
+|---|---|
+| `core/backends/base.py` | 基类加 `pinned_models: tuple = ()` + 注释约定 |
+| `core/backends/workbuddy.py` | 声明三档：`pinned_models = ("fast-model", "balanced-model", "deep-model")` |
+| `core/backends/registry.py` | `backend_name_for` 先查 pin 声明、再查前缀，最后兜底默认后端 |
+| `admin/db.py` | `SCHEMA_VERSION=12`、`_v11_to_v12`（加列 + 按前缀回填一次）、`MODEL_COLUMNS` 加 `backend`、`save_models` 带上该列、新增 `_require_backend` |
+| `admin/models.py` | `load` 读列不再逐行解析前缀；`persist` 写入循环变量 `backend`；`snapshot` 改四层排序（新增 `_SOURCE_RANK`） |
+| `admin/static/app.js` | 行前归属 icon（`attrIcon`/`attrIcons`）；添加弹框的归属多选与 N 次展开提交 |
+| `admin/static/index.html` | `model-dialog` 加 `#model-backends` / `#model-backend-options` |
+| `admin/static/style.css` | `.model-id-line`（行前 icon）、`.model-backend-picker` 等 |
+| `tests/admin/test_model_attribution.py` | 新增 22 条 |
+
+### 10.2 与方案的一处**有意偏离**：`save_models` 缺 backend 时报错
+
+方案没写这条，是实现中**变异测试逼出来的**：最初 `save_models` 给
+`item.get("backend") or "workbuddy"` 兜底，结果「`persist()` 忘了写 backend 列」
+这个变异**全量测试依然全绿**（静默写成默认后端，而 workbuddy 恰好就是正确答案）。
+
+改成缺值即 `ValueError` 后，该变异立刻被 15 条测试抓住。代价是两个直接调
+`save_models` 的测试要补 `backend` 字段——这个代价正是我们想付的：**写入点必须
+显式声明归属，不许靠兜底**。列自身的 `DEFAULT 'workbuddy'` 只兜迁移期的历史行。
+
+### 10.3 变异验证（逐条实测，全部被抓）
+
+| 变异 | 结果 |
+|---|---|
+| 排序删掉「来源」层（回到旧三层） | ✅ 4 条红 |
+| `persist` 不写 `backend` 列 | ✅ 15 条红（**加了 `_require_backend` 之后**） |
+| `load` 改回按前缀推导 | ✅ 1 条红 |
+| 删掉 `pinned_models` 声明 | ✅ 1 条红 |
+| `registry` 不再查 pin（只看前缀） | ✅ 2 条红（**补了「换一个后端来钉机制」的测试之后**） |
+| 迁移不回填 trae 行 | ✅ 1 条红 |
+
+第 5 条值得记一笔：「三档归 workbuddy」这个断言**抓不住** pin 查找被删——因为三档
+是无前缀 id，删掉 pin 查找后它们仍会走「无前缀 ⇒ 默认后端」兜底，结论一模一样。
+补了两条换后端的测试（`test_pinned_lookup_is_declaration_driven_not_fallback`
+与 `test_pin_beats_prefix`）才钉住机制本身。
+
+### 10.4 线上验证（dev，`codebuddy-dev.2020224.xyz`）
+
+- v12 迁移在**真实库**上跑过：42 个模型，22 workbuddy / 20 trae，drift 查询为空；
+- 四层排序在真实数据上**严格单调**（`keys == sorted(keys)` 为真）；
+- `_seq` 内部键未泄漏到 API 输出；
+- 多选写入路径实打：裸名 → `attribution-probe` 归 workbuddy，`trae/` 前缀 →
+  `trae/attribution-probe` 归 trae，两行各自独立，且 `source=custom` 使它们排在最前；
+- 生产（`main-39066dae`，v9）**未受影响**，容器 healthy。
+
+### 10.5 顺带修掉的两个既有 bug（测试中撞出来的）
+
+都不是本方案引入的，但**归属多选让它们变得常见**，所以一并收了。
+
+**① `DELETE /admin/api/models/{mid}` 删不掉带前缀的模型**
+
+路径参数用默认转换器，不匹配斜杠；前端 `encodeURIComponent` 送来的 `%2F`
+也变不成路径分隔符 —— `trae/xxx` 一律 404。改成 `{mid:path}` 后正常
+（`test_delete_prefixed_custom_model` 钉住，去掉 `:path` 该测试变红）。
+
+**② 自定义模型删除后**重启复活****
+
+`remove()` 只动内存，`persist()` 又已经看不到这个 id（已被弹掉），于是库里
+留着上一次写的 `available=1`；重启时 `load()` 把它原样装回来 —— 删除形同虚设。
+既有测试只验了「fetch 后不回来」（走内存），抓不住。
+
+修法上走了一条弯路，值得记下来：先用 `available=0` 标记，结果与
+`test_custom_model_loads_when_available_zero`（「上游没返回的自定义模型要保留」）
+**语义打架** —— 同一个 `available=0` 表示不了两件事。最终加独立的
+`models.deleted` 列（v13 迁移）把两个语义分开：`deleted=1` = 用户删的，
+只在表里供日志 join；`available=0` 且 `source=custom` = 上游没返回但用户要留。
+
+**v13 为什么是独立版本号而不是并入 v12**：`deleted` 最初就写在 `_v11_to_v12`
+里，但任何已经跑过 v12 的库（本地测试库、dev）版本号已是 12，迁移不再执行，
+`load_models` 直接 `no such column: deleted`。**编辑已应用过的迁移是本项目的
+大忌**，这次真被咬到了。拆成 v13 后，无论 v12 是哪个版本写的，它都会跑到。
+`test_v12_db_without_deleted_column_is_upgraded` 专门造出那个半成品状态来守这条。
+
+### 10.6 遗留
+
+- 无阻塞项。删除的持久化、带前缀模型的增删、迁移半成品修复都已在 dev 实测通过
+  （删除后重启不复活，行以 `deleted=1` 保留供日志 join）。

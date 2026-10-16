@@ -30,7 +30,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from admin.db import Database
+from admin.db import Database, SCHEMA_VERSION
 from admin.server import Store, create_app
 
 ADMIN = "admin-key-long-enough-12345"
@@ -138,7 +138,7 @@ class LastUsedAtSchemaTests(unittest.TestCase):
         db = Database(self.root / "state.db")
         try:
             self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
-                             "11")
+                             str(SCHEMA_VERSION))
             row = db.query("SELECT * FROM keys")[0]
             keys = [r[1] for r in db._write.execute("PRAGMA table_info(keys)")]
             self.assertIn("last_used_at", keys)
@@ -169,7 +169,7 @@ class LastUsedAtSchemaTests(unittest.TestCase):
         again = Database(self.root / "state.db")
         try:
             self.assertEqual(again.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
-                             "11")
+                             str(SCHEMA_VERSION))
         finally:
             again.close()
 
