@@ -240,8 +240,17 @@ Codex CLI / Claude Code 这类客户端**只能改 `model` 字段**，改不了 
    想用贵的那边必须写 `trae/` 前缀（用户知情同意）。免费变收费是不可接受的惊喜。
    实现上：候选排序时，若某后端同名模型的倍率高于当前第一名，则该后端出局
    （除非请求本身带了显式前缀——那是用户自己的选择）。
-4. **策略粒度**：全局一个（设置页调序）。每个密钥可配（像 `allowed_models` 那样）
-   不进首版——先验证全局策略的行为符合预期，再考虑下放。
+4. **策略粒度**：✅ **全局默认 + 单 key 可配**（用户拍板，2026-10-16）。
+   和现在**没有变化**——照抄 `keys.routing` 的现成模式：
+   - 全局：`settings.model_backend_order`（JSON 有序列表，默认 = 注册表顺序），设置页调序；
+   - 单 key：`keys.model_backend_order`（TEXT，NULL = 跟随全局，非空 = 自己的有序列表）；
+   - 生效值解析照抄 `_routing_for` 的一行形状：
+     `item.get("model_backend_order") or pool.model_backend_order`，未知后端名忽略。
+   - 前端照抄 `routing-chip` 的 per-key 编辑入口。
+   - 单 key 显式排序视为**知情选择**（与带前缀请求同级），不触发第 3 条的价格保护——
+     配 key 的是管理员，看得见两边倍率。
+   两处都是加列迁移（安全类型），与 `keys.routing` / `settings.default_routing`
+   同一风格，不引入新机制。
 5. **降级上界**：一次请求内最多尝试 2 个后端（主 + 一个备）。待实现时确认。
 6. **`/v1/models` 的 `owned_by`**：写当前策略第一名，并加 `available_backends` 字段。
    待实现时确认。
