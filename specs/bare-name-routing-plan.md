@@ -109,6 +109,26 @@ admin/pool.py:1298
 - 端到端：dev 上两个后端都有 `glm-5.3`，实测裸名请求落点与
   `request_logs.backend` 一致。
 
+## 四之二、接线时发现的两处「文档没写、必须显式处理」的情形
+
+1. **`auto` / 空不得走策略**（§4 表格末行「不变：走默认后端」）。它们**不是目录里的
+   模型**，拿去查候选集必然零候选 → 会从「走默认后端」变成 **400**，破坏一切既有客户端
+   （`converter` 各端点都 `payload.get("model") or "auto"`）。已在
+   `_resolve_backend_for` 里显式短路。这是**唯一**一处为「非候选」写的分支，且它不是
+   §5.4 禁止的「只有默认后端就特判」——它特判的是**名字本身不指向模型**。
+2. **`has_enabled_account` 在 `Store` 上、不在 `AccountPool` 上**。第一版接线写成了
+   `self.pool.has_enabled_account(...)`，测试直接 `AttributeError`。这类错误只会在
+   **真实 app 路径**上暴露（纯函数测试碰不到 pool/store 的边界），正是 e2e 那一层
+   存在的理由。
+
+## 四之三、为什么 `Decision.candidates` 只放「存活候选」
+
+第一版把**排序后的全部**候选放进 `candidates`，同时把价格的出局原因放进 `rejected`——
+于是「贵的出局」在返回值里**看不见**（它既在 candidates 里，又在 rejected 里，自相矛盾）。
+改成「`candidates` = 价格红线通过后的存活者」后，`candidates` 与 `rejected` 互为补集，
+调用方读一个就够。§5.3 的「降级恒为 1」也据此表达：失败就换账号（同后端），不在这里
+预留 fallback 列表。
+
 ## 五、回滚
 
 - 提交 1/2/4：无行为变更，`git revert` 即可。

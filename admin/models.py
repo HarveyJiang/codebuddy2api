@@ -745,6 +745,43 @@ class ModelRegistry:
                 out |= {prefix + mid for mid in state["available"]}
             return out
 
+    def bare_name_candidates(self, model):
+        """裸名 `model` 的各后端候选行（含被禁用的），供路由层判定。
+
+        返回 ``{backend: {"model_id", "credits_micro", "enabled", "available"}}``：
+        **只做「这个后端有没有这个模型」这一件事**，是否可用（总闸/账号/启用）
+        由调用方按 §5.1 判定并把原因记下来。
+
+        为什么放在这里而不是路由层：内存目录（`_state`）是私有结构，路由层只该
+        看见「有哪些候选」。这样 §5.1 的三道过滤与 §5.2 的排序共用同一份数据，
+        不会出现「渲染说有、路由说没有」。
+
+        匹配用**规范名**（`canonical_name`），所以请求 `kimi-k3` 能同时命中
+        `kimi-k3-1`(WB) 与 `trae/kimi-k3`(trae) —— 这正是 §4 用户侧契约要的效果。
+        """
+        wanted = canonical_name(model)
+        with self._lock:
+            out = {}
+            for backend in known_backends():
+                state = self._state_for(backend)
+                prefix = spec_for(backend).model_prefix
+                for bare in state["available"]:
+                    if bare not in state["catalog"]:
+                        continue
+                    mid = prefix + bare
+                    if canonical_name(mid) != wanted:
+                        continue
+                    entry = state["catalog"][bare]
+                    from .db import _to_micro
+                    out[backend] = {
+                        "model_id": mid,
+                        "credits_micro": _to_micro(entry.get("credits")),
+                        "enabled": bare not in state["disabled"],
+                        "available": True,
+                    }
+                    break   # 一个后端一个规范名只取第一条（同一后端不可能有两条同规范名）
+            return out
+
     def set_enabled(self, mid, enabled):
         backend = backend_for_model_id(mid)
         prefix = spec_for(backend).model_prefix

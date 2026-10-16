@@ -24,10 +24,21 @@ from admin.guards import (
 )
 from admin.reset_at import earliest_deadline, parse_reset_at, parse_retry_after
 from admin.rotation import WAF_IP_WINDOW, WafIpGate, backoff_after, is_waf_error
+from core.bare_routing import (
+    BackendOrderSpec,
+    Candidate,
+    Rejection,
+    build_order,
+    decide,
+    NoCandidate,
+)
 from core.backends.registry import (
     backend_name_for,
     default_name as default_backend,
     is_enabled as is_backend_enabled,
+    known_names as known_backends,
+    pinned_model_owner,
+    prefix_for,
     spec_for,
 )
 
@@ -37,6 +48,16 @@ REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 # 会先于外层读取执行，ContextVar 到外层就变回默认值了（实测确认）。
 # scope 是同一条链上共享的可变对象，不受 finally 时序影响。
 REQUEST_LOG_CONTEXT = "codebuddy.request_log"
+#: 裸名路由的选定后端（§5），由池中间件写、converter 读。
+#:
+#: **为什么必须共享**：中间件在选号**之前**定后端（选号要按 backend 过滤），
+#: 而 converter 的 `resolve_backend` 也要给出同一个后端 —— 否则
+#: `_resolve_backend_or_http` 的「凭据-后端一致性闸门」会发现「选定后端 ≠
+#: 账号后端」而回 503，裸名请求全挂。
+#:
+#: 两处各算一遍是不行的：它们是**两次**独立决策，中间隔着选号（以及可能的排队
+#: 换号），任何一边的状态变化都会让两者分叉。所以只算一次、放在 scope 上。
+ROUTED_BACKEND = "codebuddy.routed_backend"
 _logger = logging.getLogger("admin.pool")
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
@@ -1247,6 +1268,74 @@ class PoolMiddleware:
         self.app, self.pool = app, pool
         self.model_registry = model_registry
 
+    def _resolve_backend_for(self, model, kid):
+        """模型名 → 后端名。裸名走策略选择，带前缀/私有模型走声明。
+
+        §5 的落点。**唯一一处**决定后端的地方（converter 侧的 `resolve_backend`
+        读同一个结果 —— 见 `scope["codebuddy.routed_backend"]` 的传递）。
+
+        三道过滤（§5.1）在候选集里做，出局原因逐条留给 400 报错：
+        1. 总闸 + 环境逃生门（`is_backend_enabled`）；
+        2. 该后端有启用账号（`store.has_enabled_account`）；
+        3. 该后端这条模型行启用（模型管理页的开关）。
+
+        裸名路由开关（`settings.bare_name_routing`）关掉时，直接返回
+        `backend_name_for` 的结果 = 今天的行为（裸名走默认后端）。这是
+        §8 阶段三要求的 kill switch。
+        """
+        # 带前缀 / 私有模型（pinned）：行为与今天完全一致，不走策略。
+        # 这两类都不是「多个后端都有同名模型」的情形 —— pinned 是「本来就只可能
+        # 归我」（三档路由），带前缀是用户点名要哪个后端（§4 用户侧契约）。
+        # 判定复用 registry 的声明（不是在这里重写一遍 `in spec.pinned_models`）。
+        if prefix_for(model) or pinned_model_owner(model) is not None:
+            return backend_name_for(model)
+
+        # `auto` / 空 = 「不指定」→ 默认后端（§4 表格末行：「不变：走默认后端」）。
+        # 它们**不是目录里的模型**，拿去查候选集必然零候选 —— 那会把它变成
+        # 400，破坏既有客户端（`converter` 各处都 `payload.get("model") or "auto"`）。
+        if not model or model == "auto":
+            return backend_name_for(model)
+
+        if not self.pool.store.data["pool"].get("bare_name_routing", True):
+            return backend_name_for(model)   # kill switch：裸名走默认后端
+
+        registry = self.model_registry
+        if registry is None or not isinstance(model, str) or not model:
+            # 无注册表（旧部署/单测）或非字符串：退回今天的行为。
+            return backend_name_for(model)
+
+        rows = registry.bare_name_candidates(model)
+        known = tuple(known_backends())
+        candidates, rejections = [], []
+        for backend in known:
+            row = rows.get(backend)
+            if row is None:
+                rejections.append(Rejection(backend, "目录里没有这个模型"))
+                continue
+            if not is_backend_enabled(backend):
+                rejections.append(Rejection(backend, "后端已被管理员禁用"))
+                continue
+            if not self.pool.store.has_enabled_account(backend):
+                rejections.append(Rejection(backend, "没有启用账号"))
+                continue
+            if not row["enabled"]:
+                rejections.append(Rejection(backend, "该模型在此后端已被禁用"))
+                continue
+            candidates.append(Candidate(backend=backend,
+                                        credits_micro=row["credits_micro"],
+                                        model_id=row["model_id"]))
+        if not candidates:
+            # §5.1：候选为空 → 400（今天也是 400，只是文案更有用）。
+            # 未知模型（两边都没有）走到这里，rejections 会逐条说「目录里没有」。
+            raise HTTPException(400, str(NoCandidate(model, rejections)))
+
+        order, explicit = build_order(
+            known,
+            configured=self.pool.store.data["pool"].get("model_backend_order"),
+            key_configured=(self.pool.store.data["keys"].get(kid) or {}).get("model_backend_order"))
+        return decide(model, candidates,
+                      BackendOrderSpec(order=order, explicit_order=explicit)).backend
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}:
             return await self.app(scope, receive, send)
@@ -1294,8 +1383,15 @@ class PoolMiddleware:
                 allowed_models = self.pool.store.key_bindings(kid)[0]
                 if allowed_models and isinstance(model, str) and model and model not in allowed_models:
                     raise HTTPException(403, f"该密钥无权使用模型 {model}")
-            # 模型名 → 后端：trae/ 前缀分给 Trae 账号，其余分给 WorkBuddy 账号。
-            backend = backend_name_for(body.get("model") if isinstance(body, dict) else None)
+            # 模型名 → 后端（§5 裸名路由）：
+            #   `trae/x` / 三档路由 → 声明的归属；
+            #   裸名 → 按策略在候选后端里选（候选集/排序/价格红线见 core/bare_routing）；
+            #   总闸关掉裸名路由 → 回落「裸名走默认后端」（今天的行为）。
+            backend = self._resolve_backend_for(
+                body.get("model") if isinstance(body, dict) else None, kid)
+            # 把选定后端交给 converter（同一请求内的下一次决策必须给出同一个答案，
+            # 否则凭据-后端一致性闸门会 503）。见 ROUTED_BACKEND 的说明。
+            scope[ROUTED_BACKEND] = backend
             affinity_key = request_affinity(headers, body)
             model_name = None
             if isinstance(body, dict) and isinstance(body.get("model"), str):

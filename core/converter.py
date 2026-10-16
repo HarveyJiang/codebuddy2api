@@ -640,15 +640,30 @@ def list_models(
     return {"object": "list", "data": data}
 
 
-def _resolve_backend_or_http(model_raw) -> tuple:
+def _routed_backend(request) -> str | None:
+    """本请求由池中间件选定的后端（§5 裸名路由）；没有中间件时为 None。
+
+    scope 是 Starlette 请求对象上挂着的那份（与中间件共享同一个 dict）。
+    局部 import 防循环：`admin.pool` import core.converter。
+    """
+    try:
+        from admin.pool import ROUTED_BACKEND
+    except ImportError:
+        return None
+    scope = getattr(request, "scope", None) or {}
+    return scope.get(ROUTED_BACKEND)
+
+
+def _resolve_backend_or_http(model_raw, routed=None) -> tuple:
     """四端点共用前置：模型名 → (backend, upstream_model, cred)。
 
     trae/<名> → TraeBackend + map_model 归一（未知模型 → 400）；
+    bare 名 + `routed`（中间件已选定）→ 按选定后端解析；
     其余 → WorkBuddyBackend + 原模型名。
     凭据-后端一致性闸门：池选到的账号与请求后端不匹配 → 503
     （防独立部署模式下 Trae 账号收到 WorkBuddy 请求或反之）。
     """
-    backend, upstream_model = resolve_backend(model_raw)
+    backend, upstream_model = resolve_backend(model_raw, routed=routed)
     cred = _cred()
     # 凭据-后端一致性闸门：不比后端**名字**，比双方声明的凭据归属
     # （见 BackendSpec.credential_name / CredentialManager.backend_name）。
@@ -698,7 +713,7 @@ async def chat_completions(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae，其余走 WorkBuddy）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(payload.get("model") or "auto")
+    backend, upstream_model, cred = _resolve_backend_or_http(payload.get("model") or "auto", routed=_routed_backend(request))
 
     # 构造后端 body：只透传已知的合法字段
     client_wants_stream = bool(payload.get("stream"))
@@ -1261,7 +1276,7 @@ async def create_response(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto")
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request))
 
     if backend.tencent_policies:
         chat_body = filter_system_identity(chat_body)
@@ -1442,7 +1457,7 @@ async def create_message(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto")
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request))
 
     chat_body.setdefault("model", "auto")
     chat_body["model"] = upstream_model or chat_body.get("model") or "auto"
@@ -1649,7 +1664,7 @@ async def count_tokens(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto")
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request))
 
     # 最小化实际生成：只需要 usage 统计
     chat_body.setdefault("model", "auto")

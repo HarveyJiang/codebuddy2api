@@ -216,6 +216,25 @@ def is_enabled(name: str) -> bool:
     return not spec_for(name).env_disabled() and not toggle_disabled(name)
 
 
+def pinned_model_owner(model) -> str | None:
+    """该模型是否被某后端**私有声明**（``BackendSpec.pinned_models``）？是则返回后端名。
+
+    单独抽出来是因为它现在是**两个**判定处共用的判据：
+
+    - ``backend_name_for``（模型名 → 后端）；
+    - 裸名路由（`admin/pool.py`）：pinned 模型**不参与**策略选择（§5 只处理
+      「多个后端都有同名模型」的情形，而 pinned 是「本来就只可能归我」）。
+
+    两处若各写一遍 `model in spec.pinned_models`，将来改了声明口径就会漂移
+    —— 一处认、一处不认，表现为「三档路由偶尔被拿去自动选后端」。
+    """
+    if isinstance(model, str):
+        for name in known_names():
+            if model in spec_for(name).pinned_models:
+                return name
+    return None
+
+
 def backend_name_for(model) -> str:
     """中间件/池用：模型名 → 后端名（不 raise）。无前缀 → 默认后端。
 
@@ -226,15 +245,26 @@ def backend_name_for(model) -> str:
     2. **前缀**：带前缀的 id 归声明了该前缀的后端。
 
     两处都没有 ⇒ 默认后端（``auto`` 及一切裸名走这里）。
+
+    **注意**：这里给的是「静态归属」，不含裸名策略选择（§5）。裸名请求要走
+    自动选择时用 ``admin/pool.py`` 的 `_resolve_backend_for`（它在
+    pinned/前缀之外还查候选集与顺序）。本函数仍是那些情形的正确答案，
+    也是 kill switch 关掉时的回落值。
     """
-    if isinstance(model, str):
-        for name in known_names():
-            if model in spec_for(name).pinned_models:
-                return name
-        for name in known_names():
-            prefix = spec_for(name).model_prefix
-            if prefix and model.startswith(prefix):
-                return name
+    pinned = pinned_model_owner(model)
+    if pinned is not None:
+        return pinned
+    prefix = prefix_for(model)
+    if prefix:
+        return backend_name_for_prefix(prefix)
+    return default_name()
+
+
+def backend_name_for_prefix(prefix) -> str:
+    """前缀 → 后端名（无匹配 → 默认后端）。"""
+    for name in known_names():
+        if spec_for(name).model_prefix == prefix:
+            return name
     return default_name()
 
 
@@ -247,14 +277,39 @@ def trae_enabled() -> bool:
     return os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") != "0"
 
 
-def resolve_backend(model) -> tuple[BackendSpec, str]:
+def resolve_backend(model, routed=None) -> tuple[BackendSpec, str]:
     """返回 (spec, upstream_model)。
 
     `trae/<名>` → TraeBackend + map_model 归一后的 config_name；
     未知 Trae 模型 → HTTPException(400)（CODEBUDDY_TRAE_ALLOW_UNKNOWN_MODELS=1 时放行透传）。
     其余 → WorkBuddyBackend + 原模型名（空/auto 由各端点自行 setdefault）。
+
+    ``routed``：池中间件为**裸名**请求选定的后端（§5 裸名路由）。
+    传了就按它解析（中间件已经做过候选集与策略判定，这里是同一个答案）；
+    不传（旧调用/单测/无中间件的部署形态）则回落「裸名走默认后端」。
+
+    **为什么不让这里自己算一遍**：中间件的决策发生在**选号之前**，而这里的
+    调用发生在选号**之后**（凭据已经绑在请求上）。两次独立决策之间状态可能变
+    （排队换号、启停），算两遍就会分叉 —— 分叉的直接后果是凭据-后端一致性闸门
+    回 503。所以决策只做一次，这里只**消费**结果。
     """
     prefix = prefix_for(model)
+    if not prefix and routed:
+        # 裸名 + 中间件已选定后端：按选定后端的归属解析上游模型名。
+        name = routed
+        if not is_enabled(name):
+            # 与下面带前缀分支同一句话：中间件启用时它就在候选里，能走到这里
+            # 说明是极端竞态（决策后立刻被禁用），照旧给可理解的文案。
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": f"{spec_for(name).label} 后端已被管理员禁用",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        return spec_for(name), (model if isinstance(model, str) else "")
     if prefix:
         name = backend_name_for(model)
         if not is_enabled(name):
