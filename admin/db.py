@@ -16,6 +16,7 @@
 import json
 import math
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -308,7 +309,111 @@ def _v14_to_v15(db):
             "ALTER TABLE settings ADD COLUMN bare_name_routing INTEGER NOT NULL DEFAULT 1")
 
 
-SCHEMA_VERSION = 15
+def _v15_to_v16(db):
+    """v15 → v16：模型表去前缀 + 联合主键（specs/remove-model-prefix-plan.md）。
+
+    ## 为什么
+
+    `trae/` 前缀是**我们自己拼的**：Trae 上游返回的是裸名（`kimi-k3`、
+    `Doubao-Seed-Code`），`admin/models.py` 在写库与对外时拼上 `spec.model_prefix`
+    造出了 `trae/kimi-k3`。用户明确：「永远都没有这个模型」。它同时还是主键、
+    路由判据（`backend_name_for` 看字符串前缀）与账本键，所以要整条链移除。
+
+    ## 两张表要改
+
+    1. **`models`**：`model_id` 剥前缀 + 主键改 `(model_id, backend)`。
+       SQLite 不能直接改主键，只能**重建表**（建新表 → 搬数据 → 删旧表 → 改名）。
+    2. **`request_logs` / `upstream_request_usage` / `account_usage_daily`**：
+       模型名一并剥前缀。它们是模型名的历史记录，只改 `models` 会让同一个名字
+       在不同表里写法不一致，且用量页按模型查日志（`idx_logs_model_time`）会对不上。
+
+    ## 冲突处理
+
+    用户拍板「不会有冲突，有就舍弃保留一个」→ `INSERT OR REPLACE`，冲突留后一条。
+    仍**统计并打日志**：静默丢几十行而没有任何痕迹，事后排查不出来。
+
+    ## 剥前缀读声明，不写死 'trae/'
+
+    遍历各后端声明的 `model_prefix`（`spec_for(name).model_prefix`），
+    与全项目 arch guard 的口径一致 —— 加后端时这里不用改。
+
+    ## 幂等
+
+    `LIKE 'trae/%'` 只匹配**还带前缀**的行；重复跑不会重复剥
+    （剥过的行不再匹配任何前缀）。
+    """
+    from core.backends.registry import known_names, spec_for
+
+    #: 各后端声明的前缀（去掉空串）。**不写死 'trae/'**。
+    prefixes = [p for p in (spec_for(n).model_prefix for n in known_names()) if p]
+
+    def strip(column):
+        """把一列里的前缀剥掉的 SQL 片段（多个前缀 → 嵌套 CASE）。"""
+        expr = column
+        for p in prefixes:
+            expr = f"CASE WHEN {expr} LIKE ? THEN substr({expr}, ?) ELSE {expr} END"
+        return expr
+
+    # --- 1. models：剥前缀 + 联合主键（重建表）---------------------------
+    cols = [r[1] for r in db._write.execute("PRAGMA table_info(models)")]
+    if "backend" not in cols or "deleted" not in cols or "canonical" not in cols:
+        # 前置列由 v12/v13/v14 加。跑到这里说明迁移链被跳过了 —— 显式报错
+        # 好过重建出一张缺列的表（那会让后面所有读写路径炸在莫名的地方）。
+        raise RuntimeError(
+            f"v16 迁移要求 models 已有 backend/deleted/canonical 列，实际只有 {cols}")
+
+    before = db._write.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+
+    db._write.execute("""CREATE TABLE models_v16 (
+        model_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT,
+        credits_micro INTEGER, max_input_tokens INTEGER,
+        source TEXT NOT NULL DEFAULT 'builtin',
+        available INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
+        sort_order INTEGER NOT NULL DEFAULT 0, promo TEXT,
+        synced_at INTEGER NOT NULL DEFAULT 0,
+        backend TEXT NOT NULL DEFAULT 'workbuddy',
+        deleted INTEGER NOT NULL DEFAULT 0,
+        canonical TEXT,
+        PRIMARY KEY (model_id, backend))""")
+
+    # CASE 链的参数顺序：每层两个（LIKE 的模式、substr 的起点）。
+    # **起点是 len(p) + 1**：SQLite 的 substr 是 1-indexed，
+    # 用 len(p) 会少剥一个字符（'trae/kimi-k3' → '/kimi-k3'）。
+    args = []
+    for p in prefixes:
+        args.extend([f"{p}%", len(p) + 1])
+    db._write.execute(
+        f"""INSERT OR REPLACE INTO models_v16
+            SELECT {strip('model_id')}, name, description, credits_micro,
+                   max_input_tokens, source, available, enabled, sort_order,
+                   promo, synced_at, backend, deleted, canonical
+            FROM models""",
+        args)
+
+    after = db._write.execute("SELECT COUNT(*) FROM models_v16").fetchone()[0]
+    db._write.execute("DROP TABLE models")
+    db._write.execute("ALTER TABLE models_v16 RENAME TO models")
+
+    # --- 2. 日志/用量表：模型名一并剥前缀 --------------------------------
+    # 列名不同（request_logs.model_id / 其余 model），分开处理。
+    for table, column in (("request_logs", "model_id"),
+                          ("upstream_request_usage", "model"),
+                          ("account_usage_daily", "model")):
+        if not db._write.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone():
+            continue
+        db._write.execute(
+            f"UPDATE {table} SET {column} = {strip(column)} WHERE {column} LIKE '%/%'",
+            args)
+
+    # 迁移痕迹：行数变化与冲突情况写进日志（不阻断迁移）。
+    print(f"[migrate v16] models 去前缀：{before} 行 → {after} 行"
+          f"{'（有主键冲突，已按「保留一个」处理）' if after < before else ''}",
+          file=sys.stderr)
+
+
+SCHEMA_VERSION = 16
 
 
 MICRO = 1_000_000
@@ -515,7 +620,7 @@ class Database:
             affinity_key TEXT PRIMARY KEY, account_id TEXT NOT NULL,
             expires INTEGER NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS models (
-            model_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+            model_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT,
             credits_micro INTEGER, max_input_tokens INTEGER,
             source TEXT NOT NULL DEFAULT 'builtin',
             available INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
@@ -523,7 +628,15 @@ class Database:
             synced_at INTEGER NOT NULL DEFAULT 0,
             backend TEXT NOT NULL DEFAULT 'workbuddy',
             deleted INTEGER NOT NULL DEFAULT 0,
-            canonical TEXT)""",
+            canonical TEXT,
+            -- 联合主键（v16）：`model_id` 是**裸名**（上游原名），归属由 `backend` 表达。
+            -- 一对 (model_id, backend) 唯一 —— 同一个模型在两边各有一行
+            -- （如 workbuddy/glm-5.3 与 trae/glm-5.3），这是「一个模型多后端」的正确形状。
+            --
+            -- 历史形状是 `model_id TEXT PRIMARY KEY`，其中 trae 行存的是拼出来的
+            -- `trae/xxx`；那个前缀是**我们造的**（上游只返回裸名），v16 迁移把它剥掉
+            -- 并换成这个联合主键，见 `_v15_to_v16`。
+            PRIMARY KEY (model_id, backend))""",
         """CREATE TABLE IF NOT EXISTS request_logs (
             id INTEGER PRIMARY KEY,
             time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api', path TEXT NOT NULL,
@@ -692,7 +805,8 @@ class Database:
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
-                  (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15))
+                  (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
+                  (16, _v15_to_v16))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -934,7 +1048,9 @@ class Database:
         with self.transaction():
             self._write.executemany(
                 f"INSERT INTO models ({', '.join(columns)}) VALUES ({marks})"
-                " ON CONFLICT(model_id) DO UPDATE SET"
+                # 冲突键是**联合主键**（v16）：同一个裸名在两边各有一行，
+                # 只有 (model_id, backend) 同时相同才是同一行。
+                " ON CONFLICT(model_id, backend) DO UPDATE SET"
                 f" {', '.join(f'{c}=excluded.{c}' for c in columns[1:])}", rows)
 
     def enabled_models(self):

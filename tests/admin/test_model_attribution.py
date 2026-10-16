@@ -228,6 +228,11 @@ class MigrationTests(unittest.TestCase):
         return path
 
     def test_migration_backfills_by_prefix(self):
+        """v11 库升级后：`backend` 由前缀回填（v12），随后前缀被剥掉（v16）。
+
+        两个事实都要验 —— 只验后者的话，「回填」这一步坏掉也看不出来
+        （剥前缀不依赖 backend 列，剥完照样是裸名）。
+        """
         path = self._make_v11()
         db = Database(path)  # 打开即迁移
         try:
@@ -235,8 +240,11 @@ class MigrationTests(unittest.TestCase):
                 db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
                 str(SCHEMA_VERSION))
             rows = db.load_models()
+            # v12 的效果：归属写对了（trae 那条现在叫 `kimi-k3`，仍须归 trae）。
             self.assertEqual(rows["glm-5.2"]["backend"], "workbuddy")
-            self.assertEqual(rows["trae/kimi-k3"]["backend"], "trae")
+            self.assertEqual(rows["kimi-k3"]["backend"], "trae")
+            # v16 的效果：`trae/` 前缀不复存在。
+            self.assertNotIn("trae/kimi-k3", rows)
         finally:
             db.close()
 
