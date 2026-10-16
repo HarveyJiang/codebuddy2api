@@ -409,6 +409,30 @@ class ModelRegistryTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_custom_flag_reported_for_non_default_backend(self):
+        """非默认后端（trae）的自定义行也要报 custom=True —— 删除按钮的依据。
+
+        用户 2026-10-16 报告「Trae 侧自定义模型没有删除按钮」：快照曾只给默认
+        后端打 custom 标，前端拿 m.custom 渲染删除按钮，Trae 行永远没有。
+        删除接口本身（state["custom"] 按后端各存各的）本来就能删 —— 纯展示丢标。
+        """
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = upstream_payload()
+        with patch("admin.models.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.get.return_value = response
+            registry.fetch()
+        registry.add("my-trae-model", backend="trae", name="Trae 自定义")
+        entry = next(m for m in registry.snapshot()["models"]
+                     if m["id"] == "my-trae-model" and m["backend"] == "trae")
+        self.assertEqual(entry["source"], "custom")
+        self.assertTrue(entry["custom"], "非默认后端的自定义行必须报 custom=True")
+        self.assertTrue(registry.is_custom("my-trae-model", backend="trae"))
+        # 且真的删得掉。
+        registry.remove("my-trae-model", backend="trae")
+        self.assertNotIn("my-trae-model",
+                         [m["id"] for m in registry.snapshot()["models"]])
+
     def test_removed_custom_model_does_not_come_back_on_fetch(self):
         """删除必须同时清掉 _custom，否则下一次合并又把它加回来。"""
         registry = ModelRegistry(get_credential=lambda: FakeManager())

@@ -142,7 +142,7 @@ class ModelRegistry:
                 "catalog": {},      # bare id -> {name, description, credits, max_input_tokens, source}
                 "available": [],    # ordered bare ids
                 "disabled": set(),  # user-disabled bare ids
-                "custom": set(),    # 用户手工添加的（只对默认后端有意义）
+                "custom": set(),    # 用户手工添加的（每后端各一份）
                 "updated": 0,
                 "error": None,
             }
@@ -284,8 +284,7 @@ class ModelRegistry:
             for backend in list(self._state):
                 state = self._ensure_state(backend)
                 state["catalog"], state["available"], state["disabled"] = {}, [], set()
-                if backend == self._default:
-                    state["custom"] = set()
+                state["custom"] = set()
                 # 「上次拉取时刻」记在目录行自己身上（models.synced_at），
                 # 而不是 settings 的固定列 —— 后端数量是可变的，settings 留不出列。
                 state["updated"] = 0
@@ -315,10 +314,11 @@ class ModelRegistry:
                                               "source": source,
                                               "_promo": row.get("promo") if backend == self._default else None}
                     state["available"].append(bare)
-                    # 自定义只对默认后端有意义（见 add()）：别的后端目录完全由上游
-                    # 决定。非默认后端的自定义行不进 catalog，下次 persist 时会被标
-                    # 成 available=0 保留行（供 request_logs join），不再对外可见。
-                    if source == SOURCE_CUSTOM and backend == self._default:
+                    # 自定义按后端各记各的（用户 2026-10-16：Trae 侧的自定义模型也要
+                    # 能删 —— `custom` 标志与删除入口都依赖这份集合）。「自定义只对
+                    # 默认后端有意义」的旧假设随归属多选一起废除了：add() 允许往
+                    # 任意启用后端加自定义项，加载就得如实收回来。
+                    if source == SOURCE_CUSTOM:
                         state["custom"].add(bare)
                     if not row.get("enabled", 1):
                         state["disabled"].add(bare)
@@ -858,8 +858,10 @@ class ModelRegistry:
         `backend` 语义同 `set_enabled`：同名多后端下必须显式给（管理页的
         「归属多选」展开成 N 次调用，每次都带着自己的 backend）。
 
-        自定义模型只对**默认后端**有意义：其它后端的目录完全由上游决定
-        （用户不该往 Trae 目录里塞一个上游没有的模型 —— 那个模型调不通）。
+        自定义模型按后端各存各的（``state["custom"]`` 每后端一份）。早年注释说
+        「只对默认后端有意义」，但归属多选上线后用户确实会往 Trae 侧加自定义项
+        （如 `test-model`），加载与快照都已按后端如实收回 —— 这里的行为与它们
+        一致：加给哪个后端，就归哪个后端的 custom 集合。
         """
         backend = backend_for_model_id(mid, backend)
         bare = mid
