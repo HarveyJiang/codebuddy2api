@@ -104,8 +104,8 @@ for (const a of accounts) {
   check(`${tag} 行有后端图标`, html.includes("backend-icon-svg") || html.includes(fn.backendIcon(a.backend)));
   check(`${tag} 行有后端名`, html.includes(fn.backendName(a.backend)));
   check(`${tag} 行带 data-account（点行开详情要用）`, html.includes(`data-account="${a.id}"`));
-  check(`${tag} 行不再画行首账号图标（用户 2026-10-16：太大已取消，归属靠后端名徽标）`,
-        !html.includes("account-icon-backend"));
+  check(`${tag} 行首有小号账号图标（15px 内联，不再是 39px 方块）`,
+        html.includes("account-icon-inline") && !/account-icon(?!-backend|-inline)/.test(html.replace(/account-icon account-icon-inline/g, "")));
   // 未知后端不该显示成「未知」以外的怪值
   check(`${tag} 后端名可读`, fn.backendName(a.backend) !== "未知" || !a.backend);
 }
