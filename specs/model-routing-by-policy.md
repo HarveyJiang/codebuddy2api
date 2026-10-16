@@ -203,6 +203,40 @@ Codex CLI / Claude Code 这类客户端**只能改 `model` 字段**，改不了 
 > 归属方案先落（给 `models` 加 `backend`），路由方案后落（加 `canonical`），
 > 两个迁移各自独立、版本号按实际落地顺序顺延。
 
+**实现记录（2026-10-16，已完成——第一段「跨后端归并展示」）**
+
+版本号最终是 **v14**（`_v13_to_v14`，见 `admin/db.py`）。落地时与文档有两处偏差，
+都是刻意为之，记在这里免得下次照文档写错：
+
+1. **`canonical` 是派生列，不由调用方传**。写入点 `db.save_models` 对每一行调用
+   `registry.canonical_name(model_id)` 现算。理由：让调用方透传就会多出一条
+   「persist 与注册表对同一模型算出不同值」的路径 —— 正是这一列要消灭的那类不一致。
+   （`item.get("canonical")` 仍优先，留给测试与将来「用户手工指定别名」。）
+
+2. **迁移不回填**，与本文档原先写的「同步时填写」一致，但读路径因此**不能**
+   依赖列：`ModelRegistry.snapshot()` 用 `canonical_name()` 现算（内存态不查列），
+   `save_models()` 才落库。所以「升级后到第一次同步之间」管理页也能正确归组，
+   代价只是那段时间 DB 里的列是 NULL。
+
+前端（`groupModelsByName`）从服务端返回的 `m.canonical` 直接归组，**不再自己算**。
+这一条是实测教训换来的：第一版实现在前端按**展示名**归并，方向对但载体错 ——
+`hy3` 与 `hy3-x` 展示名都叫「Hy3」却是两个真模型（倍率 0 vs 0.05），
+按展示名合会把它们并成一个。规范名是**显式声明**的，不依赖「字符串规则碰巧对上」
+也不依赖「展示名碰巧一样」。
+
+声明位置（第 4 节的填写规则落地为代码）：
+
+- `BackendSpec.canonical_for: dict`（`core/backends/base.py`）—— `{上游 id: 规范名}`，
+  **只声明非恒等映射**。默认空字典 = 「剥前缀即规范名」。
+- 腾讯侧实际只声明了一条：`{"kimi-k3-1": "kimi-k3"}`（`core/backends/workbuddy.py`）。
+  字节侧 `canonical_for = {}`，因为它上游 id 与规范名恒等。
+- 回归测试 `test_canonical_for_only_declares_non_identity_mappings` 拒绝显式恒等映射：
+  它没有信息量，却让「加一个模型」变成「记得也来这里抄一遍 id」，抄漏不报错、
+  只是静默不合组。
+
+**本段只做了「归并展示」**。第 5 节的候选集/排序/降级（即「裸名自动选后端」的
+路由部分）**尚未实现**，是 §8 的后续阶段。今天裸名请求仍只走默认后端。
+
 ### 6.2 `/v1/models` 去重规则
 
 事实：`/v1/models` 今天**确实返回 `owned_by`**（`converter.py:list_models`），
@@ -228,6 +262,12 @@ Codex CLI / Claude Code 这类客户端**只能改 `model` 字段**，改不了 
 > 的 `owned_by` 声明），并给 arch guard 加一条 `startswith("trae")` 规则。
 > `BackendSpec` 为此需要新增 `owned_by` 声明（今天 `"trae-solo"` / `"codebuddy"`
 > 是写死字符串）。
+>
+> **已完成（2026-10-16，`f5d3c01`）**：`owned_by` 声明**早就有了**
+> （`trae-solo` / `codebuddy`），缺的只是「调用方用它」。已改为
+> `spec_for(backend_name_for(m)).owned_by`。归并展示段（6.1）一并落了
+> `models.backend` 列与 `canonical` 列，故 arch guard 的
+> `startswith("trae")` 规则仍未加——那是独立的清理项。
 
 ### 6.3 账本与日志
 

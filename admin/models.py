@@ -23,6 +23,7 @@ import httpx
 
 from core.backends.registry import (
     backend_name_for,
+    canonical_name,
     default_name as default_backend,
     is_enabled as is_backend_enabled,
     known_names as known_backends,
@@ -635,7 +636,12 @@ class ModelRegistry:
         **第 4 层的倍率取「同名组内的最小值」**，不是单条自己的值（用户 2026-10-16
         拍板：「如果有倍率，选择较小的一个进行排」）。理由：管理页把同名模型跨后端
         合并成**一行**（`groupModelsByName`），一行的排序键必须唯一 —— 用组内最小值
-        才与「这一行最便宜多少钱能买到」的直觉一致。组名 = 去掉后端前缀的 bare id。
+        才与「这一行最便宜多少钱能买到」的直觉一致。
+        **组名 = 规范名 `canonical`**（`specs/model-routing-by-policy.md` §6.1）：
+        它由各后端按 `canonical_for` 声明，既不是「去前缀的裸名」（腾讯 `kimi-k3-1`
+        与字节 `kimi-k3` 会分成两组）也不是「展示名」（`hy3` 与 `hy3-x` 都是
+        「Hy3」却不是一个模型）。`canonical` 会随每条模型一起返回给前端，
+        前端直接用它归组，规则只有一处。
 
         来源之所以是**第一层**：用户手动加的、上游没列出的模型最需要被看见
         （它们随时可能被误当成「上游没了」而找不到）；动态拉来的几百条垫底。
@@ -672,19 +678,24 @@ class ModelRegistry:
                         entry["promo"] = {"label": stored, "factor": 1.0, "credits": entry["credits"]}
                     # 目录原顺序（稳定决胜用）：取该后端 available 里的下标。
                     entry["_seq"] = available.index(bare)
-                    # 同名组键：**去前缀的 bare 名**（`trae/glm-5.3` 与 `glm-5.3`
-                    # 归同一组）。第 4 层倍率取组内最小值，故必须先有组键。
-                    entry["_group"] = bare
+                    # 同名组键与对外字段都用**规范名**（`kimi-k3-1` 与
+                    # `trae/kimi-k3` 归同一组）。第 4 层倍率取组内最小值，故必须先有组键。
+                    #
+                    # 用 canonical 而不是「去前缀的 bare 名」：后者把腾讯的
+                    # `kimi-k3-1` 与字节的 `kimi-k3` 分到两组（上游 id 命名不一致），
+                    # 用户会看到两个「Kimi K3」。canonical 由各后端按 `canonical_for`
+                    # 声明（registry.canonical_name），是分组与自动选后端共用的键。
+                    entry["canonical"] = canonical_name(prefix + bare)
                     models.append(entry)
                 if backend == self._default:
                     updated, error = state["updated"], state["error"]
 
             # 第 4 层用「同名组内的最小倍率」（见本方法 docstring 末尾）。先按
-            # 去前缀的 bare 名分组算一遍 —— 不分后端：同一个模型在 WorkBuddy 与
+            # **规范名**分组算一遍 —— 不分后端：同一个模型在 WorkBuddy 与
             # Trae 上的价格要一起比，取更便宜的那个作为这一行的代表价。
             group_min: dict[str, float] = {}
             for m in models:
-                group = m["_group"]
+                group = m["canonical"]
                 cr = m["credits"] if isinstance(m.get("credits"), (int, float)) else 0
                 cur = group_min.get(group)
                 if cur is None or cr < cur:
@@ -694,12 +705,11 @@ class ModelRegistry:
                 _SOURCE_RANK[m["source"]],          # ① 来源
                 spec_for(m["backend"]).order,       # ② 归属（注册表顺序）
                 not m["enabled"],                   # ③ 启用优先
-                group_min[m["_group"]],             # ④ 倍率（同名组内最小值）
+                group_min[m["canonical"]],          # ④ 倍率（同名组内最小值）
                 m["_seq"],                          # 稳定决胜：同分保持目录原顺序
             ))
             for m in models:
                 m.pop("_seq", None)
-                m.pop("_group", None)
             # updated/error 报告**默认后端**的刷新状态：管理页的「上次拉取」提示
             # 说的是主目录；各后端的细节在各自的目录提供者里。
             return {"updated": updated, "error": error, "models": models}

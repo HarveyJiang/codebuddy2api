@@ -58,6 +58,20 @@ class WorkBuddyBackend(BackendSpec):
     # 所以恰好归我」，而是「本来就只可能归我」。
     pinned_models = ("fast-model", "balanced-model", "deep-model")
 
+    # 跨后端规范名（specs/model-routing-by-policy.md §4）：**只声明非恒等映射**。
+    #
+    # 为什么必须显式声明：腾讯的 Kimi K3 上游 id 叫 `kimi-k3-1`，字节的叫
+    # `trae/kimi-k3`。剥掉前缀后是 `kimi-k3-1` vs `kimi-k3` —— 天然不等，
+    # 靠字符串规则永远合不起来。用户要的是「一个 Kimi K3」，所以要把腾讯这个
+    # 偏了一截的 id 显式指向规范名。
+    #
+    # 为什么不写 `{"kimi-k2.6": "kimi-k2.6"}` 这种恒等映射：它没有信息量，
+    # 却让「加模型」变成「记得也来这里抄一遍 id」，抄漏了不报错、只是静默不合组。
+    # 默认规则（`canonical_name`）已经把「剥前缀即规范名」覆盖掉了。
+    canonical_for = {
+        "kimi-k3-1": "kimi-k3",
+    }
+
     def chat_url(self) -> str:
         from .. import converter  # 延迟 import 防循环
 

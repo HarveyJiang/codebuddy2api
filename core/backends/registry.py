@@ -141,6 +141,33 @@ def strip_prefix(model) -> str:
     return model[len(prefix):].strip() if prefix else (model or "")
 
 
+def canonical_name(model) -> str:
+    """模型名（对外 id 或上游 id）→ **规范名** —— 跨后端的同一个模型。
+
+    规则（specs/model-routing-by-policy.md §4，用户已拍板）：
+    1. 先看所属后端的 ``canonical_for`` 声明里有没有**非恒等**映射 ——
+       有就用它（``kimi-k3-1 → kimi-k3``）；
+    2. 否则默认 = ``model_id`` **剥掉后端前缀**。
+
+    只声明非恒等映射：恒等映射没有信息量，却让每个新后端都要为自己的每个
+    模型抄一遍自己的 id，改上游 id 时反而多一处要同步的地方。
+
+    这是**分组与自动选后端共用的唯一判定处**。渲染与路由若各算一遍，
+    就会出现「显示 2 条、实际只路由到 1 条」且界面不报错。
+    """
+    mid = str(model or "")
+    backend = backend_name_for(mid)
+    upstream = strip_prefix(mid)
+    mapping = spec_for(backend).canonical_for or {}
+    # 映射键优先按**上游 id**（剥前缀后）匹配：`canonical_for` 是「上游叫什么 →
+    # 规范名叫什么」，写声明时不用关心前缀（前缀是本后端的属性，不该抄进映射）。
+    if upstream in mapping:
+        return str(mapping[upstream]).strip() or upstream
+    if mid in mapping:
+        return str(mapping[mid]).strip() or upstream
+    return upstream
+
+
 #: 设置页总闸的数据源（``{后端名: 是否启用}``，缺键即启用）。
 #:
 #: **为什么要注入而不是直接读 DB**：本模块是 core 层，不能 import admin

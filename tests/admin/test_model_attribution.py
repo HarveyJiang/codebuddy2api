@@ -296,6 +296,85 @@ class MigrationTests(unittest.TestCase):
         finally:
             again.close()
 
+    def test_v13_db_gets_canonical_column(self):
+        """已 stamp 成 v13、没有 canonical 列的库，打开时必须补上该列。
+
+        与 `deleted` 同一个坑：列要能加进**已有**的库，就必须是独立版本号。
+        迁移**不回填**（见 `_v13_to_v14` 的 docstring），所以这里只断言列存在、
+        且旧行读得出来（值为 NULL），不报 `no such column`。
+        """
+        import sqlite3
+
+        path = self.root / "v13.db"
+        Database(path).close()
+        conn = sqlite3.connect(path)
+        # 退回「v13 已 stamp、但列里没有 canonical」的状态。
+        conn.executescript(
+            "UPDATE schema_meta SET value='13' WHERE key='version';"
+            "CREATE TABLE _m AS SELECT model_id,name,description,credits_micro,"
+            "max_input_tokens,source,available,enabled,sort_order,promo,synced_at,"
+            "backend,deleted FROM models;"
+            "DROP TABLE models;"
+            "ALTER TABLE _m RENAME TO models;"
+            "INSERT INTO models (model_id,name,source,available,enabled,sort_order,"
+            "synced_at,backend,deleted) VALUES ('glm-5.2','GLM','upstream',1,1,0,0,"
+            "'workbuddy',0);"
+        )
+        conn.commit()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(models)")]
+        assert "canonical" not in cols, "构造失败：canonical 列没被去掉"
+        conn.close()
+
+        db = Database(path)
+        try:
+            self.assertEqual(
+                db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                str(SCHEMA_VERSION))
+            self.assertIn("canonical",
+                          [r[1] for r in db._write.execute("PRAGMA table_info(models)")])
+            # 旧行读得出来，值为 NULL（不回填是有意为之）。
+            rows = db.load_models()
+            self.assertIsNone(rows["glm-5.2"]["canonical"])
+        finally:
+            db.close()
+
+    def test_save_models_derives_canonical_from_declaration(self):
+        """`canonical` 是**派生列**：写入时按后端声明现算，不靠调用方记得传。
+
+        这条防的是「加一条写入路径、忘了带 canonical」——那种回归不会报错，
+        只会让跨后端同名悄悄分成两行。这里故意**不传** canonical，
+        断言落库值等于 registry 现算的值。
+        """
+        from core.backends.registry import canonical_name
+
+        path = self.root / "derive.db"
+        db = Database(path)
+        try:
+            db.save_models({
+                "kimi-k3-1": {"name": "Kimi-K3", "backend": "workbuddy"},
+                "trae/kimi-k3": {"name": "Kimi-K3", "backend": "trae"},
+            })
+            rows = db.load_models()
+            self.assertEqual(rows["kimi-k3-1"]["canonical"], canonical_name("kimi-k3-1"))
+            self.assertEqual(rows["trae/kimi-k3"]["canonical"], canonical_name("trae/kimi-k3"))
+            # 关键：两个**不同裸名**的腾讯/字节条目，规范名必须相同（否则合不起来）。
+            self.assertEqual(rows["kimi-k3-1"]["canonical"],
+                             rows["trae/kimi-k3"]["canonical"])
+        finally:
+            db.close()
+
+    def test_save_models_persists_canonical_across_reopen(self):
+        """重开库后 canonical 仍在（它是列，不是每次现算的视图）。"""
+        path = self.root / "reopen.db"
+        db = Database(path)
+        db.save_models({"kimi-k3-1": {"name": "Kimi-K3", "backend": "workbuddy"}})
+        db.close()
+        again = Database(path)
+        try:
+            self.assertEqual(again.load_models()["kimi-k3-1"]["canonical"], "kimi-k3")
+        finally:
+            again.close()
+
 
 class SortOrderTests(unittest.TestCase):
     """四层排序（§6）：来源 → 归属 → 启用 → 倍率。"""
@@ -354,10 +433,12 @@ class SortOrderTests(unittest.TestCase):
         self.assertEqual(credits, sorted(credits))
 
     def test_snapshot_does_not_leak_internal_seq_key(self):
-        """内部稳定决胜用的 `_seq` 与分组键 `_group` 都不得出现在 API 输出里。"""
+        """内部稳定决胜用的 `_seq` 不得出现在 API 输出里（`canonical` 是对外字段，保留）。"""
         for m in self._registry().snapshot()["models"]:
             self.assertNotIn("_seq", m)
             self.assertNotIn("_group", m)
+            # canonical 是**要**给前端的：它按规范名归组。
+            self.assertIn("canonical", m)
 
     def test_credits_sort_uses_group_minimum(self):
         """第 4 层倍率按**同名组内最小值**排，不是单条自己的值。

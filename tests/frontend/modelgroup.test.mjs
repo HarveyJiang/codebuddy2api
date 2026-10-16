@@ -17,7 +17,6 @@ function slice(from, to) {
 }
 const code = [
   slice("function groupModelsByName(list) {", "\n}"),
-  slice("function mergeByDisplayName(groups) {", "\n}"),
   slice("function modelBaseName(id) {", "\n}"),
   slice("const creditsText = m =>", ";\n"),
   slice("function modelsInGroup(list, key) {", "\n}"),
@@ -74,38 +73,48 @@ check("上下文各自保留（256K / 200K 不能被平均）",
 check("hy3 单独成组（没有同名后端）",
       groups.find(g => g.key === "hy3").items.length, 1);
 
-// ---- 跨后端展示名归并（用户 2026-10-16：「trae/kimi-k3，kimi-k3-1 怎么没有合并」）----
-// 上游两边 id 命名不一致，同一模型会写成两个裸名，只按裸名分组就会显示成两行。
+// ---- 跨后端归并靠**规范名**（canonical，用户 2026-10-16 拍板）----
+// 上游两边 id 命名不一致（腾讯 `kimi-k3-1` vs 字节 `trae/kimi-k3`），
+// 只按裸名分组会显示成两行。且**不能按展示名猜**：hy3 / hy3-x 展示名都是
+// 「Hy3」却是两个真模型。规范名由服务端按各后端 `canonical_for` 声明算好。
 const aliasList = [
-  // 展示名相同、裸名不同、**分属不同后端** → 应该合。
-  { id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", max_input_tokens: 200000 },
-  { id: "trae/kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", max_input_tokens: 200000 },
-  // 反例：展示名相同、裸名不同，但**同属 WorkBuddy** → 绝不能合（是同一后端的两个模型）。
-  { id: "hy3", backend: "workbuddy", credits: 0, name: "Hy3", max_input_tokens: 200000 },
-  { id: "hy3-x", backend: "workbuddy", credits: 0.05, name: "Hy3", max_input_tokens: 200000 },
+  // 裸名不同、规范名相同 → 应该合（服务端已把 canonical 都算成 kimi-k3）。
+  { id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
+  { id: "trae/kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
+  // 反例：展示名相同、**规范名不同** → 绝不能合（同一后端的两个模型，倍率 0 vs 0.05）。
+  { id: "hy3", backend: "workbuddy", credits: 0, name: "Hy3", canonical: "hy3", max_input_tokens: 200000 },
+  { id: "hy3-x", backend: "workbuddy", credits: 0.05, name: "Hy3", canonical: "hy3-x", max_input_tokens: 200000 },
 ];
 const aliasGroups = groupModelsByName(aliasList);
-check("跨后端同名展示名合成一行（kimi-k3-1 + trae/kimi-k3）", aliasGroups.length, 3);
+check("同规范名合成一行（kimi-k3-1 + trae/kimi-k3）", aliasGroups.length, 3);
 const k3 = aliasGroups.find(g => g.items.some(m => m.id === "trae/kimi-k3"));
 check("归并行的两条都在（不是只留下一侧）",
       k3.items.map(m => m.id).sort(), ["kimi-k3-1", "trae/kimi-k3"]);
-check("归并行标记了 mergedByDisplayName", Boolean(k3.mergedByDisplayName), true);
-// 这是最容易写错的一条：同一后端内的同名展示名**不是**同一个模型。
-check("同一后端内的同名展示名不合并（hy3 / hy3-x 必须分开）",
+check("归并行的组键就是规范名", k3.key, "kimi-k3");
+// 这是最容易写错的一条：展示名相同**不是**同一个模型的判据。
+check("展示名相同但规范名不同 → 不合并（hy3 / hy3-x 必须分开）",
       aliasGroups.filter(g => g.items.some(m => m.id === "hy3" || m.id === "hy3-x"))
                  .every(g => g.items.length === 1), true);
 check("hy3 与 hy3-x 各自成组、倍率未被混",
       [aliasGroups.find(g => g.items[0].id === "hy3").items[0].credits,
        aliasGroups.find(g => g.items[0].id === "hy3-x").items[0].credits], [0, 0.05]);
-// 常规行不该因此被标记（标记只属于真正归并出来的行）。
-check("普通同名组不带 mergedByDisplayName",
-      Boolean(groups.find(g => g.key === "step-5-preview").mergedByDisplayName), false);
+
+// canonical 缺失（老库迁移后尚未同步）时回落到裸名：各自成组而不是全挤一组。
+const legacyList = [
+  { id: "glm-5.3", backend: "workbuddy", credits: 0.1 },
+  { id: "trae/glm-5.3", backend: "trae", credits: 0.2 },
+  { id: "kimi-k2.6", backend: "workbuddy", credits: 0.5 },
+];
+const legacyGroups = groupModelsByName(legacyList);
+check("canonical 缺失时回落到裸名分组（glm-5.3 两侧仍同组）",
+      legacyGroups.find(g => g.items[0].id === "glm-5.3").items.length, 2);
+check("canonical 缺失时不把所有行挤成一组", legacyGroups.length, 2);
 
 // modelsInGroup 必须与分组结果一致（渲染与批量操作共用它，见 app.js 的说明）。
 // 归并行的成员来自两个不同裸名，按裸名过滤只会切到一条 —— 这条钉住那个 bug。
 check("modelsInGroup 对归并行返回全部成员",
       modelsInGroup(aliasList, k3.key).map(m => m.id).sort(), ["kimi-k3-1", "trae/kimi-k3"]);
-check("modelsInGroup 对普通组仍按裸名命中",
+check("modelsInGroup 对普通组仍按规范名命中",
       modelsInGroup(list, "step-5-preview").length, 2);
 check("modelsInGroup 对不存在的组返回空", modelsInGroup(list, "没有这个").length, 0);
 

@@ -149,6 +149,58 @@ class BackendMetadataTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(rows["trae"]["enabled"])
             self.assertTrue(rows["workbuddy"]["enabled"])
 
+    async def test_canonical_for_only_declares_non_identity_mappings(self):
+        """各后端的 `canonical_for` 只允许声明**非恒等**映射（§4 填写规则）。
+
+        恒等映射（`{"glm-5.3": "glm-5.3"}`）没有信息量，却让「加一个模型」变成
+        「记得也来这里抄一遍 id」——抄漏不报错、只是静默不合组，是最难查的那种。
+        默认规则已经覆盖「剥前缀即规范名」，所以拒绝显式写恒等。
+        """
+        from core.backends.registry import known_names, spec_for
+
+        for name in known_names():
+            spec = spec_for(name)
+            prefix = spec.model_prefix
+            for upstream, canon in (spec.canonical_for or {}).items():
+                self.assertNotEqual(
+                    upstream, canon,
+                    f"{name} 声明了恒等映射 {upstream!r} → {canon!r}：删掉即可，"
+                    "默认规则已经覆盖它")
+                # 声明键应写**上游 id**（不带上本后端前缀），值是非空字符串。
+                self.assertFalse(
+                    prefix and str(upstream).startswith(prefix),
+                    f"{name} 的 canonical_for 键 {upstream!r} 带上了本后端前缀 "
+                    f"{prefix!r}：键写上游 id，前缀是本后端的属性不必抄进来")
+                self.assertTrue(str(canon).strip(), f"{name} 的 {upstream!r} 规范名为空")
+
+    async def test_canonical_merges_kimi_k3_across_backends(self):
+        """真实数据回归：腾讯 `kimi-k3-1` 与字节 `trae/kimi-k3` 必须同规范名。
+
+        这是这套机制存在的理由（用户 2026-10-16：「trae/kimi-k3，kimi-k3-1 怎么
+        没有合并」）：两边上游 id 命名不一致，只靠字符串规则永远合不起来，
+        必须在腾讯侧显式声明 `kimi-k3-1 → kimi-k3`。
+        """
+        from core.backends.registry import canonical_name, strip_prefix
+
+        wb, trae = canonical_name("kimi-k3-1"), canonical_name("trae/kimi-k3")
+        self.assertEqual(wb, trae, "kimi-k3 在两个后端必须归到同一规范名")
+        self.assertEqual(wb, "kimi-k3")
+        # 反例守卫：规范化之后仍然是**各自剥前缀**，不能把裸名也改掉
+        # （裸名是路由键与账单 join 键，动它会断账本）。
+        self.assertEqual(strip_prefix("kimi-k3-1"), "kimi-k3-1")
+        self.assertEqual(strip_prefix("trae/kimi-k3"), "kimi-k3")
+
+    async def test_canonical_does_not_merge_distinct_models(self):
+        """反例守卫：`hy3` 与 `hy3-x` 是**两个**真模型，规范名必须不同。
+
+        它们展示名都叫「Hy3」（实测），若按展示名归并就会被并成一个 ——
+        这正是不能用展示名当归一化键的原因。规范名来自显式声明，
+        没声明就是各自的裸名，天然不同。
+        """
+        from core.backends.registry import canonical_name
+
+        self.assertNotEqual(canonical_name("hy3"), canonical_name("hy3-x"))
+
 
 class BackendFieldValidationTests(unittest.IsolatedAsyncioTestCase):
     """导入凭据时的 backend 白名单**由注册表推导**，不是写死的两个名字。"""

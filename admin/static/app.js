@@ -271,80 +271,39 @@ function renderModels() {
   $("models-body").innerHTML = groups.map(renderModelGroup).join("") || '<tr><td colspan="7" class="muted">模型列表为空，请点击「立即拉取」或手动添加。</td></tr>';
 }
 
-// 按「剥掉后端前缀后的模型名」归组，再做一道**跨后端的展示名归并**：
-// 同名的不同后端合并到一组。
+// 按**规范名**（canonical）归组 —— 服务端 `snapshot()` 已经按后端声明算好，
+// 前端直接用，不再自己猜「哪些名字是同一个模型」。
 //
-// 为什么要第二道：上游两边的 id 命名不总一致，同一个模型会写成两个不同的裸名
-// （实测 `kimi-k3-1` 在 WorkBuddy、`trae/kimi-k3` 在 Trae，两边官方展示名都是
-// 「Kimi-K3」；还有 `kimi-k2.7` vs `trae/kimi-k2.7-code`，展示名都是
-// 「Kimi-K2.7-Code」）。只按裸名分组就会显示成两行，看着像「没合并」。
+// 为什么不能自己猜（这里踩过坑）：上游两边的 id 命名不总一致，同一个模型会写成
+// 两个不同的裸名（实测腾讯 `kimi-k3-1`、字节 `trae/kimi-k3`，两边官方展示名都是
+// 「Kimi-K3」）。只看裸名会显示成两行。而**按展示名猜是错的**：`hy3` 与 `hy3-x`
+// 都是 WorkBuddy 侧的独立模型（倍率 0 vs 0.05），展示名却都叫「Hy3」，
+// 按展示名合会把两个真模型并成一个。
 //
-// **限定「仅跨后端」**：只有「裸名不同的两条**分属不同后端**」才按展示名归并。
-// 反例（实测）：`hy3` 与 `hy3-x` 都是 WorkBuddy 侧的独立模型、倍率 0 vs 0.05，
-// 只是展示名都叫「Hy3」——若不加这条限制会被并成一行，是明确的错误。
-// 道理上也是如此：同一个后端不可能把同一个模型列成两个 id。
-//
-// 组内保持默认后端在前、其余按注册表顺序，保证渲染顺序稳定。
+// 规范名是**显式声明**的（各后端的 `canonical_for`，只写非恒等映射），
+// 所以它既不依赖「字符串规则碰巧对上」，也不依赖「展示名碰巧一样」。
+// 服务端算 canonical 有两条路径（`snapshot` 的 _group 与 API 输出），
+// 前端只读 `m.canonical` —— 规则只有一处。
 function groupModelsByName(list) {
-  const byName = new Map();
+  const groups = new Map();
   for (const m of list) {
-    const key = modelBaseName(m.id);
-    if (!byName.has(key)) byName.set(key, {key, items: []});
-    byName.get(key).items.push(m);
+    // canonical 缺失时回落到裸名：老库（v13 及之前、迁移后尚未同步）里的行
+    // 可能还没有这一列的值，回落保证它们照旧显示成自己一行，而不是全挤进一组。
+    const key = String(m.canonical || "").trim() || modelBaseName(m.id);
+    if (!groups.has(key)) groups.set(key, {key, items: []});
+    groups.get(key).items.push(m);
   }
-  const groups = [...byName.values()];
+  const out = [...groups.values()];
   // 组的先后**直接用服务端给的顺序**（Map 保留插入序），这里不再重排。
   //
   // 曾经这里按「后端顺序 + 名字字母序」排过一遍，把 `snapshot()` 的四层排序
   // （来源 → 归属 → 启用 → 倍率）**整个覆盖**掉——于是设置页排序规则再怎么调、
   // 页面都不变，看着就是「乱的」。规则只该有一处：服务端。
   // 组内（同一模型跨后端的那几条）保留服务端顺序即可，它同样来自四层排序。
-  for (const g of groups) {
+  for (const g of out) {
     g.items.sort((a, b) => (backendOrder(a.backend) - backendOrder(b.backend)) || a.id.localeCompare(b.id));
   }
-  return mergeByDisplayName(groups);
-}
-
-// 跨后端的展示名归并（见 groupModelsByName 的说明）。原地返回，不改调用方语义。
-function mergeByDisplayName(groups) {
-  // 先按「官方展示名」给**单条组**建索引；一个展示名下挂多条、且它们分属不同后端时，
-  // 才是可归并的候选。多组的裸名相同（本来就合上了）不参与。
-  const byDisplay = new Map();
-  for (const g of groups) {
-    if (g.items.length !== 1) continue;
-    const name = String(g.items[0].name || "").trim();
-    if (!name) continue;
-    if (!byDisplay.has(name)) byDisplay.set(name, []);
-    byDisplay.get(name).push(g);
-  }
-  const absorbed = new Set();
-  for (const [, cands] of byDisplay) {
-    if (cands.length < 2) continue;
-    // 只看「分属不同后端」的那些：先在候选里按后端去重（同一后端内绝不按展示名合）。
-    const byBackend = new Map();
-    for (const g of cands) {
-      const be = g.items[0].backend;
-      if (!byBackend.has(be)) byBackend.set(be, g);
-      // 同一后端还出现第二条同名展示名 → 那对是不同模型（如 hy3 / hy3-x），留在原组不管。
-    }
-    if (byBackend.size < 2) continue;
-    // 归并到「第一个后端顺序最靠前」的那组（= 主组），其余组并入。
-    const members = [...byBackend.values()].sort(
-      (a, b) => (backendOrder(a.items[0].backend) - backendOrder(b.items[0].backend))
-                || a.key.localeCompare(b.key));
-    const host = members[0];
-    for (const g of members.slice(1)) {
-      host.items.push(...g.items);
-      absorbed.add(g.key);
-    }
-    host.items.sort((a, b) => (backendOrder(a.backend) - backendOrder(b.backend)) || a.id.localeCompare(b.id));
-    // 标记「这一行是跨后端展示名归并来的」：行名要改用官方展示名——
-    // 主组裸名（`kimi-k3-1`）只是其中**一个后端**的 id，还可能正是上游写错的那个，
-    // 拿它当跨后端共用名会误导。两边展示名本就相同（归并的前提），用它最自然。
-    host.mergedByDisplayName = true;
-  }
-  if (!absorbed.size) return groups;
-  return groups.filter(g => !absorbed.has(g.key));
+  return out;
 }
 
 // 模型 id 去掉后端前缀后的本名。前缀表来自注册表（后端可声明任意前缀），
@@ -411,13 +370,17 @@ function renderModelGroup(g) {
   // 现在改用**点状态列**（见 stateCell）——同一个动作不该有两个入口。
   const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}">删除${multi ? ` ${esc(backendLabel(m.backend))}` : ""}</button>`).join("");
 
-  // 跨后端展示名归并来的行（`g.mergedByDisplayName`）行名用**官方展示名**：
-  // 主组裸名只是其中一个后端的 id（`kimi-k3-1` 这种，还可能正是上游写错的那个），
-  // 当跨后端共用名会误导。归并的前提就是两边展示名相同，用它最自然。
-  // 该行的两个真实 id 仍然都能从小灰字看到（多后端行会列出各后端）。
+  // 多后端行的行名：当各成员的**裸名不一致**时用官方展示名，否则用裸名。
+  //
+  // 举例：腾讯 `kimi-k3-1` 与字节 `trae/kimi-k3` 规范名同为 `kimi-k3`，但两个裸名
+  // 不同 —— 挑任何一个当共用名都会误导（`kimi-k3-1` 还是上游那个写偏的 id）。
+  // 两边展示名相同（`Kimi-K3`）才是这一行真正的名字。
+  // 反之 `glm-5.3` 两边裸名一致，直接用裸名，展示名反而可能与 id 不一致。
+  // 该行的两个真实 id 仍都能从「N 个后端」那行小灰字看到。
   const bareId = modelBaseName(primary.id);
+  const allSameBare = items.every(m => modelBaseName(m.id) === bareId);
   const displayName = String(primary.name || "").trim();
-  const titleText = (multi && g.mergedByDisplayName && displayName) ? displayName : bareId;
+  const titleText = (multi && !allSameBare && displayName) ? displayName : bareId;
   // 真实 id 不能因为剥前缀而丢失（复制去调 API 要用）：
   // 单条行放在小灰字位；归并行的两个 id 已在「N 个后端」提示里给出各后端名，
   // 这里补上各自的后端标记即可，不再重复列 id。

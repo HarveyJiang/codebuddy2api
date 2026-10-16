@@ -1186,6 +1186,13 @@ class TraeBackend(BackendSpec):
     catalog_method = "fetch_models"
     static_catalog = TRAE_STATIC_MODELS
 
+    # 跨后端规范名：**本后端一个非恒等映射都不需要声明**。
+    #
+    # 保留成显式空字典（而不是删掉这行）是给下一个人看的：Trae 的上游 id 与
+    # 规范名恒等（`trae/kimi-k3` 剥前缀＝`kimi-k3`），这正是默认规则覆盖的情形。
+    # 想让 Trae 的某个模型与腾讯侧合组，在这里加一条 `{"上游id": "规范名"}` 即可。
+    canonical_for = {}
+
     def __init__(self):
         # 动态目录提供者由 admin 在启动时注入（它知道动态表存在哪、
         # 什么时候刷过）。实例级而非模块级：模块级全局会在「同一进程里建了

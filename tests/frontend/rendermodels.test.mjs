@@ -38,7 +38,6 @@ const snippets = [
   /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /function backendBadge\(b\) \{[\s\S]*?\n\}\n/,
   /function groupModelsByName\(list\) \{[\s\S]*?\n\}\n/,
-  /function mergeByDisplayName\(groups\) \{[\s\S]*?\n\}\n/,
   /function modelBaseName\(id\) \{[\s\S]*?\n\}\n/,
   /const creditsText = [^\n]*\n/,
   /const CREDITS_ICON = [^\n]*\n/,
@@ -260,12 +259,12 @@ if (modelHead) {
 check("倍率/上下文列各带行内图标",
       allHtml.includes(fn.CREDITS_ICON) && allHtml.includes(fn.CTX_ICON));
 
-// 跨后端展示名归并出来的行，行名用**官方展示名**（用户 2026-10-16 拍板）。
-// 主组裸名只是其中一个后端的 id（`kimi-k3-1` 这种，还可能正是上游写错的那个），
-// 拿它当跨后端共用名会误导 —— 这行已经不属于那一个后端了。
+// 跨后端归并出来的行，行名用**官方展示名**（用户 2026-10-16 拍板）。
+// 两个裸名不同（`kimi-k3-1` vs `trae/kimi-k3`），挑任何一个当共用名都会误导
+// —— 这行已经不属于那一个后端了。两边展示名相同（服务端算 canonical 时也靠这一点）。
 const aliasGroups = fn.groupModelsByName([
-  {id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", max_input_tokens: 200000, enabled: true},
-  {id: "trae/kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", max_input_tokens: 200000, enabled: true},
+  {id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000, enabled: true},
+  {id: "trae/kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000, enabled: true},
 ]);
 const aliasHtml = fn.renderModelGroup(aliasGroups[0]);
 check("归并行行名用官方展示名 Kimi-K3", aliasHtml.includes("<strong>Kimi-K3</strong>"), aliasHtml.slice(0, 160));

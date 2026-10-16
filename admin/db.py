@@ -259,7 +259,31 @@ def _v12_to_v13(db):
         db._write.execute("ALTER TABLE models ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
 
 
-SCHEMA_VERSION = 13
+def _v13_to_v14(db):
+    """v13 → v14：给 models 补 canonical（跨后端规范名，见 specs/model-routing-by-policy.md §6.1）。
+
+    **为什么需要独立一列**：`model_id` 在两边天然不等（腾讯 `kimi-k3-1` vs 字节
+    `trae/kimi-k3`），`name` 是展示文本（用户可改名、两边写法可能不同），两者都
+    不能当「同一个模型」的判据。没有这一列，跨后端同名永远合不起来，
+    「用户只看到一个模型、系统按策略选后端」也就无从谈起。
+
+    **可空是设计**：空 = 没有规范名可选（正常写入路径不会产生这种行，
+    见下）。
+
+    **迁移不回填、由下次目录同步写入**：规范名要靠后端声明现算，而迁移代码不该
+    依赖 registry（迁移是「历史数据修复」，不该因将来加了后端而改变结果）。
+    回填的代价只是「升级后到第一次同步之间，跨后端的同名行暂时显示成两行」——
+    可接受，且比在迁移里粘业务规则安全。
+
+    注意写入点（`save_models`）**不会**写空：它对每一行都调 `canonical_name()`
+    现算，所以空值只可能出现在迁移后、同步前的窗口里。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(models)")}
+    if "canonical" not in columns:
+        db._write.execute("ALTER TABLE models ADD COLUMN canonical TEXT")
+
+
+SCHEMA_VERSION = 14
 
 
 MICRO = 1_000_000
@@ -302,7 +326,7 @@ KEY_COLUMNS = (
 
 MODEL_COLUMNS = (
     "name", "description", "credits_micro", "max_input_tokens", "source", "available",
-    "enabled", "sort_order", "promo", "synced_at", "backend", "deleted",
+    "enabled", "sort_order", "promo", "synced_at", "backend", "deleted", "canonical",
 )
 
 LOG_COLUMNS = (
@@ -353,6 +377,17 @@ def _require_backend(value, model_id):
     if not value:
         raise ValueError(f"模型 {model_id} 缺少 backend（归属列必须显式给出）")
     return str(value)
+
+
+def _canonical_column(model_id):
+    """`models.canonical` 的写入值 —— 按后端声明现算（派生列，不接受调用方直给）。
+
+    局部 import 的理由与 `_v11_to_v12` 同：`admin.db` 在模块级 import registry
+    会让「registry → admin」的反向依赖成环。这条路径在写盘时才走，不在 import 时。
+    """
+    from core.backends.registry import canonical_name
+
+    return canonical_name(model_id)
 
 
 def _to_float(value):
@@ -460,7 +495,8 @@ class Database:
             sort_order INTEGER NOT NULL DEFAULT 0, promo TEXT,
             synced_at INTEGER NOT NULL DEFAULT 0,
             backend TEXT NOT NULL DEFAULT 'workbuddy',
-            deleted INTEGER NOT NULL DEFAULT 0)""",
+            deleted INTEGER NOT NULL DEFAULT 0,
+            canonical TEXT)""",
         """CREATE TABLE IF NOT EXISTS request_logs (
             id INTEGER PRIMARY KEY,
             time INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'api', path TEXT NOT NULL,
@@ -629,7 +665,7 @@ class Database:
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
-                  (12, _v11_to_v12), (13, _v12_to_v13))
+                  (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -844,7 +880,13 @@ class Database:
                          # 那条路径不经过这里。
                          _require_backend(item.get("backend"), mid),
                          # 删除标记：1 = 用户删掉的保留行（供日志 join，不加载）。
-                         _to_int(item.get("deleted"), 0)))
+                         _to_int(item.get("deleted"), 0),
+                         # 跨后端规范名：**派生值，不是调用方给的**（§6.1）。
+                         # 从 `mid` + 后端声明现算，所以谁都不可能写歪——若让调用方
+                         # 透传，就多出一条「persist 与注册表对同一模型算出不同值」的
+                         # 路径，正是这个列要消灭的那类不一致。
+                         # 调用方显式给了就用它（留给测试与将来「用户手工指定别名」）。
+                         item.get("canonical") or _canonical_column(mid)))
         with self.transaction():
             self._write.executemany(
                 f"INSERT INTO models ({', '.join(columns)}) VALUES ({marks})"
