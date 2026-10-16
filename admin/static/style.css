@@ -46,8 +46,6 @@
 .mini-backend .backend-icon-text{font-size:1em}
 /* 设置页后端开关、添加模型弹框的选项：行内图标，与文字同高。 */
 .inline-checkbox .backend-icon-svg,.model-backend-option .backend-icon-svg{width:1em;height:1em}
-.model-mini-toggle{font-size:10px;border:0;background:transparent;padding:0 4px 0 0;color:#7d9085;cursor:pointer}
-.model-mini-toggle:hover{color:#2f5744;text-decoration:underline}
 /* 模型归属多选（添加模型弹框）：选项由 /admin/api/backends 驱动。 */
 .model-backend-picker{display:block;font-size:12px;margin:10px 0}
 .model-backend-options{display:flex;flex-wrap:wrap;gap:14px;margin-top:7px}
@@ -57,15 +55,26 @@
    与 .mini-backend 同族的浅色描边风格，不抢占表格视觉重心。 */.routing-chip{font-size:11px;border:1px solid #d3ddd3;background:#f7faf5;color:#4e6b58;border-radius:6px;padding:3px 9px;cursor:pointer;white-space:nowrap}
 .routing-chip:hover{border-color:#9fbfa8;background:#eef5ec;color:#2f5744}
 /* 模型表：固定列宽，官方描述列收窄并换行（原来是 nowrap 撑满剩余宽度） */
+// 列宽（用户 2026-10-16 重排后的新列序）：
+//   1 模型 2 来源 3 倍率 4 上下文 5 官方描述 6 状态 7 操作
 .models-table{table-layout:fixed}
-.models-table th:nth-child(1),.models-table td:nth-child(1){width:26%}
-.models-table th:nth-child(2),.models-table td:nth-child(2){width:9%}
-.models-table th:nth-child(3),.models-table td:nth-child(3){width:23%;white-space:normal;overflow-wrap:anywhere;line-height:1.7}
-.models-table th:nth-child(4),.models-table td:nth-child(4){width:9%}
-.models-table th:nth-child(5),.models-table td:nth-child(5){width:11%}
+.models-table th:nth-child(1),.models-table td:nth-child(1){width:24%}
+.models-table th:nth-child(2),.models-table td:nth-child(2){width:8%}
+.models-table th:nth-child(3),.models-table td:nth-child(3){width:14%}
+.models-table th:nth-child(4),.models-table td:nth-child(4){width:11%}
+.models-table th:nth-child(5),.models-table td:nth-child(5){width:22%;white-space:normal;overflow-wrap:anywhere;line-height:1.7}
 .models-table th:nth-child(6),.models-table td:nth-child(6){width:9%}
-.models-table th:nth-child(7),.models-table td:nth-child(7){width:13%;text-align:right}
-@media(max-width:1100px){.models-table th:nth-child(1),.models-table td:nth-child(1){width:24%}.models-table th:nth-child(3),.models-table td:nth-child(3){width:25%}}
+.models-table th:nth-child(7),.models-table td:nth-child(7){width:12%;text-align:right}
+@media(max-width:1100px){.models-table th:nth-child(1),.models-table td:nth-child(1){width:22%}.models-table th:nth-child(5),.models-table td:nth-child(5){width:24%}}
+/* 状态列即开关：pill 样式复用，但它是 <button> —— 补上「可点」的指针与悬停反馈，
+   并清掉 button 的默认边框/背景（全局 button 只有 transition，没有外观重置）。 */
+.model-state-toggle{margin:0;border:0;cursor:pointer}
+.model-state-toggle:hover:not(:disabled){filter:brightness(.95);background:#e4ebe4}
+.model-state-toggle.green:hover:not(:disabled){background:#e2f0e6}
+.model-state-toggle.amber:hover:not(:disabled){background:#f4ebd9}
+/* 倍率/上下文列前的图标：与模型名前的 .model-id-line 同款（贴住基线、不与数值抢位）。
+   宽度固定，两个图标列的数值因此左对齐成一竖列。 */
+.model-id-line svg{width:1em;height:1em}
 
 .pager{display:flex;align-items:center;gap:14px;padding:16px 0 0;border-top:1px solid #edf0eb;margin-top:16px;font-size:11px}
 .pager .secondary{padding:7px 14px;font-size:11px}

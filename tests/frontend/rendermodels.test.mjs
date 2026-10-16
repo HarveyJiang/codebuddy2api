@@ -40,6 +40,8 @@ const snippets = [
   /function groupModelsByName\(list\) \{[\s\S]*?\n\}\n/,
   /function modelBaseName\(id\) \{[\s\S]*?\n\}\n/,
   /const creditsText = [^\n]*\n/,
+  /const CREDITS_ICON = [^\n]*\n/,
+  /const CTX_ICON = [^\n]*\n/,
   /const ctxText = [^\n]*\n/,
   /function renderModelGroup\(g\) \{[\s\S]*?\n\}\n/,
 ];
@@ -54,7 +56,7 @@ const escMatch = src.match(/const esc = [^\n]*\n/);
 code += escMatch[0];
 
 const fn = new Function(code + `
-  return {renderModelGroup, groupModelsByName, backendBadge, backendTag, backendName, backendIconSvg, applyBackends, esc};
+  return {renderModelGroup, groupModelsByName, backendBadge, backendTag, backendName, backendIconSvg, applyBackends, esc, backendsForTest: () => backends, CREDITS_ICON, CTX_ICON};
 `)();
 
 // 注入与 GET /admin/api/backends 同构的元数据（真实服务返回的就是这份形状）。
@@ -165,26 +167,60 @@ const single = groups.find(g => g.items.length === 1);
 const singleHtml = fn.renderModelGroup(single);
 check(`单后端行 ${single.key} 渲染正常`, singleHtml.includes("<tr>") && !/undefined/.test(singleHtml));
 
+// 单条行的主标题必须是**裸名**，与合并行一致 —— 曾经直接用 primary.id，
+// 于是只有 Trae 独有的模型（不参与同名合并）会露出 `trae/` 前缀。
+//
+// 这里**逐行穷举**而不是抽样：那个 bug 只在「单条 + 带前缀」的组合下出现，
+// 抽到合并行或 WorkBuddy 行都会漏。
+const prefixLeaks = [];
+let singles = 0, prefixedSingles = 0;
+for (const g of groups) {
+  if (g.items.length !== 1) continue;
+  singles++;
+  if (g.items[0].id.includes("/")) prefixedSingles++;
+  const title = fn.renderModelGroup(g).match(/<strong>([^<]*)<\/strong>/)?.[1] || "";
+  for (const b of fn.backendsForTest()) {
+    if (b.prefix && title.startsWith(b.prefix)) prefixLeaks.push(`${title} (真实 id ${g.items[0].id})`);
+  }
+}
+check(`单条行主标题都不带后端前缀（穷举 ${singles} 条，其中 ${prefixedSingles} 条 id 含 "/"）`,
+      prefixLeaks.length === 0, prefixLeaks.join("; "));
+
+// 真实 id 不能因为剥前缀而丢失：它要能在行的某处看到（小灰字位），
+// 否则用户没法把这个模型名复制去调 API。
+const traeOnly = groups.find(g => g.items.length === 1 && g.items[0].id.startsWith("trae/"));
+if (traeOnly) {
+  const h = fn.renderModelGroup(traeOnly);
+  check(`Trae 独有行 ${traeOnly.key} 主标题是裸名、小灰字保留真实 id`,
+        h.includes(`<strong>${traeOnly.key}</strong>`) && h.includes(traeOnly.items[0].id),
+        h.slice(0, 260));
+} else {
+  console.log("  跳过 Trae 独有行断言：数据里没有（需库里有 Trae 独有模型）");
+}
+
 // 徽标：null 要显示 —，不能显示成 workbuddy。
 check("backendBadge(null) 显示 —", fn.backendBadge(null).includes("—"));
 check("backendBadge('trae') 显示 Trae", fn.backendBadge("trae").includes("Trae"));
 check("backendBadge('workbuddy') 显示 WB", fn.backendBadge("workbuddy").includes("WB"));
 
-// 批量开关的目标态：按钮上标的是「点下去要变成什么」，不是当前态。
-// 写反了会让「全部禁用」把模型全打开，是会造成线上放量的错误。
+// 状态列即开关（用户 2026-10-16：操作列的启用/禁用按钮去掉，直接点状态）。
+// 按钮上标的是**当前状态**，`data-enabled` 标的是「点下去要变成什么」。
+// 目标态写反了会一次把全部模型打开，是会造成线上放量的错误。
 const all = {key: "m", items: [
   {id: "m", backend: "workbuddy", enabled: true, credits: 1, max_input_tokens: 1000},
   {id: "trae/m", backend: "trae", enabled: true, credits: 1, max_input_tokens: 1000}]};
 const allHtml = fn.renderModelGroup(all);
-check("全启用时按钮文案是「全部禁用」", allHtml.includes("全部禁用"));
-check("全启用时按钮目标态为 0", /data-model-group-toggle="m" data-enabled="0"/.test(allHtml));
+check("全启用时状态列文案是「启用」", allHtml.includes(">启用</button>"));
+check("全启用时点击目标态为 0（即禁用）", /data-model-group-toggle="m" data-enabled="0"/.test(allHtml));
+check("全启用时状态是可点的 button（不是 span）",
+      /<button class="pill model-state-toggle green" data-model-group-toggle="m"/.test(allHtml));
 
 const none = {key: "m", items: [
   {id: "m", backend: "workbuddy", enabled: false, credits: 1, max_input_tokens: 1000},
   {id: "trae/m", backend: "trae", enabled: false, credits: 1, max_input_tokens: 1000}]};
 const noneHtml = fn.renderModelGroup(none);
-check("全禁用时按钮文案是「全部启用」", noneHtml.includes("全部启用"));
-check("全禁用时按钮目标态为 1", /data-model-group-toggle="m" data-enabled="1"/.test(noneHtml));
+check("全禁用时状态列文案是「禁用」", noneHtml.includes(">禁用</button>"));
+check("全禁用时点击目标态为 1（即启用）", /data-model-group-toggle="m" data-enabled="1"/.test(noneHtml));
 
 const half = {key: "m", items: [
   {id: "m", backend: "workbuddy", enabled: true, credits: 1, max_input_tokens: 1000},
@@ -192,6 +228,36 @@ const half = {key: "m", items: [
 const halfHtml = fn.renderModelGroup(half);
 check("部分启用时目标态为 1（补齐启用）", /data-model-group-toggle="m" data-enabled="1"/.test(halfHtml));
 check("部分启用时状态列显示 1/2 启用", halfHtml.includes("1/2 启用"));
+
+// 操作列只剩删除：批量开关已并入状态列，单后端开关已删。
+// 同一个动作有两个入口会让人怀疑「点了哪个」，也会让「操作列」名不副实。
+check("操作列不再有启用/禁用按钮", !/data-model-group-toggle[^>]*>(全部)?(启用|禁用)<\/button>/.test(allHtml.split("<td class=\"align-right\">")[1] || ""));
+check("操作列不再有单后端开关", !/data-model-toggle/.test(allHtml));
+
+// @media 之外的整行结构：列序必须是 模型→来源→倍率→上下文→官方描述→状态→操作。
+// 官方描述挪到倒数第二列（操作列前）是用户明确要求的位置。
+const cellCount = (allHtml.match(/<td/g) || []).length;
+check("模型行恰好 7 个 td（列数与表头一致）", cellCount === 7, `实际 ${cellCount} 个`);
+check("官方描述在第 5 个 td（倒数第三）",
+      /^[\s\S]*?<\/td>[\s\S]*?<\/td>[\s\S]*?<\/td>[\s\S]*?<\/td><td class="model-desc-cell">/.test(allHtml));
+
+// 表头与行体的列序必须对得上 —— 重排列时最容易漏改的正是表头
+// （改完表头写「倍率」而行里是描述，页面不会报错，只是永久错位）。
+const indexHtml = readFileSync(join(here, "..", "..", "admin", "static", "index.html"), "utf8");
+const modelHead = /<table class="models-table">[\s\S]*?<thead><tr>([\s\S]*?)<\/tr><\/thead>/.exec(indexHtml);
+check("模型表有 class=\"models-table\"（列宽靠它按 nth-child 定）", Boolean(modelHead));
+if (modelHead) {
+  const heads = [...modelHead[1].matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)].map(m => m[1].trim());
+  check("表头 7 列且列序为 模型/来源/◭/⌘/官方描述/状态/操作",
+        heads.length === 7 && heads[4] === "官方描述" && heads[5] === "状态",
+        JSON.stringify(heads));
+  check("倍率/上下文表头是图标而非文字（免得与行内图标重复）",
+        heads[2] !== "倍率" && heads[3] !== "上下文", JSON.stringify(heads.slice(2, 4)));
+  check("表头列数 == 行体 td 数",
+        heads.length === cellCount, `表头 ${heads.length} / 行体 ${cellCount}`);
+}
+check("倍率/上下文列各带行内图标",
+      allHtml.includes(fn.CREDITS_ICON) && allHtml.includes(fn.CTX_ICON));
 
 console.log(bad ? `=== ${bad} 个失败 ===` : "=== 真实数据渲染全部通过 ===");
 process.exit(bad ? 1 : 0);

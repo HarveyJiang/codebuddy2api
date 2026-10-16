@@ -310,6 +310,11 @@ function modelsInGroup(list, key) {
 // 否则会丢失免费与付费的区别）。0 是「免费」、null 是「按标准计费」，两者必须区分。
 const creditsText = m => !Number.isFinite(m.credits) ? "标准" : m.credits === 0 ? "免费" : "×" + m.credits;
 const ctxText = m => m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.round(m.max_input_tokens / 1000) + "K" : String(m.max_input_tokens)) : "—";
+// 倍率/上下文列前的图标：**逐行**显示，同列各行用同一形状，靠对齐读出「这列是什么」。
+// 这样表头就不必再写「倍率」「上下文」两个词（用户 2026-10-16：用了 icon 就别再上文字，
+// 冗余且不友好）。图标是字符不是 emoji，不存在字形盒宽度不一致的问题。
+const CREDITS_ICON = "◭";
+const CTX_ICON = "⌘";
 
 function renderModelGroup(g) {
   const items = g.items;
@@ -327,6 +332,7 @@ function renderModelGroup(g) {
   const attrIcon = m => `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(m.backend)?.color || "#888")}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)}</span>`;
   const attrIcons = items.map(attrIcon).join("");
 
+  // 倍率列：**列内不再写"×"文字前缀**（表头有图标，数值自带含义），多后端每行一个。
   const creditsCell = multi
     ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span></div>`).join("")
     : `<span class="pill ${primary.credits === 0 ? "green" : primary.credits && primary.credits >= 1 ? "amber" : ""}">${esc(creditsText(primary))}</span>`;
@@ -334,30 +340,47 @@ function renderModelGroup(g) {
 
   const ctxCell = multi
     ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="mono">${esc(ctxText(m))}</span></div>`).join("")
-    : `<span class="mono">${esc(ctxText(primary))}</span>${primary.max_context_length && primary.max_context_length > (primary.max_input_tokens || 0) ? `<small class="cell-note">max 模式 ${Math.round(primary.max_context_length / 1000)}K</small>` : ""}`;
+    : `<span class="mono">${esc(ctxText(primary))}</span>`;
 
   const sourceLabel = {upstream: "上游", builtin: "内置", custom: "自定义"}[primary.source] || primary.source || "—";
   const sourceTag = `<span class="pill ${primary.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
   const desc = items.map(m => m.description).find(Boolean);
 
-  // 行级批量开关：一次作用于该名字的**全部后端**（决定 8 的「合并显示 + 默认全选禁用/启用」）。
-  const batchToggle = `<button data-model-group-toggle="${esc(g.key)}" data-enabled="${allEnabled ? "0" : "1"}" title="一次${allEnabled ? "禁用" : "启用"}该模型在所有后端的条目">${allEnabled ? "全部禁用" : "全部启用"}</button>`;
-  // 单后端删除（仅自定义项可删）。
+  // 单后端删除（仅自定义项可删）。原来这里还有一个「全部启用/禁用」按钮，
+  // 现在改用**点状态列**（见 stateCell）——同一个动作不该有两个入口。
   const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}">删除${multi ? ` ${esc(backendLabel(m.backend))}` : ""}</button>`).join("");
-  // 单后端开关：合并行里仍需能只停其中一个后端。
-  const perBackend = multi
-    ? `<small class="cell-note">${items.map(m => `<button class="model-mini-toggle" data-model-toggle="${esc(m.id)}" data-enabled="${m.enabled ? "0" : "1"}" title="${esc(m.id)}">${tagFor(m)}${m.enabled ? "已启用" : "已禁用"}</button>`).join(" ")}</small>`
-    : "";
 
+  // 单条行的主标题也用**裸名**（`modelBaseName`），与合并行一致 —— 合并行显示的
+  // 就是 `g.key`（裸名）。曾经这里直接用 `primary.id`，于是只有 Trae 独有的模型
+  // （没有同名 WorkBuddy 条目、不参与合并）会露出 `trae/` 前缀，页面里前缀时有时无。
+  //
+  // 裸名与真实 id 不总相同（Trae 带前缀），所以真实 id 不能丢：小灰字位放它，
+  // 复制去调 API 用得上。原位的官方展示名（`primary.name`）多数与裸名重复
+  // （`Doubao-Seed-2.1-Pro` / `Seed-2.1-Pro-0915` 这种才是少数），故让位。
+  const bareId = modelBaseName(primary.id);
+  const realIdNote = primary.id !== bareId ? primary.id : (primary.name || "");
   const idCell = multi
     ? `<span class="model-id-line">${attrIcons}</span><strong>${esc(g.key)}</strong><small class="cell-note">${items.length} 个后端：${esc(items.map(m => backendName(m.backend)).join(" / "))}</small>`
-    : `<span class="model-id-line">${attrIcons}</span><strong>${esc(primary.id)}</strong><small class="cell-note">${esc(primary.name || "")}</small>`;
+    : `<span class="model-id-line">${attrIcons}</span><strong>${esc(bareId)}</strong><small class="cell-note">${esc(realIdNote)}</small>`;
 
-  const stateCell = multi
-    ? `<span class="pill ${allEnabled ? "green" : anyEnabled ? "amber" : ""}">${allEnabled ? "启用" : anyEnabled ? `${enabledCount}/${items.length} 启用` : "禁用"}</span>`
-    : `<span class="pill ${primary.enabled ? "green" : ""}">${primary.enabled ? "启用" : "禁用"}</span>`;
+  // 状态列即开关：点一下切换该名字在**全部后端**的启用状态（原「全部启用/禁用」按钮）。
+  // 多后端时文案给出 `已启用数/总数`，与 pill 的颜色语义一致（绿=全开、黄=部分、灰=全关）。
+  // 用 <button> 而非 <span>：键盘可达（Enter/Space 原生可用），也自带「可点」语义。
+  const stateText = multi
+    ? (allEnabled ? "启用" : anyEnabled ? `${enabledCount}/${items.length} 启用` : "禁用")
+    : (primary.enabled ? "启用" : "禁用");
+  const stateCell = `<button class="pill model-state-toggle${allEnabled ? " green" : anyEnabled ? " amber" : ""}"`
+    + ` data-model-group-toggle="${esc(g.key)}" data-enabled="${allEnabled ? "0" : "1"}"`
+    + ` title="点击${allEnabled ? "禁用" : "启用"}「${esc(g.key)}」在全部后端的条目">${esc(stateText)}</button>`;
 
-  return `<tr><td>${idCell}</td><td>${sourceTag}</td><td>${esc(desc || "—")}</td><td>${creditsCell}${promoNote}</td><td>${ctxCell}</td><td>${stateCell}</td><td class="align-right">${del}${batchToggle}${perBackend}</td></tr>`;
+  // 列序（用户 2026-10-16 重排）：模型 → 来源 → 倍率 → 上下文 → 官方描述 → 状态 → 操作。
+  // 官方描述从第 3 列挪到倒数第二列（操作列前）；倍率/上下文列各带一个图标，
+  // 表头因此不必再写「倍率」「上下文」二字。
+  return `<tr><td>${idCell}</td><td>${sourceTag}</td>`
+    + `<td><span class="model-id-line">${CREDITS_ICON}</span>${creditsCell}${promoNote}</td>`
+    + `<td><span class="model-id-line">${CTX_ICON}</span>${ctxCell}</td>`
+    + `<td class="model-desc-cell">${esc(desc || "—")}</td>`
+    + `<td>${stateCell}</td><td class="align-right">${del}</td></tr>`;
 }
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
@@ -986,8 +1009,9 @@ $("models-refresh").addEventListener("click", async () => {
   finally { $("models-refresh").disabled = false; $("models-refresh").innerHTML = '<span>↻</span> 立即拉取'; }
 });
 $("models-body").addEventListener("click", async e => {
-  // 批量开关：一次作用于同名模型的**全部后端**（需求 8 的「批量禁用、启用」）。
-  // 单后端开关仍保留在行内小字里，便于只停其中一条链路。
+  // 状态列开关：一次作用于同名模型的**全部后端**（需求 8 的「批量禁用、启用」）。
+  // 这个按钮在**状态列**（不在操作列）——用户 2026-10-16 把两个入口合一了：
+  // 状态本身就是开关，操作列只留删除。
   const batch = e.target.closest("[data-model-group-toggle]");
   if (batch) {
     const key = batch.dataset.modelGroupToggle;
@@ -1012,13 +1036,6 @@ $("models-body").addEventListener("click", async e => {
       await refresh();
       toast(`「${key}」已${verb} ${done}/${targets.length} 个，失败：${err.message}`);
     }
-    return;
-  }
-  const toggle = e.target.closest("[data-model-toggle]");
-  if (toggle) {
-    toggle.disabled = true;
-    try { await api("models/" + encodeURIComponent(toggle.dataset.modelToggle), {method:"PATCH", body:{enabled:toggle.dataset.enabled === "1"}}); await refresh(); }
-    catch (err) { toast(err.message); toggle.disabled = false; }
     return;
   }
   const del = e.target.closest("[data-model-delete]");
