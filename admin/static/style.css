@@ -203,5 +203,8 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .routing-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .routing-row select{flex:0 0 auto;width:auto}
 
-/* 密钥表范围列做成可点 pill：视觉仍是 pill，行为同「设置」按钮。 */
+/* 密钥表范围列做成可点 pill：视觉仍是 pill，行为同「设置」按钮。
+   「全部」是纯文本样式（muted），hover 才显出可点感。 */
 .scope-pill{cursor:pointer;border:0;font:inherit}
+.scope-all{background:none;border:0;padding:0;color:var(--muted);text-decoration:underline dotted transparent}
+.scope-all:hover{color:var(--deep);text-decoration-color:currentColor}

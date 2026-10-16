@@ -153,9 +153,11 @@ function render() {
     const expired = !!k.expires_at && k.expires_at <= now;
     // 范围列做成可点击（用户拍板：多条路径进同一个选择弹框）—— 点「N 个模型」
     // /「N 个账号」直接打开该密钥的设置弹框，与「设置」按钮殊途同归。
+    // 「全部」也可点（用户拍板）：点击同样进设置弹框 —— 想从「全部」改成
+    // 指定范围是同一类操作，没有理由只有非空范围才可点。
     const scope = (list, noun, kid) => (Array.isArray(list) && list.length)
       ? `<button class="pill amber scope-pill" data-bind="${esc(kid)}" title="点击编辑可用${noun}（与「设置」相同）">${list.length} 个${noun}</button>`
-      : `<span class="muted">全部</span>`;
+      : `<button class="scope-pill scope-all" data-bind="${esc(kid)}" title="当前不限制，点击设置可用${noun}">全部</button>`;
     // 操作收敛（用户 2026-10-16）：停用/撤销/限额都进「设置」弹框 —— 撤销与
     // 停用语义上不同（撤销不可逆、停用可恢复），但都是低频操作，占表格按钮位
     // 冗余；表格只留「设置」「请求」两个高频入口。
