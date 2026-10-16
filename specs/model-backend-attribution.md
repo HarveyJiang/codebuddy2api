@@ -281,6 +281,12 @@ pinned_models = ("fast-model", "balanced-model", "deep-model")
    用户自己负责。
 3. **行前 icon 与现有标记的关系**：✅ **搬到模型名前**。`tagFor` 标记从倍率/
    上下文单元格移到 `idCell`，一处标记，行更干净。
-4. **排期**：待定。建议本方案先行——它是裸名自动选后端
-  （`model-routing-by-policy.md`）的输入（多行结构），先有稳定的多行，
-   自动选择才有东西可选。
+4. **`models.backend` 列**：✅ **加**（用户拍板，2026-10-16）。原「不加列」结论
+   已推翻——`persist()` 里 backend 是循环变量、写入时已知，今天的做法是拼进
+   字符串再解析回来（stringly typed round-trip）。详见 §3.1。
+   `model_id` **保留前缀**（对外路由键 + 账本 join 键，不动）；
+   `backend_for_model_id` **保留**（请求路径与 `add(mid)` 还要用）。
+5. **与总闸的关系**：账号行/模型行是否按后端启用的隐藏或置灰，
+   由 `backend-toggle.md` 统一定，本方案不单独决定（避免两处各定一套）。
+6. **排期**：待定。前置依赖 `backend-toggle.md`（总闸）；本方案又是裸名自动
+   选后端（`model-routing-by-policy.md`）的输入（多行结构）。
