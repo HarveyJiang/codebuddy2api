@@ -1189,7 +1189,11 @@ function openKeyBind(k) {
   const paintBindTabs = () => {
     bindTabsBox.innerHTML = bindTabs.map(b => {
       const rows = models.filter(m => m.backend === b.name);
-      const on = rows.filter(m => selectedModels.includes(m.id)).length;
+      // 判据用 m.value（map 后元素的字段），不是 m.id —— map 重构后元素上
+      // 没有 id，m.id 恒为 undefined，includes 永远 false → badge 永远 0
+      //（用户两次报告的真根因；checkbox 的 checked 判据用的是 item.value，
+      // 所以勾选框是对的、badge 是错的，两边对不上）。
+      const on = rows.filter(m => selectedModels.includes(m.value)).length;
       const sel = b.name === bindTab;
       return `<button type="button" class="model-tab${sel ? " selected" : ""}" role="tab" aria-selected="${sel}"`
         + ` data-bind-tab="${esc(b.name)}" title="只看 ${esc(b.label)} 的模型">${backendIconSvg(b.name)}<span>${esc(b.label)}</span>`
