@@ -190,4 +190,4 @@ tr:hover .model-name-cell .model-del{opacity:1}
 
 /* 密钥设置：分配策略 select 与「当前默认：…」提示同行。 */
 .routing-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.routing-row select{flex:0 0 auto}
+.routing-row select{flex:0 0 auto;width:auto}
