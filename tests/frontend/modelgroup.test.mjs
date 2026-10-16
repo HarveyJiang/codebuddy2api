@@ -1,13 +1,23 @@
-// 同名模型跨后端合并展示（需求 8）的分组逻辑单测。
+// 模型管理页的「按上游分页签」逻辑单测（用户 2026-10-16 拍板）。
 //
-// 关键不变量：**只合并展示，不合并数值**。step-5-preview 在腾讯免费(0.0)、
-// 字节 0.48，若归组时把倍率平均或取首个，成本账本与排队降级会把付费当免费。
-// 所以这里既验「同名归到一组」，也验「组内两个 item 的原值都还在」。
+// 这一组测试的来历：v16 去前缀之前，同名模型（`glm-5.3` 在 WorkBuddy 与 Trae
+// 各有一个）驱动了一套「跨后端合并成一行」的展示 —— 前端按 `canonical` 归组、
+// 一行里并排画两个后端的倍率，批量的启用/禁用要一次作用到「这个名字的全部后端」。
+//
+// 用户改成「按上游分页签、各管各的、不做合并」后那整套被删了。这里钉住的是
+// **取而代之的三条不变量**：
+//
+//   1. 页签 = 可见后端（`enabled !== false`），**无「全部」页签**；
+//   2. 关掉的上游 → 页签与它的行**一起**消失（计数不能数出看不见的行）；
+//   3. 一个页签里只画一个上游的行，**不再画归属 icon**（整页同一归属，画了是噪声）。
+//
+// 还有一条容易漏的：当前页签被关闭时要**自动切到可见页签** —— 否则界面上
+// 一个页签都没选中，表格却是空的，看着像「模型全丢了」。
 import { readFileSync } from "node:fs";
 const src = readFileSync("admin/static/app.js", "utf8");
 
-// 抽取几个纯函数。用各自的源码形态精确定位；app.js 里 const 箭头函数与 function
-// 混用、行尾还有分号差异，所以每个片段各有明确的起止串。
+// 抽取几个纯函数。app.js 里 const 箭头函数与 function 混用、行尾还有分号差异，
+// 所以每个片段各有明确的起止串。
 function slice(from, to) {
   const start = src.indexOf(from);
   if (start < 0) throw new Error(`找不到 ${from}`);
@@ -15,25 +25,42 @@ function slice(from, to) {
   if (end < 0) throw new Error(`找不到 ${from} 的结尾 ${to}`);
   return src.slice(start, end + to.length);
 }
+
 const code = [
-  slice("function groupModelsByName(list) {", "\n}"),
-  slice("function modelBaseName(id) {", "\n}"),
+  slice("function backendIsVisible(name) {", "\n}"),
+  slice("function visibleBackends() {", "\n}"),
+  slice("function paintModelsTabs(tabs, list) {", "\n}"),
   slice("const creditsText = m =>", ";\n"),
-  slice("function modelsInGroup(list, key) {", "\n}"),
-  // 后端元数据现在来自服务端（需求 2），这几个 helper 是它的唯一消费口。
-  // 测试里注入一份与注册表一致的元数据，验证「元数据驱动」确实生效。
-  slice("let backends = [];", "\n"), 
+  slice("const ctxText = m =>", ";\n"),
+  slice("function renderModelRow(m) {", "\n}"),
+  // 元数据驱动：这几个 helper 是 /admin/api/backends 的唯一消费口。
+  slice("let backends = [];", "\n"),
   slice("function applyBackends(list) {", "\n}"),
   slice("const backendMeta = b =>", ";\n"),
-  slice("const backendOrder = b =>", ";\n"),
+  slice("const backendName = b =>", ";\n"),
+  slice("const backendIcon = b =>", ";\n"),
+  slice("const SVG_ALLOWED_TAGS = ", ";\n"),
+  slice("const backendIconSvg = b => {", "\n};\n"),
+  slice("const esc = v =>", ";\n"),
+  slice("const CREDITS_ICON = ", ";\n"),
+  slice("const CTX_ICON = ", ";\n"),
+  slice("let modelsTab = ", ";\n"),
 ].join("\n");
-const { groupModelsByName, modelBaseName, creditsText, modelsInGroup, applyBackends } =
-  new Function(code + "\nreturn {groupModelsByName, modelBaseName, creditsText, modelsInGroup, applyBackends};")();
 
+// 页签渲染要写 DOM（$("models-tabs")）；测试里给一个最小的桩，只记录 innerHTML。
+const box = { hidden: false, innerHTML: "" };
+const code2 = code.replace(/const \$ = .*\n/, "");
+const api = new Function("$", code2 + "\nreturn {backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText,"
+  + " getTab: () => modelsTab, setTab: v => { modelsTab = v; }};")(
+  id => (id === "models-tabs" ? box : null)
+);
+const { backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, getTab, setTab } = api;
+// 页签渲染要读 modelsTab 才知道哪个 selected；测「选中态」时先设好再画。
+setTab("workbuddy");
 // 与 GET /admin/api/backends 的返回同构（顺序故意打乱，验证 applyBackends 会排序）。
 applyBackends([
-  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", color: "#7c4dff", order: 1, prefix: "trae/" },
-  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", color: "#2f6fed", order: 0, prefix: "" },
+  { name: "trae", label: "Trae", short: "Trae", icon: "⚡", color: "#7c4dff", order: 1, login_kind: "trae", enabled: true, default: false },
+  { name: "workbuddy", label: "WorkBuddy", short: "WB", icon: "◈", color: "#2f6fed", order: 0, login_kind: "browser", enabled: true, default: true },
 ]);
 
 let bad = 0;
@@ -43,125 +70,106 @@ const check = (label, got, want) => {
   console.log(`${ok ? "  ok" : "FAIL"}  ${label}${ok ? "" : `\n       得到 ${JSON.stringify(got)}\n       期望 ${JSON.stringify(want)}`}`);
 };
 
-// 用线上真实数据：7 个重名模型里最危险的是 step-5-preview（免费 vs 0.48）。
-// v16 去前缀后，两条同名行的 `id` **相同**（`step-5-preview`），靠 `backend` 区分 ——
-// 这正是「同 id 两行」的新形状，归组必须仍然把它们合到一起。
-const list = [
-  { id: "step-5-preview", backend: "workbuddy", credits: 0.0, max_input_tokens: 200000, canonical: "step-5-preview" },
-  { id: "step-5-preview", backend: "trae", credits: 0.48, max_input_tokens: 200000, canonical: "step-5-preview" },
-  { id: "hy3", backend: "workbuddy", credits: 1, max_input_tokens: 128000, canonical: "hy3" },
-  { id: "kimi-k2.6", backend: "trae", credits: 0.75, max_input_tokens: 200000, canonical: "kimi-k2.6" },
-  { id: "kimi-k2.6", backend: "workbuddy", credits: 0.52, max_input_tokens: 256000, canonical: "kimi-k2.6" },
-];
+// ---- 1. 页签 = 可见后端，无「全部」页签 ----
+check("两个后端都启用 → 两个页签", visibleBackends().map(b => b.name), ["workbuddy", "trae"]);
+check("页签顺序来自元数据 order（workbuddy 在前）", visibleBackends()[0].name, "workbuddy");
+check("没有「全部」这个后端", visibleBackends().some(b => b.name === "all" || b.name === "全部"), false);
 
-const groups = groupModelsByName(list);
-check("5 个模型归成 3 组", groups.length, 3);
-
-const step = groups.find(g => g.key === "step-5-preview");
-check("step-5-preview 合并了两条", step.items.length, 2);
-// 原始倍率必须一个都没被改（免费 vs 付费是成本账本的判据）。
-check("组内保留 workbuddy 免费价 0.0",
-      step.items.find(m => m.backend === "workbuddy").credits, 0);
-check("组内保留 trae 价 0.48",
-      step.items.find(m => m.backend === "trae").credits, 0.48);
-check("两条的 id 现在相同（靠 backend 区分）",
-      step.items.map(m => m.id).sort(), ["step-5-preview", "step-5-preview"]);
-
-const kimi = groups.find(g => g.key === "kimi-k2.6");
-check("kimi-k2.6 合并两条", kimi.items.length, 2);
-check("上下文各自保留（256K / 200K 不能被平均）",
-      kimi.items.map(m => m.max_input_tokens).sort((a, b) => a - b), [200000, 256000]);
-
-check("hy3 单独成组（没有同名后端）",
-      groups.find(g => g.key === "hy3").items.length, 1);
-
-// ---- 跨后端归并靠**规范名**（canonical，用户 2026-10-16 拍板）----
-// 上游两边 id 命名不一致（腾讯 `kimi-k3-1` vs 字节 `kimi-k3`），
-// 只按裸名分组会显示成两行。且**不能按展示名猜**：hy3 / hy3-x 展示名都是
-// 「Hy3」却是两个真模型。规范名由服务端按各后端 `canonical_for` 声明算好。
-const aliasList = [
-  // 裸名不同、规范名相同 → 应该合（服务端已把 canonical 都算成 kimi-k3）。
-  { id: "kimi-k3-1", backend: "workbuddy", credits: 1.62, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
-  { id: "kimi-k3", backend: "trae", credits: 1.83, name: "Kimi-K3", canonical: "kimi-k3", max_input_tokens: 200000 },
-  // 反例：展示名相同、**规范名不同** → 绝不能合（同一后端的两个模型，倍率 0 vs 0.05）。
-  { id: "hy3", backend: "workbuddy", credits: 0, name: "Hy3", canonical: "hy3", max_input_tokens: 200000 },
-  { id: "hy3-x", backend: "workbuddy", credits: 0.05, name: "Hy3", canonical: "hy3-x", max_input_tokens: 200000 },
-];
-const aliasGroups = groupModelsByName(aliasList);
-check("同规范名合成一行（kimi-k3-1 + kimi-k3）", aliasGroups.length, 3);
-const k3 = aliasGroups.find(g => g.items.some(m => m.id === "kimi-k3"));
-check("归并行的两条都在（不是只留下一侧）",
-      k3.items.map(m => m.id).sort(), ["kimi-k3", "kimi-k3-1"]);
-check("归并行的组键就是规范名", k3.key, "kimi-k3");
-// 这是最容易写错的一条：展示名相同**不是**同一个模型的判据。
-check("展示名相同但规范名不同 → 不合并（hy3 / hy3-x 必须分开）",
-      aliasGroups.filter(g => g.items.some(m => m.id === "hy3" || m.id === "hy3-x"))
-                 .every(g => g.items.length === 1), true);
-check("hy3 与 hy3-x 各自成组、倍率未被混",
-      [aliasGroups.find(g => g.items[0].id === "hy3").items[0].credits,
-       aliasGroups.find(g => g.items[0].id === "hy3-x").items[0].credits], [0, 0.05]);
-
-// canonical 缺失（老库迁移后尚未同步）时回落到裸名：同名两行仍同组（id 相同）。
-const legacyList = [
-  { id: "glm-5.3", backend: "workbuddy", credits: 0.1 },
-  { id: "glm-5.3", backend: "trae", credits: 0.2 },
-  { id: "kimi-k2.6", backend: "workbuddy", credits: 0.5 },
-];
-const legacyGroups = groupModelsByName(legacyList);
-check("canonical 缺失时回落到裸名分组（glm-5.3 两侧仍同组）",
-      legacyGroups.find(g => g.items[0].id === "glm-5.3").items.length, 2);
-check("canonical 缺失时不把所有行挤成一组", legacyGroups.length, 2);
-
-// modelsInGroup 必须与分组结果一致（渲染与批量操作共用它，见 app.js 的说明）。
-// 归并行的成员来自两个不同裸名，按裸名过滤只会切到一条 —— 这条钉住那个 bug。
-check("modelsInGroup 对归并行返回全部成员",
-      modelsInGroup(aliasList, k3.key).map(m => m.id).sort(), ["kimi-k3", "kimi-k3-1"]);
-check("modelsInGroup 对普通组仍按规范名命中",
-      modelsInGroup(list, "step-5-preview").length, 2);
-check("modelsInGroup 对不存在的组返回空", modelsInGroup(list, "没有这个").length, 0);
-
-// 顺序稳定：workbuddy 在前。
-check("组内 workbuddy 排在 trae 前", step.items[0].backend, "workbuddy");
-
-// **组的先后必须原样跟随输入顺序**（= 服务端 snapshot() 的四层排序结果）。
-// 回归：前端曾在这里按「后端顺序 + 名字字母序」再排一次，把服务端排好的
-// 来源/倍率顺序整个覆盖 —— 表现就是「设置页排序规则改了但页面不变」。
-const ordered = groupModelsByName([
-  { id: "zzz-custom", backend: "workbuddy", credits: 9 },
-  { id: "aaa-upstream", backend: "workbuddy", credits: 0.1 },
-  { id: "mmm-builtin", backend: "trae", credits: 5 },
+// 服务端返回 enabled:false 表示「该上游已被管理员关闭」（总闸 ∧ 环境逃生门）。
+applyBackends([
+  { name: "trae", label: "Trae", icon: "⚡", color: "#7c4dff", order: 1, enabled: false, default: false },
+  { name: "workbuddy", label: "WorkBuddy", icon: "◈", color: "#2f6fed", order: 0, enabled: true, default: true },
 ]);
-check("组间顺序 = 输入顺序（后端不再重排）",
-      ordered.map(g => g.key), ["zzz-custom", "aaa-upstream", "mmm-builtin"]);
-check("trae 组不会因为后端顺序被提到最前",
-      ordered[0].key, "zzz-custom");
+check("关闭的 Trae 不出现在页签里", visibleBackends().map(b => b.name), ["workbuddy"]);
+// 判据是**后端自己的 enabled**，不是「有没有模型行」：一个被关闭但目录里
+// 仍有模型的后端必须隐藏页签，而不是显示成空页签。
+check("被关闭的后端即使有模型行也不可见", backendIsVisible("trae"), false);
+check("启用中的后端可见", backendIsVisible("workbuddy"), true);
+// 拿不到元数据（老接口 / 后端被删）→ 默认可见：宁可多一个页签，
+// 也不要让整个模型页因为缺一份元数据而空白（那会被当成「模型全丢了」）。
+check("未知后端默认可见（不让页面空掉）", backendIsVisible("nope"), true);
 
-// modelBaseName 现在是**恒等函数**：v16 去前缀后 id 就是上游裸名，
-// 没有前缀可剥。保留它是给归组一个明确的「裸名」概念（且不再读 backends[].prefix）。
-check("modelBaseName 不再剥任何前缀", modelBaseName("trae/kimi-k2.6"), "trae/kimi-k2.6");
-check("modelBaseName 原样返回", modelBaseName("glm-5.3"), "glm-5.3");
-check("modelBaseName 对空值安全", modelBaseName(null), "");
-// 上游自带 `/` 的名字也是原样（`openrouter/free` 不是我们的前缀）。
-check("上游自带斜杠的名字原样", modelBaseName("openrouter/free"), "openrouter/free");
+// ---- 2. 页签上的计数：只数**本上游**的行，且不数被隐藏的上游 ----
+applyBackends([
+  { name: "trae", label: "Trae", icon: "⚡", color: "#7c4dff", order: 1, enabled: true, default: false },
+  { name: "workbuddy", label: "WorkBuddy", icon: "◈", color: "#2f6fed", order: 0, enabled: true, default: true },
+]);
+const list = [
+  { id: "glm-5.3", backend: "workbuddy", credits: 0.1, max_input_tokens: 200000, enabled: true, source: "upstream" },
+  { id: "glm-5.3", backend: "trae", credits: 0.2, max_input_tokens: 200000, enabled: false, source: "upstream" },
+  { id: "hy3", backend: "workbuddy", credits: 0, max_input_tokens: 128000, enabled: true, source: "upstream" },
+];
+paintModelsTabs(visibleBackends(), list);
+check("页签条被画出来（非 hidden）", box.hidden, false);
+check("页签数 = 可见后端数", (box.innerHTML.match(/data-model-tab=/g) || []).length, 2);
+check("页签里不出现后端名字面量以外的硬编码（用 label）", box.innerHTML.includes("WorkBuddy"), true);
+// workbuddy: 2 条全开 → 2 / 2；trae: 1 条禁用 → 0 / 1。
+check("workbuddy 页签计数 2 / 2", /data-model-tab="workbuddy"[\s\S]*?<span class="count-badge">2 \/ 2<\/span>/.test(box.innerHTML), true);
+check("trae 页签计数 0 / 1（禁用行也计入总数）", /data-model-tab="trae"[\s\S]*?<span class="count-badge">0 \/ 1<\/span>/.test(box.innerHTML), true);
+// 选中态：当前页签带 .selected + aria-selected（可访问性，别只靠颜色）。
+check("当前页签标记 selected", /class="model-tab selected"[^>]*data-model-tab="workbuddy"/.test(box.innerHTML), true);
+check("当前页签 aria-selected=true", /data-model-tab="workbuddy"[^>]*aria-selected="true"|aria-selected="true"[^>]*data-model-tab="workbuddy"/.test(box.innerHTML)
+  || (box.innerHTML.match(/aria-selected="true"/g) || []).length === 1, true);
+setTab("trae");
+paintModelsTabs(visibleBackends(), list);
+check("切到 trae 后 selected 跟着走", box.innerHTML.includes('class="model-tab selected" role="tab" aria-selected="true" data-model-tab="trae"'), true);
+check("切到 trae 后只有一个 selected", (box.innerHTML.match(/class="model-tab selected"/g) || []).length, 1);
+setTab("workbuddy");
 
-// 倍率措辞：0 必须显示「免费」而不是「×0」，否则用户以为收费但为 0。
+// 关掉 Trae → 页签只剩一个；trae 的行也不在可见列表里（由 renderModels 过滤，
+// 这里用它过滤后喂给 paintModelsTabs，验证不会再出现 trae 的页签）。
+applyBackends([
+  { name: "trae", label: "Trae", icon: "⚡", color: "#7c4dff", order: 1, enabled: false, default: false },
+  { name: "workbuddy", label: "WorkBuddy", icon: "◈", color: "#2f6fed", order: 0, enabled: true, default: true },
+]);
+const visibleList = list.filter(m => backendIsVisible(m.backend));
+paintModelsTabs(visibleBackends(), visibleList);
+check("关掉 Trae 后只剩一个页签", (box.innerHTML.match(/data-model-tab=/g) || []).length, 1);
+check("关掉 Trae 后没有 trae 页签", box.innerHTML.includes('data-model-tab="trae"'), false);
+check("关掉 Trae 后它的行也被过滤掉", visibleList.some(m => m.backend === "trae"), false);
+
+// 完全没有可见后端 → 页签条整块隐藏（不给一个空的 role=tablist）。
+applyBackends([{ name: "trae", label: "Trae", icon: "⚡", order: 1, enabled: false, default: true }]);
+paintModelsTabs(visibleBackends(), []);
+check("没有可见后端 → 页签条隐藏", box.hidden, true);
+
+// ---- 3. 单行渲染：一个页签里只有同一归属，**不画归属 icon** ----
+applyBackends([
+  { name: "trae", label: "Trae", icon: "⚡", color: "#7c4dff", order: 1, enabled: true, default: false },
+  { name: "workbuddy", label: "WorkBuddy", icon: "◈", color: "#2f6fed", order: 0, enabled: true, default: true },
+]);
+const row = renderModelRow({ id: "glm-5.3", backend: "workbuddy", credits: 0.1, max_input_tokens: 200000, enabled: true, source: "upstream", name: "GLM-5.3" });
+// 归属 icon（.account-icon-backend）是「多后端并排」时代的产物：整页都是同一
+// 归属时每行再画一遍会读成噪声，用户已拍板去掉。
+check("单行不再画归属 icon", row.includes("account-icon-backend"), false);
+check("单行显示裸名 id", row.includes("glm-5.3"), true);
+check("单行状态列是开关（带 data-model-toggle）", row.includes("data-model-toggle"), true);
+check("开关带 backend（去前缀后裸名不唯一确定后端）", row.includes('data-model-backend="workbuddy"'), true);
+check("启用的行按钮为「启用」（点一下禁用）", row.includes('data-enabled="0"'), true);
+check("单行不出现跨后端合并的「N 个后端」话术", row.includes("个后端"), false);
+
+const rowOff = renderModelRow({ id: "hy3", backend: "workbuddy", credits: 0, max_input_tokens: 128000, enabled: false, source: "upstream" });
+check("禁用的行按钮为「禁用」（点一下启用）", rowOff.includes('data-enabled="1"'), true);
+check("倍率 0 显示「免费」", rowOff.includes("免费"), true);
+
+const rowCustom = renderModelRow({ id: "my-model", backend: "trae", credits: null, enabled: true, source: "custom", custom: true });
+check("自定义项有删除按钮（带 backend）", rowCustom.includes('data-model-delete="my-model"'), true);
+check("自定义项删除按钮带 backend", rowCustom.includes('data-model-backend="trae"'), true);
+const rowUpstream = renderModelRow({ id: "glm-5.3", backend: "workbuddy", credits: 0.1, enabled: true, source: "upstream" });
+check("上游模型没有删除按钮", rowUpstream.includes("data-model-delete"), false);
+
+// 倍率措辞：0 必须显示「免费」而不是「×0」（否则用户以为收费但为 0）。
 check("倍率 0 显示免费", creditsText({ credits: 0 }), "免费");
 check("倍率 null 显示标准", creditsText({ credits: null }), "标准");
 check("倍率 0.48 原样显示", creditsText({ credits: 0.48 }), "×0.48");
 
-// 渲染与批量操作必须对「一个组有哪些条目」有**同一个答案**。
-// 若两边各算一遍，将来改了归组规则就会出现「显示 2 条、批量只操作到 1 条」，
-// 而且界面不会报错——这类静默不一致最难查。
-for (const g of groups) {
-  const viaHelper = modelsInGroup(list, g.key).map(m => m.id).sort();
-  const viaRender = g.items.map(m => m.id).sort();
-  check(`组 ${g.key} 的成员：渲染与批量判断一致`,
-        JSON.stringify(viaRender), JSON.stringify(viaHelper));
+// ---- 4. 被删的那套不能再回来 ----
+// 合并展示的整套（归组 / 行内并排多后端）已随「按上游分页」删除。
+// 若有人把它加回来，两套展示会打架（一行既有归属 icon 又分页），且它们是
+// 静默冲突 —— 没有人会报错，只是页面同时呈现两种组织方式。
+for (const dead of ["groupModelsByName", "renderModelGroup", "modelsInGroup", "modelBaseName", "model-group-toggle"]) {
+  check(`已删除的 ${dead} 不再出现`, src.includes(dead + "(") || src.includes("data-" + dead) || new RegExp(`\\b${dead}\\b\\s*[=(]`).test(src), false);
 }
-check("modelsInGroup 对空/异常输入不抛错",
-      JSON.stringify(modelsInGroup(null, "hy3")), JSON.stringify([]));
-check("modelsInGroup 只返回本组条目",
-      modelsInGroup(list, "hy3").map(m => m.id), ["hy3"]);
 
-console.log(bad ? `=== ${bad} 个失败 ===` : "=== 模型合并分组全部通过 ===");
+console.log(bad ? `=== ${bad} 个失败 ===` : "=== 按上游分页签全部通过 ===");
 process.exit(bad ? 1 : 0);

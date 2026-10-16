@@ -243,8 +243,6 @@ const backendIconSvg = b => {
 };
 // 列表列宽窄时用短名（最近请求的后端列）。
 const backendLabel = b => backendMeta(b)?.short || b || "—";
-// 后端在展示顺序里的序号；未知后端排在已知的后面（而不是插到最前）。
-const backendOrder = b => backendMeta(b)?.order ?? 50;
 
 // 请求行里的后端徽标；backend 取自**实际选中的账号**，老记录/账号已删显示「—」。
 function backendBadge(b) {
@@ -259,70 +257,36 @@ function backendTag(b) {
 
 function renderModels() {
   const catalog = overview?.models;
-  const list = Array.isArray(catalog?.models) ? catalog.models : [];
-  // 同名模型跨后端合并成一行（需求 8）。**只合并展示，底层仍是两个独立模型** ——
-  // 倍率/上下文往往不同（如 step-5-preview：腾讯免费、字节 0.48），若合成一个数，
-  // 成本账本与排队降级会误判免费/付费。
-  const groups = groupModelsByName(list);
-  $("models-badge").textContent = groups.filter(g => g.items.some(m => m.enabled)).length + " / " + groups.length;
+  const list = (Array.isArray(catalog?.models) ? catalog.models : [])
+    // 已禁用的后端不参与展示：它的页签整个不出现（用户拍板「关掉一个上游，
+    // 它的页签直接隐藏」）。放在这里而不是只过滤页签，是为了让**计数**（页签上
+    // 的 N/M 与标题角的 badge）与可见内容一致 —— 否则会数出看不见的行。
+    // 判据是后端的 `enabled`（总闸 ∧ 逃生门），不是「有没有模型行」：
+    // 一个被关闭但目录里仍有模型的后端，页签必须消失而不是显示成空页签。
+    .filter(m => backendIsVisible(m.backend));
   const note = $("models-note");
   if (catalog?.error) { note.textContent = `上游拉取异常：${catalog.error}（当前展示${catalog.updated ? "上次缓存" : "内置官方列表"}）`; note.classList.add("field-error"); }
-  else { note.textContent = catalog?.updated ? `上次拉取：${stamp(catalog.updated * 1000)} · 每 6 小时自动刷新。同名模型已合并展示，倍率/上下文按后端分行。禁用的模型不会出现在 /v1/models。` : "尚未从上游拉取过，展示内置官方列表。服务启动与每 6 小时会自动尝试拉取。"; note.classList.remove("field-error"); }
-  $("models-body").innerHTML = groups.map(renderModelGroup).join("") || '<tr><td colspan="7" class="muted">模型列表为空，请点击「立即拉取」或手动添加。</td></tr>';
+  else { note.textContent = catalog?.updated ? `上次拉取：${stamp(catalog.updated * 1000)} · 每 6 小时自动刷新。按上游分页查看，各上游独立管理。禁用的模型不会出现在 /v1/models。` : "尚未从上游拉取过，展示内置官方列表。服务启动与每 6 小时会自动尝试拉取。"; note.classList.remove("field-error"); }
+
+  // 页签 = 可见后端，**不写死后端名**（读 /admin/api/backends，顺序也来自它）。
+  const tabs = visibleBackends();
+  // 当前页签可能因为「这个上游刚被关掉」而失效 —— 自动切到第一个可见页签
+  // （用户拍板）。用 find 而不是保留旧值：旧值指向的后端已不在 tabs 里了。
+  if (!tabs.some(b => b.name === modelsTab)) modelsTab = tabs[0]?.name || "";
+  paintModelsTabs(tabs, list);
+
+  const rows = list.filter(m => m.backend === modelsTab);
+  $("models-badge").textContent = rows.filter(m => m.enabled).length + " / " + rows.length;
+  $("models-body").innerHTML = rows.map(renderModelRow).join("")
+    || `<tr><td colspan="7" class="muted">${tabs.length ? "该上游暂无模型。" : "没有启用的上游。"}</td></tr>`;
 }
 
-// 按**规范名**（canonical）归组 —— 服务端 `snapshot()` 已经按后端声明算好，
-// 前端直接用，不再自己猜「哪些名字是同一个模型」。
-//
-// 为什么不能自己猜（这里踩过坑）：上游两边的 id 命名不总一致，同一个模型会写成
-// 两个不同的裸名（实测腾讯 `kimi-k3-1`、字节 `trae/kimi-k3`，两边官方展示名都是
-// 「Kimi-K3」）。只看裸名会显示成两行。而**按展示名猜是错的**：`hy3` 与 `hy3-x`
-// 都是 WorkBuddy 侧的独立模型（倍率 0 vs 0.05），展示名却都叫「Hy3」，
-// 按展示名合会把两个真模型并成一个。
-//
-// 规范名是**显式声明**的（各后端的 `canonical_for`，只写非恒等映射），
-// 所以它既不依赖「字符串规则碰巧对上」，也不依赖「展示名碰巧一样」。
-// 服务端算 canonical 有两条路径（`snapshot` 的 _group 与 API 输出），
-// 前端只读 `m.canonical` —— 规则只有一处。
-function groupModelsByName(list) {
-  const groups = new Map();
-  for (const m of list) {
-    // canonical 缺失时回落到裸名：老库（v13 及之前、迁移后尚未同步）里的行
-    // 可能还没有这一列的值，回落保证它们照旧显示成自己一行，而不是全挤进一组。
-    const key = String(m.canonical || "").trim() || modelBaseName(m.id);
-    if (!groups.has(key)) groups.set(key, {key, items: []});
-    groups.get(key).items.push(m);
-  }
-  const out = [...groups.values()];
-  // 组的先后**直接用服务端给的顺序**（Map 保留插入序），这里不再重排。
-  //
-  // 曾经这里按「后端顺序 + 名字字母序」排过一遍，把 `snapshot()` 的四层排序
-  // （来源 → 归属 → 启用 → 倍率）**整个覆盖**掉——于是设置页排序规则再怎么调、
-  // 页面都不变，看着就是「乱的」。规则只该有一处：服务端。
-  // 组内（同一模型跨后端的那几条）保留服务端顺序即可，它同样来自四层排序。
-  for (const g of out) {
-    g.items.sort((a, b) => (backendOrder(a.backend) - backendOrder(b.backend)) || a.id.localeCompare(b.id));
-  }
-  return out;
-}
-
-// 模型名（**已是上游裸名**）。v16 去前缀后 id 不再带后缀，这里只是保留一个
-// 明确的「裸名」概念给归组用；不再读 `backends[].prefix`（那个字段已删）。
-function modelBaseName(id) {
-  return String(id || "");
-}
-
-// 某个组包含哪些条目 —— **渲染与批量操作共用这一处判断**。
-// 若两边各算一遍，将来改了归组规则就会「显示 2 条、只操作到 1 条」且界面不报错。
-//
-// **不能再按裸名过滤**：跨后端展示名归并后（见 groupModelsByName），一行的成员
-// 可能来自两个不同的裸名（`kimi-k3-1` + `trae/kimi-k3`）。按裸名过滤只会切到其中
-// 一条 —— 界面上点一下「禁用」，两种后端里只停一种，而且不报错。
-// 所以这里直接复用分组结果，取那一组的 items。
-function modelsInGroup(list, key) {
-  const g = groupModelsByName(Array.isArray(list) ? list : []).find(x => x.key === key);
-  return g ? g.items : [];
-}
+// 幂等去重用的键：联合主键是 (model_id, backend)，但**渲染前还要再防一手**。
+// 第 3/4 步已把读库改成按行取（`load_model_rows`），同名两行不会再互相覆盖；
+// 这里加一层是因为前端拿的是 JSON 数组，服务端若哪天回退成按 id 索引，重复行会
+// 静默变成「少一行」——那种故障只会表现为「模型不见了」，最难查。
+// 键里带 backend 才是对的：同名模型在两个上游各有一行是**正常**的。
+const modelRowKey = m => `${m.backend || ""}\u0000${m.id || ""}`;
 
 // 倍率/上下文的统一格式化。倍率保留后端给的精度（0.06 / 0.79 这种不能取整，
 // 否则会丢失免费与付费的区别）。0 是「免费」、null 是「按标准计费」，两者必须区分。
@@ -334,87 +298,73 @@ const ctxText = m => m.max_input_tokens ? (m.max_input_tokens >= 1000 ? Math.rou
 const CREDITS_ICON = "◭";
 const CTX_ICON = "⌘";
 
-function renderModelGroup(g) {
-  const items = g.items;
-  const primary = items[0];
-  const multi = items.length > 1;
-  const enabledCount = items.filter(m => m.enabled).length;
-  const allEnabled = enabledCount === items.length;
-  const anyEnabled = enabledCount > 0;
+// 当前选中的上游页签。空串表示「还没选过」（首次渲染时由 renderModels 填）。
+let modelsTab = "";
 
-  // 后端标记：单后端直接打标；多后端在每个值前面标，读得出「哪个数属于哪个后端」。
-  //
-  // **只画 icon，不写后端名**（用户 2026-10-16 拍板）：多后端组里每个数值前都挂一个
-  // `WB` / `Trae` 文字，一列里堆两三个 pill，比数值本身还抢眼，读起来像表格在自说自话。
-  // icon 的形状+颜色已经能区分后端（颜色由后端声明经 /admin/api/backends 提供），
-  // 文字是冗余的。后端名移到 `title`，鼠标悬停仍可确认。
-  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)}</span>`;
-  // 行前归属 icon（specs/model-backend-attribution.md §4.1）：纯 icon 无 pill
-  // （复用账号表同款 .account-icon-backend），颜色由后端声明经 /admin/api/backends
-  // 提供。多后端组按后端顺序并排，一眼看出这行跨了几条链路。
-  const attrIcon = m => `<span class="account-icon account-icon-backend" style="color:${esc(backendMeta(m.backend)?.color || "#888")}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)}</span>`;
-  const attrIcons = items.map(attrIcon).join("");
+// 某个上游此刻该不该出现在页面上（页签是否显示、它的行是否参与统计）。
+//
+// 判据是**后端自己的 enabled**（总闸 ∧ 环境逃生门），不是「有没有模型行」：
+// - 关掉的上游 → 页签直接隐藏，它的模型也不显示（它们这时也不会出现在
+//   /v1/models，两边一致）；
+// - 拿不到元数据（老接口 / 后端被删）→ **默认可见**。宁可多显示一个页签，
+//   也不要让整个模型页因为缺一份元数据而空白 —— 那会被当成「模型全丢了」。
+function backendIsVisible(name) {
+  const meta = backendMeta(name);
+  if (!meta) return true;
+  return meta.enabled !== false;
+}
 
-  // 倍率列：**列内不再写"×"文字前缀**（表头有图标，数值自带含义），多后端每行一个。
-  const creditsCell = multi
-    ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span></div>`).join("")
-    : `<span class="pill ${primary.credits === 0 ? "green" : primary.credits && primary.credits >= 1 ? "amber" : ""}">${esc(creditsText(primary))}</span>`;
-  const promoNote = primary.promo ? `<small class="cell-note">${esc(primary.promo.label)} ×${primary.promo.credits}</small>` : "";
+// 可见后端，按元数据的展示顺序（order）—— 页签顺序与设置页、账号表一致。
+function visibleBackends() {
+  return backends.filter(b => b.enabled !== false);
+}
 
-  const ctxCell = multi
-    ? items.map(m => `<div class="model-line">${tagFor(m)}<span class="mono">${esc(ctxText(m))}</span></div>`).join("")
-    : `<span class="mono">${esc(ctxText(primary))}</span>`;
+// 画页签条：每个可见后端一个，**无「全部」页签、不做合并**（用户拍板）。
+// 文案用后端自己的 label（不写死），图标也用后端声明的（`icon_svg`）。
+function paintModelsTabs(tabs, list) {
+  const box = $("models-tabs");
+  if (!box) return;
+  if (!tabs.length) { box.innerHTML = ""; box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = tabs.map(b => {
+    const sel = b.name === modelsTab;
+    // 每个页签带自己的「启用数 / 总数」：一眼看出哪个上游还有东西没开。
+    // 没有模型的后端显示 0 —— 页签仍要在（关掉的是后端才隐藏，不是空目录）。
+    const rows = list.filter(m => m.backend === b.name);
+    const on = rows.filter(m => m.enabled).length;
+    return `<button class="model-tab${sel ? " selected" : ""}" role="tab"`
+      + ` aria-selected="${sel ? "true" : "false"}" data-model-tab="${esc(b.name)}"`
+      + ` title="只看 ${esc(b.label)} 的模型">${backendIconSvg(b.name)}<span>${esc(b.label)}</span>`
+      + `<span class="count-badge">${on} / ${rows.length}</span></button>`;
+  }).join("");
+}
 
-  const sourceLabel = {upstream: "上游", builtin: "内置", custom: "自定义"}[primary.source] || primary.source || "—";
-  const sourceTag = `<span class="pill ${primary.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
-  const desc = items.map(m => m.description).find(Boolean);
-
-  // 单后端删除（仅自定义项可删）。原来这里还有一个「全部启用/禁用」按钮，
-  // 现在改用**点状态列**（见 stateCell）——同一个动作不该有两个入口。
-  //
-  // 多后端时不再在按钮上写后端名（用户 2026-10-16 拍板）：归并行的每个后端各有一个
-  // 删除按钮，写出来就是「删除 WB」「删除 Trae」并排两行 —— 归属已经由该列上方的
-  // 归属 icon 表达，按钮只留「删除」二字，后端名靠 `title` 提示。
-  const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"${multi ? ` title="删除 ${esc(backendName(m.backend))} 下的 ${esc(m.id)}"` : ""}>删除</button>`).join("");
-
-  // 多后端行的行名：当各成员的**裸名不一致**时用官方展示名，否则用裸名。
-  //
-  // 举例：腾讯 `kimi-k3-1` 与字节 `trae/kimi-k3` 规范名同为 `kimi-k3`，但两个裸名
-  // 不同 —— 挑任何一个当共用名都会误导（`kimi-k3-1` 还是上游那个写偏的 id）。
-  // 两边展示名相同（`Kimi-K3`）才是这一行真正的名字。
-  // 反之 `glm-5.3` 两边裸名一致，直接用裸名，展示名反而可能与 id 不一致。
-  // 该行的两个真实 id 仍都能从「N 个后端」那行小灰字看到。
-  const bareId = modelBaseName(primary.id);
-  const allSameBare = items.every(m => modelBaseName(m.id) === bareId);
-  const displayName = String(primary.name || "").trim();
-  const titleText = (multi && !allSameBare && displayName) ? displayName : bareId;
-  // 真实 id 不能因为剥前缀而丢失（复制去调 API 要用）：
-  // 单条行放在小灰字位；归并行的两个 id 已在「N 个后端」提示里给出各后端名，
-  // 这里补上各自的后端标记即可，不再重复列 id。
-  const realIdNote = primary.id !== bareId ? primary.id : (primary.name || "");
-  const idCell = multi
-    ? `<span class="model-id-line">${attrIcons}</span><strong>${esc(titleText)}</strong><small class="cell-note">${items.length} 个后端：${esc(items.map(m => `${backendName(m.backend)} ${m.id}`).join(" / "))}</small>`
-    : `<span class="model-id-line">${attrIcons}</span><strong>${esc(bareId)}</strong><small class="cell-note">${esc(realIdNote)}</small>`;
-
-  // 状态列即开关：点一下切换该名字在**全部后端**的启用状态（原「全部启用/禁用」按钮）。
-  // 多后端时文案给出 `已启用数/总数`，与 pill 的颜色语义一致（绿=全开、黄=部分、灰=全关）。
-  // 用 <button> 而非 <span>：键盘可达（Enter/Space 原生可用），也自带「可点」语义。
-  const stateText = multi
-    ? (allEnabled ? "启用" : anyEnabled ? `${enabledCount}/${items.length} 启用` : "禁用")
-    : (primary.enabled ? "启用" : "禁用");
-  const stateCell = `<button class="pill model-state-toggle${allEnabled ? " green" : anyEnabled ? " amber" : ""}"`
-    + ` data-model-group-toggle="${esc(g.key)}" data-enabled="${allEnabled ? "0" : "1"}"`
-    + ` title="点击${allEnabled ? "禁用" : "启用"}「${esc(g.key)}」在全部后端的条目">${esc(stateText)}</button>`;
-
-  // 列序（用户 2026-10-16 重排）：模型 → 来源 → 倍率 → 上下文 → 官方描述 → 状态 → 操作。
-  // 官方描述从第 3 列挪到倒数第二列（操作列前）；倍率/上下文列各带一个图标，
-  // 表头因此不必再写「倍率」「上下文」二字。
-  return `<tr><td>${idCell}</td><td>${sourceTag}</td>`
-    + `<td><span class="model-id-line">${CREDITS_ICON}</span>${creditsCell}${promoNote}</td>`
-    + `<td><span class="model-id-line">${CTX_ICON}</span>${ctxCell}</td>`
-    + `<td class="model-desc-cell">${esc(desc || "—")}</td>`
+// 单行渲染：**一个页签里只有一个上游**，所以归属列（后端 icon）不再需要 ——
+// 整页都是同一个归属，每行再画一遍是噪声（用户拍板）。
+// 也因此不再有「同名模型跨后端合并成一行」那套（`groupModelsByName` /
+// `renderModelGroup` 已删）：合并的理由是「同名两行看着像重复」，而现在它们
+// 分在两个页签里，各管各的，本来就不会同屏。
+function renderModelRow(m) {
+  const sourceLabel = {upstream: "上游", builtin: "内置", custom: "自定义"}[m.source] || m.source || "—";
+  const sourceTag = `<span class="pill ${m.custom ? "amber" : ""}">${esc(sourceLabel)}</span>`;
+  const credits = `<span class="pill ${m.credits === 0 ? "green" : m.credits && m.credits >= 1 ? "amber" : ""}">${esc(creditsText(m))}</span>`;
+  const promoNote = m.promo ? `<small class="cell-note">${esc(m.promo.label)} ×${m.promo.credits}</small>` : "";
+  const stateCell = `<button class="pill model-state-toggle${m.enabled ? " green" : ""}"`
+    + ` data-model-toggle="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"`
+    + ` data-enabled="${m.enabled ? "0" : "1"}"`
+    + ` title="点击${m.enabled ? "禁用" : "启用"}「${esc(m.id)}」">${m.enabled ? "启用" : "禁用"}</button>`;
+  const del = m.custom
+    ? `<button class="danger" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}">删除</button>`
+    : "";
+  // 列序与表头一致：模型 → 来源 → 倍率 → 上下文 → 官方描述 → 状态 → 操作。
+  return `<tr><td><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small></td>`
+    + `<td>${sourceTag}</td>`
+    + `<td><span class="model-id-line">${CREDITS_ICON}</span>${credits}${promoNote}</td>`
+    + `<td><span class="model-id-line">${CTX_ICON}</span><span class="mono">${esc(ctxText(m))}</span></td>`
+    + `<td class="model-desc-cell">${esc(m.description || "—")}</td>`
     + `<td>${stateCell}</td><td class="align-right">${del}</td></tr>`;
 }
+
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
   const fmt = value => Math.floor(Number(value)).toLocaleString("zh-CN");
@@ -1041,33 +991,39 @@ $("models-refresh").addEventListener("click", async () => {
   catch (e) { toast(e.message); }
   finally { $("models-refresh").disabled = false; $("models-refresh").innerHTML = '<span>↻</span> 立即拉取'; }
 });
+// 页签点击：切到某个上游。页签条由 renderModels 重画（refresh 后计数也要更新），
+// 所以这里只改状态 + 立即重渲染一次，不等下一次轮询。
+$("models-tabs").addEventListener("click", e => {
+  const tab = e.target.closest("[data-model-tab]");
+  if (!tab) return;
+  const next = tab.dataset.modelTab;
+  if (next === modelsTab) return;
+  modelsTab = next;
+  renderModels();
+});
 $("models-body").addEventListener("click", async e => {
-  // 状态列开关：一次作用于同名模型的**全部后端**（需求 8 的「批量禁用、启用」）。
-  // 这个按钮在**状态列**（不在操作列）——用户 2026-10-16 把两个入口合一了：
-  // 状态本身就是开关，操作列只留删除。
-  const batch = e.target.closest("[data-model-group-toggle]");
-  if (batch) {
-    const key = batch.dataset.modelGroupToggle;
-    const enabled = batch.dataset.enabled === "1";
-    // 与渲染同一处判断（modelsInGroup），避免「显示两组、只切一组」。
-    const list = modelsInGroup(overview?.models?.models, key);
-    const targets = list.filter(m => !!m.enabled !== enabled);
-    if (!targets.length) return;
-    batch.disabled = true;
+  // 状态列开关：切换**这一行**（一个上游下的一个模型）。
+  //
+  // 去前缀前这里是「一次作用于同名模型的全部后端」——那时同名跨后端被合并成
+  // 一行，只能批量切。现在按上游分页、各管各的，一行就是一个后端上的一条，
+  // 逐个切才对（用户拍板「各管各的、不做合并」），也不再需要「已切 2/3 个」的
+  // 部分失败话术。
+  const toggle = e.target.closest("[data-model-toggle]");
+  if (toggle) {
+    const mid = toggle.dataset.modelToggle;
+    const enabled = toggle.dataset.enabled === "1";
+    // backend 由渲染时写进 dataset：同名模型两边都有，PATCH 必须指名是哪一行
+    // （去前缀后裸名不唯一确定后端，服务端要求显式 backend）。
+    const backend = toggle.dataset.modelBackend || undefined;
     const verb = enabled ? "启用" : "禁用";
-    let done = 0;
+    toggle.disabled = true;
     try {
-      // 逐个串行：任一失败要能定位到具体模型，已成功的保持生效（PATCH 幂等，可重试）。
-      for (const m of targets) {
-        await api("models/" + encodeURIComponent(m.id), {method:"PATCH", body:{enabled, backend: m.backend}});
-        done += 1;
-      }
+      await api("models/" + encodeURIComponent(mid), {method:"PATCH", body:{enabled, backend}});
       await refresh();
-      toast(`已${verb}「${key}」的 ${targets.length} 个后端条目`);
+      toast(`已${verb}「${mid}」`);
     } catch (err) {
-      // 报出「成了几个/共几个」：只说 err.message 会让人以为一个都没动。
       await refresh();
-      toast(`「${key}」已${verb} ${done}/${targets.length} 个，失败：${err.message}`);
+      toast(`${verb}「${mid}」失败：${err.message}`);
     }
     return;
   }

@@ -55,7 +55,6 @@ const snippets = [
   /const SVG_ALLOWED_TAGS = [^\n]*\n/,
   /const backendIconSvg = [\s\S]*?\n\};\n/,
   /const backendLabel = [^\n]*\n/,
-  /const backendOrder = [^\n]*\n/,
   /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /const creditsFmt = v => \{[\s\S]*?\n\};\n/,
   /const stamp = [^\n]*\n/,

@@ -125,3 +125,17 @@
 @media(max-width:760px){.settings-groups{grid-template-columns:1fr}.settings-card{padding:18px}}
 .check-row{display:flex;align-items:center;gap:9px;font-size:12px;margin:19px 0 7px;font-weight:600}
 .check-row input{width:16px;height:16px;flex-shrink:0}
+
+/* 模型页按上游分页签（用户 2026-10-16 拍板：一个上游一个页签、各管各的、
+   无「全部」页签、不做合并）。视觉语言沿用侧栏 .nav-item 的「选中 = 浅绿底 +
+   深绿字」，让「当前在看哪个上游」这件事与「当前在看哪一页」是同一套读法。 */
+.model-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
+.model-tab{display:inline-flex;align-items:center;gap:8px;padding:9px 14px;font-size:12px;
+  background:#fff;color:#68786e;border:1px solid var(--line);border-radius:9px;white-space:nowrap}
+.model-tab:hover{border-color:#c3d3c4;color:#3f5a48}
+.model-tab.selected{background:#e9f1e0;border-color:#cfe0bd;color:#2c4a35;font-weight:600}
+/* 页签里的图标：形状+颜色来自后端声明（/admin/api/backends 的 icon_svg / color）。 */
+.model-tab .backend-icon-svg{width:15px;height:15px;flex-shrink:0}
+.model-tab .count-badge{font-size:10px;padding:1px 6px}
+.model-tab.selected .count-badge{background:#d8e6c5;color:#3c5c41}
+@media(max-width:760px){.model-tabs{gap:6px}.model-tab{padding:7px 11px;font-size:11px}}
