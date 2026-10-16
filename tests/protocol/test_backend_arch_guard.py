@@ -60,7 +60,13 @@ CALLERS = [
 #: 后端名。写死成字面量是判断「有人加了第三个后端但没更新这里」的依据。
 BACKEND_NAMES = ("workbuddy", "trae")
 
-#: 允许按后端名分支的地方（后端自己的实现文件 + 它的登录模块）。
+#: 允许按后端名分支的地方（后端自己的实现文件、它的登录模块，以及注册表本身）。
+#:
+#: registry.py 在这里是**有意**的：它是唯一允许出现后端名的地方 —— 它持有
+#: `_REGISTRY` 那张表，其它模块一律从声明派生。这条豁免配了两条锁
+#: （见 tests/protocol/test_backend_registry.py）：
+#: `test_registration_is_a_single_table` 管「表还在」，
+#: `test_registry_modules_have_no_stray_backend_branches` 管「表外的按名分支不超两处」。
 ALLOWED_FILES = ("core/backends/",)
 
 
