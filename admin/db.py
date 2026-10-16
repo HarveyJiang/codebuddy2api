@@ -1111,7 +1111,7 @@ class Database:
         return [{column: row[column] for column in LOG_COLUMNS} for row in rows]
 
     def page_request_logs(self, limit=50, offset=0, since=None, until=None,
-                          source=None, outcome=None, key_id=None):
+                          source=None, outcome=None, key_id=None, account_id=None):
         """分页读请求日志（按 id 倒序），返回 {rows, total, limit, offset}。
 
         total 是不带 limit/offset 的同条件总数，供前端画页码。条件都用参数绑定，
@@ -1137,6 +1137,10 @@ class Database:
         if key_id:
             clauses.append("key_id = ?")
             params.append(str(key_id))
+        # account_id：账号详情里的「最近请求」。命中 idx_logs_account_time 索引。
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(str(account_id))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         total = self.query(f"SELECT COUNT(*) AS n FROM request_logs{where}", tuple(params))[0]["n"]
         rows = self.query(

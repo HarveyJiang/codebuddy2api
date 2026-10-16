@@ -592,9 +592,8 @@ $("account-page-size").addEventListener("change", e => { accountPageSize = Numbe
 
 // 账号详情弹框（需求 6）：点账号行打开。**只读** —— 行内的操作按钮仍承担写操作，
 // 这里不重复一份，避免两条写路径各自漂移。
-function openAccountDetail(a) {
-  if (!a) return;
-  const yes = v => v === true ? "是" : v === false ? "否" : "—";
+async function openAccountDetail(a) {
+  if (!a) return;  const yes = v => v === true ? "是" : v === false ? "否" : "—";
   const stampOr = v => v ? stamp(v * 1000) : "—";
   const rows = [
     ["账号类型", `${backendIcon(a.backend)} ${backendName(a.backend)}`],
@@ -622,6 +621,19 @@ function openAccountDetail(a) {
   // （用户 2026-10-16 报告「表格上下显示数据」的真因）。
   $("account-detail-body").innerHTML = rows.map(([k, v]) =>
     `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+  // 最近请求（用户拍板：冷却中想看「之前发生了什么」）—— 复用 /admin/api/logs
+  // 的 account_id 过滤，最多 10 条，覆盖 cooldown 的典型窗口（2h 内基本都在）。
+  try {
+    const logs = await api(`logs?account_id=${encodeURIComponent(a.id)}&limit=10`);
+    const body = $("account-detail-logs");
+    body.innerHTML = (logs.rows || []).map(r =>
+      `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
+      + `<td><span class="pill ${r.ok ? "green" : "red"}">${r.status ?? "—"}</span></td>`
+      + `<td class="mono">${esc(r.model_id || "—")}</td>`
+      + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`)
+      .join("") || '<tr><td colspan="4" class="muted">近期没有请求记录。</td></tr>';
+    $("account-detail-logs-box").hidden = false;
+  } catch { /* 日志拉取失败不打断详情弹框 */ }
   $("account-detail-dialog").showModal();
 }
 async function refresh(loadCredits) {
