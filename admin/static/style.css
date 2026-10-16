@@ -140,13 +140,25 @@ tr:hover .model-name-cell .model-del{opacity:1}
 #models-body .danger:hover:not(:disabled){background:#fbefed}
 /* 设置页：分区卡片。沿用 .pool-settings 的淡绿底与 .pool-controls 的排布，
    只把「一张大表单」拆成几块，避免所有设置挤在一起找不到。 */
-.settings-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px;align-items:start}
+/* 设置页：左右两列分组（用户 2026-10-16：等宽 auto-fit 错落浪费空间）。
+   上排「行为类」（后端总闸/签到/排队），下排「数值类」（分配/护栏/备份），
+   caption 标出分组语义；每张卡内字段走两列网格 —— 高频的短字段并排，
+   不再一列到底。 */
+.settings-caption{font-size:11px;letter-spacing:1.5px;color:#6d8478;margin:0 0 10px}
+.settings-groups{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
 .pool-settings .settings-groups{margin-bottom:20px}
-.settings-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px;margin:0}
+.settings-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px 24px;margin:0}
 .settings-card h3{font-size:16px;color:#416c54;margin:0 0 9px}
-.settings-card>p{font-size:11px;color:#809789;line-height:1.9;margin:0 0 18px}
-.settings-card .pool-controls{flex-direction:column;align-items:stretch;gap:0}
-.settings-card .pool-controls label{min-width:0;width:100%;margin:0 0 15px}
+.settings-card>p{font-size:11px;color:#809789;line-height:1.9;margin:0 0 16px}
+.settings-card .pool-controls{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
+.settings-card .pool-controls label{min-width:0;width:auto;margin:0 0 13px}
+.settings-card .pool-controls label.inline-checkbox,
+.settings-card .pool-controls #backend-toggles label{grid-column:1 / -1}
+/* 备份卡带动作按钮，独占一行放卡底。 */
+#backup-card .pool-controls{grid-template-columns:1fr 1fr 1fr}
+#backup-card .pool-controls button{grid-column:auto;align-self:end}
+@media(max-width:1100px){.settings-groups{grid-template-columns:1fr}.settings-card .pool-controls{grid-template-columns:1fr 1fr}}
+@media(max-width:760px){.settings-groups{grid-template-columns:1fr}.settings-card{padding:18px}.settings-card .pool-controls{grid-template-columns:1fr}}
 .settings-card .pool-controls .inline-checkbox{align-self:flex-start;width:auto}
 .settings-card .pool-controls button{margin:4px 0 0;align-self:flex-start}
 .settings-actions{display:flex;justify-content:flex-end}
