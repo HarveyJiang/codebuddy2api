@@ -151,14 +151,17 @@ function render() {
     const routing = k.routing || "";
     const revoked = !!k.revoked_at;
     const expired = !!k.expires_at && k.expires_at <= now;
-    const scope = (list, noun) => (Array.isArray(list) && list.length)
-      ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
+    // 范围列做成可点击（用户拍板：多条路径进同一个选择弹框）—— 点「N 个模型」
+    // /「N 个账号」直接打开该密钥的设置弹框，与「设置」按钮殊途同归。
+    const scope = (list, noun, kid) => (Array.isArray(list) && list.length)
+      ? `<button class="pill amber scope-pill" data-bind="${esc(kid)}" title="点击编辑可用${noun}（与「设置」相同）">${list.length} 个${noun}</button>`
+      : `<span class="muted">全部</span>`;
     // 操作收敛（用户 2026-10-16）：停用/撤销/限额都进「设置」弹框 —— 撤销与
     // 停用语义上不同（撤销不可逆、停用可恢复），但都是低频操作，占表格按钮位
     // 冗余；表格只留「设置」「请求」两个高频入口。
     const actions = `<td class="align-right"><div class="actions">${revoked ? `<button data-requests="${k.id}">请求</button>`
       : `<button data-bind="${k.id}" title="可用模型、可用账号、分配策略、限额与有效期">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button>`}</div></td>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${k.last_used_at ? `<span class="mono">${esc(stamp(k.last_used_at * 1000))}</span>` : '<span class="muted">从未使用</span>'}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td>${actions}</tr>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${k.last_used_at ? `<span class="mono">${esc(stamp(k.last_used_at * 1000))}</span>` : '<span class="muted">从未使用</span>'}</td><td>${scope(k.models, "模型", k.id)}</td><td>${scope(k.accounts, "账号", k.id)}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td>${actions}</tr>`;
   }).join("");
   paintKeysSort();
   const shown = keys.length, total = (overview.keys || []).length;
