@@ -281,8 +281,15 @@ function groupModelsByName(list) {
     byName.get(key).items.push(m);
   }
   const groups = [...byName.values()];
-  for (const g of groups) g.items.sort((a, b) => (backendOrder(a.backend) - backendOrder(b.backend)) || a.id.localeCompare(b.id));
-  groups.sort((a, b) => (backendOrder(a.items[0].backend) - backendOrder(b.items[0].backend)) || a.key.localeCompare(b.key));
+  // 组的先后**直接用服务端给的顺序**（Map 保留插入序），这里不再重排。
+  //
+  // 曾经这里按「后端顺序 + 名字字母序」排过一遍，把 `snapshot()` 的四层排序
+  // （来源 → 归属 → 启用 → 倍率）**整个覆盖**掉——于是设置页排序规则再怎么调、
+  // 页面都不变，看着就是「乱的」。规则只该有一处：服务端。
+  // 组内（同一模型跨后端的那几条）保留服务端顺序即可，它同样来自四层排序。
+  for (const g of groups) {
+    g.items.sort((a, b) => (backendOrder(a.backend) - backendOrder(b.backend)) || a.id.localeCompare(b.id));
+  }
   return groups;
 }
 // 模型 id 去掉后端前缀后的本名。前缀表来自注册表（后端可声明任意前缀），

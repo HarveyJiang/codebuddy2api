@@ -354,9 +354,59 @@ class SortOrderTests(unittest.TestCase):
         self.assertEqual(credits, sorted(credits))
 
     def test_snapshot_does_not_leak_internal_seq_key(self):
-        """内部稳定决胜用的 `_seq` 不得出现在 API 输出里。"""
+        """内部稳定决胜用的 `_seq` 与分组键 `_group` 都不得出现在 API 输出里。"""
         for m in self._registry().snapshot()["models"]:
             self.assertNotIn("_seq", m)
+            self.assertNotIn("_group", m)
+
+    def test_credits_sort_uses_group_minimum(self):
+        """第 4 层倍率按**同名组内最小值**排，不是单条自己的值。
+
+        用户 2026-10-16 拍板：「如果有倍率，选择较小的一个进行排」。管理页把同名
+        模型跨后端合成一行，一行的排序键必须唯一，用组内最小值才与「这行最便宜
+        多少钱」的直觉一致。
+
+        构造：`cheap-elsewhere` 在 workbuddy 上贵（9.9）、在 trae 上便宜（0.01），
+        组内最小值是 0.01 —— 它必须排在 `mid-price`（0.5，只有 workbuddy）**之前**。
+        若退回「按单条 credits 排」，workbuddy 那条 9.9 会把它甩到最后，测试变红。
+        """
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        registry.ensure_static_catalog("trae")
+        # 两条同名（bare 名相同）、分属两个后端、价格差很大。
+        registry.add("cheap-elsewhere", credits=9.9)
+        registry.add("trae/cheap-elsewhere", credits=0.01)
+        registry.add("mid-price", credits=0.5)
+
+        models = registry.snapshot()["models"]
+        custom = [m for m in models if m["source"] == "custom"]
+        keys = [m["id"] for m in custom]
+        self.assertIn("cheap-elsewhere", keys)
+        self.assertIn("mid-price", keys)
+        # 归属（第 2 层）在倍率（第 4 层）**之前**，所以两个后端各成一段；
+        # 关键在于：workbuddy 段里 cheap-elsewhere(组内 min 0.01) 必须排在
+        # mid-price(0.5) 之前 —— 若按单条 9.9 排，它会跑到 mid-price 后面。
+        wb = [m["id"] for m in custom if m["backend"] == "workbuddy"]
+        self.assertLess(wb.index("cheap-elsewhere"), wb.index("mid-price"),
+                        "组内最小值应参与排序（workbuddy 那条 9.9 也要按 0.01 排）")
+        # 倍率取「跨后端的组内最小值」，不是「同一后端内」：trae 的 0.01 决定了整组。
+        self.assertIn("trae/cheap-elsewhere", keys)
+
+    def test_group_min_spans_backends_not_just_same_backend(self):
+        """组内最小值要**跨后端**取：workbuddy 贵、trae 便宜时以 trae 为准。
+
+        反例对照：若把「组」误当成「同一后端内同名」，最小值就只在 workbuddy 内取，
+        得到 9.9，于是仍排在 0.5 后面 —— 这条会红。
+        """
+        registry = ModelRegistry(get_credential=lambda: FakeManager())
+        registry.ensure_builtin()
+        registry.ensure_static_catalog("trae")
+        registry.add("only-cheap-on-trae", credits=9.9)
+        registry.add("trae/only-cheap-on-trae", credits=0.01)
+        registry.add("pricier", credits=0.5)
+
+        keys = [m["id"] for m in registry.snapshot()["models"] if m["source"] == "custom"]
+        self.assertLess(keys.index("only-cheap-on-trae"), keys.index("pricier"))
 
     def test_snapshot_is_json_serializable(self):
         json.dumps(self._registry().snapshot())

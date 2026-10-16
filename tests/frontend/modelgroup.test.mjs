@@ -76,6 +76,19 @@ check("hy3 单独成组（没有同名后端）",
 // 顺序稳定：workbuddy 在前。
 check("组内 workbuddy 排在 trae 前", step.items[0].backend, "workbuddy");
 
+// **组的先后必须原样跟随输入顺序**（= 服务端 snapshot() 的四层排序结果）。
+// 回归：前端曾在这里按「后端顺序 + 名字字母序」再排一次，把服务端排好的
+// 来源/倍率顺序整个覆盖 —— 表现就是「设置页排序规则改了但页面不变」。
+const ordered = groupModelsByName([
+  { id: "zzz-custom", backend: "workbuddy", credits: 9 },
+  { id: "aaa-upstream", backend: "workbuddy", credits: 0.1 },
+  { id: "mmm-builtin", backend: "trae", credits: 5 },
+]);
+check("组间顺序 = 输入顺序（后端不再重排）",
+      ordered.map(g => g.key), ["zzz-custom", "aaa-upstream", "mmm-builtin"]);
+check("trae 组不会因为后端顺序被提到最前",
+      ordered[0].key, "zzz-custom");
+
 // 前缀剥离只针对后端声明的前缀，不能误伤名字里带相同字样的模型。
 check("modelBaseName 剥 trae/ 前缀", modelBaseName("trae/kimi-k2.6"), "kimi-k2.6");
 check("modelBaseName 不剥非前缀", modelBaseName("mytrae/x"), "mytrae/x");

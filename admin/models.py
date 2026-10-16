@@ -632,6 +632,11 @@ class ModelRegistry:
         4. **倍率**：``credits`` 升序；``None``（按标准计费）视为 0，与免费并列最前。
            同分用目录原顺序（``available`` 下标）稳定决胜。
 
+        **第 4 层的倍率取「同名组内的最小值」**，不是单条自己的值（用户 2026-10-16
+        拍板：「如果有倍率，选择较小的一个进行排」）。理由：管理页把同名模型跨后端
+        合并成**一行**（`groupModelsByName`），一行的排序键必须唯一 —— 用组内最小值
+        才与「这一行最便宜多少钱能买到」的直觉一致。组名 = 去掉后端前缀的 bare id。
+
         来源之所以是**第一层**：用户手动加的、上游没列出的模型最需要被看见
         （它们随时可能被误当成「上游没了」而找不到）；动态拉来的几百条垫底。
 
@@ -667,19 +672,34 @@ class ModelRegistry:
                         entry["promo"] = {"label": stored, "factor": 1.0, "credits": entry["credits"]}
                     # 目录原顺序（稳定决胜用）：取该后端 available 里的下标。
                     entry["_seq"] = available.index(bare)
+                    # 同名组键：**去前缀的 bare 名**（`trae/glm-5.3` 与 `glm-5.3`
+                    # 归同一组）。第 4 层倍率取组内最小值，故必须先有组键。
+                    entry["_group"] = bare
                     models.append(entry)
                 if backend == self._default:
                     updated, error = state["updated"], state["error"]
+
+            # 第 4 层用「同名组内的最小倍率」（见本方法 docstring 末尾）。先按
+            # 去前缀的 bare 名分组算一遍 —— 不分后端：同一个模型在 WorkBuddy 与
+            # Trae 上的价格要一起比，取更便宜的那个作为这一行的代表价。
+            group_min: dict[str, float] = {}
+            for m in models:
+                group = m["_group"]
+                cr = m["credits"] if isinstance(m.get("credits"), (int, float)) else 0
+                cur = group_min.get(group)
+                if cur is None or cr < cur:
+                    group_min[group] = cr
 
             models.sort(key=lambda m: (
                 _SOURCE_RANK[m["source"]],          # ① 来源
                 spec_for(m["backend"]).order,       # ② 归属（注册表顺序）
                 not m["enabled"],                   # ③ 启用优先
-                m["credits"] if isinstance(m.get("credits"), (int, float)) else 0,  # ④ 倍率
+                group_min[m["_group"]],             # ④ 倍率（同名组内最小值）
                 m["_seq"],                          # 稳定决胜：同分保持目录原顺序
             ))
             for m in models:
                 m.pop("_seq", None)
+                m.pop("_group", None)
             # updated/error 报告**默认后端**的刷新状态：管理页的「上次拉取」提示
             # 说的是主目录；各后端的细节在各自的目录提供者里。
             return {"updated": updated, "error": error, "models": models}
