@@ -187,3 +187,7 @@ tr:hover .model-name-cell .model-del{opacity:1}
 /* 密钥设置弹框：可用模型页签间距收紧（弹框里没有 16px 的余量）。 */
 #key-bind-dialog .model-tabs{margin:0 0 8px}
 #key-bind-dialog .model-tab{font-size:11px;padding:5px 11px}
+
+/* 密钥设置：分配策略 select 与「当前默认：…」提示同行。 */
+.routing-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.routing-row select{flex:0 0 auto}

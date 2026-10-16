@@ -1181,6 +1181,11 @@ function openKeyBind(k) {
     el.prepend(backendIconEl(a.backend));
   });
   $("key-bind-routing").value = k.routing || "";
+  // 「跟随默认」必须让人看到默认是什么（用户 2026-10-16）：在 select 后面
+  // 追加当前的全局默认策略名，随 overview 实时刷新 —— 设置页改了默认这里
+  // 下次打开就是新值。
+  $("key-bind-routing-hint").textContent = k.routing
+    ? "" : `当前默认：${routingShort(overview.pool?.default_routing || "round_robin")}`;
   $("key-bind-dialog").dataset.kid = k.id;
   $("key-bind-dialog").showModal();
 }
