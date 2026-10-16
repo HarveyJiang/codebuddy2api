@@ -34,6 +34,8 @@ const code = [
   slice("const ctxText = m =>", ";\n"),
   slice("function renderModelRow(m) {", "\n}"),
   slice("function batchTargets(rows, enabled) {", "\n}"),
+  slice("const modelKey = m =>", ";\n"),
+  slice("function checkedModelRows(rows) {", "\n}"),
   // 元数据驱动：这几个 helper 是 /admin/api/backends 的唯一消费口。
   slice("let backends = [];", "\n"),
   slice("function applyBackends(list) {", "\n}"),
@@ -49,11 +51,11 @@ const code = [
 // 页签渲染要写 DOM（$("models-tabs")）；测试里给一个最小的桩，只记录 innerHTML。
 const box = { hidden: false, innerHTML: "" };
 const code2 = code.replace(/const \$ = .*\n/, "");
-const api = new Function("$", code2 + "\nreturn {backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, batchTargets,"
+const api = new Function("$", code2 + "\nreturn {backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, batchTargets, modelKey, checkedModelRows,"
   + " getTab: () => modelsTab, setTab: v => { modelsTab = v; }};")(
   id => (id === "models-tabs" ? box : null)
 );
-const { backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, batchTargets, getTab, setTab } = api;
+const { backendIsVisible, visibleBackends, paintModelsTabs, renderModelRow, applyBackends, creditsText, batchTargets, modelKey, checkedModelRows, getTab, setTab } = api;
 // 页签渲染要读 modelsTab 才知道哪个 selected；测「选中态」时先设好再画。
 setTab("workbuddy");
 // 与 GET /admin/api/backends 的返回同构（顺序故意打乱，验证 applyBackends 会排序）。
@@ -172,16 +174,20 @@ check("倍率 0 显示免费", creditsText({ credits: 0 }), "免费");
 check("倍率 null 显示标准", creditsText({ credits: null }), "标准");
 check("倍率 0.48 原样显示", creditsText({ credits: 0.48 }), "×0.48");
 
-// ---- 批量启用/禁用（操作列取消后的批量入口，在工具栏）----
-// 作用范围 = 当前页签的行；目标 = 状态与目标不一致的那些。
+// ---- 批量启用/禁用（只作用于勾选的行，用户 2026-10-16 拍板）----
 const batchRows = [
   { id: "a", backend: "trae", enabled: true },
   { id: "b", backend: "trae", enabled: false },
   { id: "c", backend: "trae", enabled: true },
 ];
-check("批量启用 → 只取禁用的那 1 条", batchTargets(batchRows, true).map(m => m.id), ["b"]);
-check("批量禁用 → 只取启用的那 2 条", batchTargets(batchRows, false).map(m => m.id).sort(), ["a", "c"]);
-check("全开时批量启用无目标（按钮置灰的依据）", batchTargets(batchRows.filter(m => m.enabled), true).length, 0);
+// 无 DOM 的测试环境按「全不勾」处理 → 目标恒为空；有 DOM 时按勾选行过滤。
+check("没勾任何行 → 批量无目标（按钮置灰的依据）", batchTargets(batchRows, true).length, 0);
+check("没勾任何行 → 批量禁用也无目标", batchTargets(batchRows, false).length, 0);
+const batchDom = { checked: [{ dataset: { modelKey: modelKey(batchRows[1]) } }] };
+globalThis.document = { querySelectorAll: () => batchDom.checked };
+check("勾了 b（禁用）→ 批量启用只取 b", batchTargets(batchRows, true).map(m => m.id), ["b"]);
+check("勾了 b → 批量禁用无目标（b 已是禁用）", batchTargets(batchRows, false).length, 0);
+globalThis.document = { querySelectorAll: () => [] };
 
 // ---- 4. 被删的那套不能再回来 ----
 // 合并展示的整套（归组 / 行内并排多后端）已随「按上游分页」删除。

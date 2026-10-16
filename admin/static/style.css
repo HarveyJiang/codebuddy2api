@@ -64,15 +64,20 @@
 // 列宽（用户 2026-10-16 重排后的新列序）：
 //   1 模型 2 来源 3 倍率 4 上下文 5 官方描述 6 状态 7 操作
 .models-table{table-layout:fixed}
-/* 6 列：模型（含自定义模型的删除按钮）→ 来源 → 倍率 → 上下文 → 官方描述 → 状态。
-   操作列已取消（用户 2026-10-16）：删除做进模型名列，批量开关在工具栏。 */
-.models-table th:nth-child(1),.models-table td:nth-child(1){width:26%}
-.models-table th:nth-child(2),.models-table td:nth-child(2){width:8%}
-.models-table th:nth-child(3),.models-table td:nth-child(3){width:11%}
-.models-table th:nth-child(4),.models-table td:nth-child(4){width:11%}
-.models-table th:nth-child(5),.models-table td:nth-child(5){width:26%;white-space:normal;overflow-wrap:anywhere;line-height:1.7}
-.models-table th:nth-child(6),.models-table td:nth-child(6){width:18%}
-@media(max-width:1100px){.models-table th:nth-child(1),.models-table td:nth-child(1){width:24%}.models-table th:nth-child(5),.models-table td:nth-child(5){width:26%}}
+/* 7 列：勾选 → 模型（含自定义模型的删除按钮）→ 来源 → 倍率 → 上下文 →
+   官方描述 → 状态。操作列已取消（用户 2026-10-16）：删除做进模型名列，
+   批量开关在工具栏、只作用于勾选的行。 */
+.models-table th:nth-child(1),.models-table td:nth-child(1){width:4%}
+.models-table th:nth-child(2),.models-table td:nth-child(2){width:24%}
+.models-table th:nth-child(3),.models-table td:nth-child(3){width:8%}
+.models-table th:nth-child(4),.models-table td:nth-child(4){width:10%}
+.models-table th:nth-child(5),.models-table td:nth-child(5){width:10%}
+.models-table th:nth-child(6),.models-table td:nth-child(6){width:26%;white-space:normal;overflow-wrap:anywhere;line-height:1.7}
+.models-table th:nth-child(7),.models-table td:nth-child(7){width:18%}
+@media(max-width:1100px){.models-table th:nth-child(2),.models-table td:nth-child(2){width:22%}.models-table th:nth-child(6),.models-table td:nth-child(6){width:26%}}
+/* 勾选列：窄，居中；表头的全选框只勾当前页签渲染出来的行。 */
+.model-check-cell{text-align:center}
+.model-check,.model-check-cell input{width:15px;height:15px;cursor:pointer;accent-color:var(--accent,#4a7dff)}
 /* 模型名单元格：id + 展示名 + （仅自定义）删除按钮。删除是次要操作，
    平时淡显、悬停行才醒目 —— 一列红按钮比数据还抢眼。 */
 .model-name-cell{white-space:normal}

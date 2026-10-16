@@ -278,17 +278,31 @@ function renderModels() {
   const rows = list.filter(m => m.backend === modelsTab);
   $("models-badge").textContent = rows.filter(m => m.enabled).length + " / " + rows.length;
   $("models-body").innerHTML = rows.map(renderModelRow).join("")
-    || `<tr><td colspan="6" class="muted">${tabs.length ? "该上游暂无模型。" : "没有启用的上游。"}</td></tr>`;
+    || `<tr><td colspan="7" class="muted">${tabs.length ? "该上游暂无模型。" : "没有启用的上游。"}</td></tr>`;
+  $("models-check-all").checked = false;
   paintBatchButtons(rows);
 }
 
-// 批量启用/禁用（用户 2026-10-16 拍板：操作列取消后，批量开关挪到工具栏）。
-// 作用范围 = **当前页签**：页签就是「各管各的」的边界，跨页签的批量操作没有
-// 语义（用户得先选一个上游才知道自己在批量操作谁）。
-// 按钮上有多少可切换的目标就显示成什么样：没有可切目标（全开 → 禁用键没意义）
-// 时置灰，而不是点了之后 toast 一句「无事可做」。
+// 批量启用/禁用（用户 2026-10-16 拍板：操作列取消后，批量开关挪到工具栏；
+// 随后补充：批量只作用于**勾选的行**，没有勾选时按钮置灰）。
+// 勾选是逐行的（复选框在每行行首），作用范围天然被页签框住 —— 换页签会
+// 重画表格、勾选清空，跨页签的批量操作没有语义。
+// 按钮上有多少可切换的目标就显示成什么样：目标为零（没勾 / 勾的全已是
+// 目标状态）时置灰，而不是点了之后 toast 一句「无事可做」。
 function batchTargets(rows, enabled) {
-  return rows.filter(m => !!m.enabled !== enabled);
+  return checkedModelRows(rows).filter(m => !!m.enabled !== enabled);
+}
+
+function checkedModelRows(rows) {
+  // 无 DOM 环境（测试抽函数裸跑）没有 document：按「全不勾」处理，返回空。
+  if (typeof document === "undefined") return [];
+  const byKey = new Map(rows.map(m => [modelKey(m), m]));
+  const out = [];
+  for (const box of document.querySelectorAll(".model-check:checked")) {
+    const m = byKey.get(box.dataset.modelKey);
+    if (m) out.push(m);
+  }
+  return out;
 }
 
 function paintBatchButtons(rows) {
@@ -297,8 +311,8 @@ function paintBatchButtons(rows) {
     if (!btn) continue;
     const n = batchTargets(rows, enabled).length;
     btn.disabled = n === 0;
-    btn.title = n === 0 ? `当前上游没有可${enabled ? "启用" : "禁用"}的模型`
-      : `把当前上游的 ${n} 个模型${enabled ? "启用" : "禁用"}`;
+    btn.title = n === 0 ? "先勾选要操作的模型行"
+      : `${enabled ? "启用" : "禁用"}勾选的 ${n} 个模型`;
   }
 }
 
@@ -309,7 +323,7 @@ async function batchToggle(enabled) {
   const targets = batchTargets(rows, enabled);
   if (!targets.length) return;
   const verb = enabled ? "启用" : "禁用";
-  if (!confirm(`确定${verb}当前上游的 ${targets.length} 个模型？`)) return;
+  if (!confirm(`确定${verb}勾选的 ${targets.length} 个模型？`)) return;
   const btn = $(enabled ? "models-batch-enable" : "models-batch-disable");
   btn.disabled = true;
   let done = 0;
@@ -332,6 +346,29 @@ async function batchToggle(enabled) {
 }
 $("models-batch-enable").addEventListener("click", () => batchToggle(true));
 $("models-batch-disable").addEventListener("click", () => batchToggle(false));
+
+// 勾选变化 → 重算批量按钮态（事件委托在表格上，复选框是重画出来的）。
+// 全选框 = 勾/消当前页签渲染出来的所有行；行勾选反过来同步它的三态。
+$("models-check-all").addEventListener("change", e => {
+  const on = e.target.checked;
+  document.querySelectorAll(".model-check").forEach(b => { b.checked = on; });
+  e.target.indeterminate = false;
+  const catalog = overview?.models;
+  const rows = (Array.isArray(catalog?.models) ? catalog.models : [])
+    .filter(m => backendIsVisible(m.backend) && m.backend === modelsTab);
+  paintBatchButtons(rows);
+});
+$("models-body").addEventListener("change", e => {
+  if (!e.target.classList.contains("model-check")) return;
+  const boxes = [...document.querySelectorAll(".model-check")];
+  const all = $("models-check-all");
+  all.checked = boxes.length > 0 && boxes.every(b => b.checked);
+  all.indeterminate = !all.checked && boxes.some(b => b.checked);
+  const catalog = overview?.models;
+  const rows = (Array.isArray(catalog?.models) ? catalog.models : [])
+    .filter(m => backendIsVisible(m.backend) && m.backend === modelsTab);
+  paintBatchButtons(rows);
+});
 
 // 幂等去重用的键：联合主键是 (model_id, backend)，但**渲染前还要再防一手**。
 // 第 3/4 步已把读库改成按行取（`load_model_rows`），同名两行不会再互相覆盖；
@@ -410,16 +447,25 @@ function renderModelRow(m) {
     ? `<button class="danger model-del" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"`
       + ` title="删除自定义模型「${esc(m.id)}」">删除</button>`
     : "";
-  // 列序与表头一致：模型（含删除）→ 来源 → 倍率 → 上下文 → 官方描述 → 状态。
-  // 表头已改为**文字**（倍率 / 上下文）：行内不再画列图标 —— 页签已经区分了
-  // 上游，行内那一对 ◭/⌘ 每行重复一遍是噪声（用户拍板）。
-  return `<tr><td class="model-name-cell"><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small>${del}</td>`
+  // 复选框（用户 2026-10-16 拍板）：批量操作改为只作用于**勾选的行**，
+  // 没勾选时批量按钮置灰。key = id + backend（同名模型两边各一行，id 不唯一）。
+  // 复选框自带行信息（data-model-key），批量逻辑不必再回头查行对象。
+  const key = modelKey(m);
+  // 列序与表头一致：选择 → 模型（含删除）→ 来源 → 倍率 → 上下文 → 官方描述 → 状态。
+  // 表头是**文字**（倍率 / 上下文）：行内不画列图标 —— 页签已经区分了上游，
+  // 行内那一对 ◭/⌘ 每行重复一遍是噪声（用户拍板）。
+  return `<tr><td class="model-check-cell"><input type="checkbox" class="model-check"`
+    + ` data-model-key="${esc(key)}" aria-label="选择 ${esc(m.id)}"></td>`
+    + `<td class="model-name-cell"><strong>${esc(m.id)}</strong><small class="cell-note">${esc(m.name || "")}</small>${del}</td>`
     + `<td>${sourceTag}</td>`
     + `<td>${credits}${promoNote}</td>`
     + `<td><span class="mono">${esc(ctxText(m))}</span></td>`
     + `<td class="model-desc-cell">${esc(m.description || "—")}</td>`
     + `<td>${stateCell}</td></tr>`;
 }
+
+// 行的唯一键：id + backend。同名模型跨后端各占一行，单凭 id 区分不开。
+const modelKey = m => m.backend ? `${m.backend}\u0000${m.id}` : m.id;
 
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;

@@ -684,8 +684,12 @@ class ModelRegistry:
                     # 反向模块级 import 会成环（与 db.py 里 `_canonical_column` 同因）。
                     from .db import _to_micro
                     entry["credits_micro"] = _to_micro(entry.get("credits"))
-                    if backend == self._default:
-                        entry["custom"] = bare in state["custom"]
+                    # custom 标志对所有后端都报（用户 2026-10-16 报告「Trae 的自定义
+                    # 模型没有删除按钮」）：add() 允许往任意后端加自定义项
+                    # （state["custom"] 按后端各存各的），快照却只给默认后端打标，
+                    # 前端拿 `m.custom` 判断就把 Trae 的自定义行漏掉了。删除走
+                    # remove() 的 state["custom"] 校验，本来就能删 —— 纯展示层丢标。
+                    entry["custom"] = bare in state["custom"]
                     entry["source"] = normalize_source(entry.get("source"))
                     stored = entry.pop("_promo", None)
                     # promo 列存的是上游活动文案（只做展示）；折后价仍由内置 PROMOTIONS
