@@ -288,5 +288,7 @@ pinned_models = ("fast-model", "balanced-model", "deep-model")
    `backend_for_model_id` **保留**（请求路径与 `add(mid)` 还要用）。
 5. **与总闸的关系**：账号行/模型行是否按后端启用的隐藏或置灰，
    由 `backend-toggle.md` 统一定，本方案不单独决定（避免两处各定一套）。
-6. **排期**：待定。前置依赖 `backend-toggle.md`（总闸）；本方案又是裸名自动
-   选后端（`model-routing-by-policy.md`）的输入（多行结构）。
+6. **排期**：✅ **第二位**（用户拍板顺序，2026-10-16：总闸 → 归属 → 路由）。
+   前置依赖 `backend-toggle.md`（总闸先落，本方案沿用它的「行按 `is_enabled` 隐藏」
+   惯例，不另定一套）；本方案又是裸名自动选后端（`model-routing-by-policy.md`）
+   的输入（`backend` 列 + 多行结构）。
