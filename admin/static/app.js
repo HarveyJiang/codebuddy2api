@@ -345,7 +345,12 @@ function renderModelGroup(g) {
   const anyEnabled = enabledCount > 0;
 
   // 后端标记：单后端直接打标；多后端在每个值前面标，读得出「哪个数属于哪个后端」。
-  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)} ${esc(backendLabel(m.backend))}</span>`;
+  //
+  // **只画 icon，不写后端名**（用户 2026-10-16 拍板）：多后端组里每个数值前都挂一个
+  // `WB` / `Trae` 文字，一列里堆两三个 pill，比数值本身还抢眼，读起来像表格在自说自话。
+  // icon 的形状+颜色已经能区分后端（颜色由后端声明经 /admin/api/backends 提供），
+  // 文字是冗余的。后端名移到 `title`，鼠标悬停仍可确认。
+  const tagFor = m => `<span class="mini-backend mini-${esc(m.backend || backends[0]?.name)}" title="${esc(backendName(m.backend))}">${backendIconSvg(m.backend)}</span>`;
   // 行前归属 icon（specs/model-backend-attribution.md §4.1）：纯 icon 无 pill
   // （复用账号表同款 .account-icon-backend），颜色由后端声明经 /admin/api/backends
   // 提供。多后端组按后端顺序并排，一眼看出这行跨了几条链路。
@@ -368,7 +373,11 @@ function renderModelGroup(g) {
 
   // 单后端删除（仅自定义项可删）。原来这里还有一个「全部启用/禁用」按钮，
   // 现在改用**点状态列**（见 stateCell）——同一个动作不该有两个入口。
-  const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}">删除${multi ? ` ${esc(backendLabel(m.backend))}` : ""}</button>`).join("");
+  //
+  // 多后端时不再在按钮上写后端名（用户 2026-10-16 拍板）：归并行的每个后端各有一个
+  // 删除按钮，写出来就是「删除 WB」「删除 Trae」并排两行 —— 归属已经由该列上方的
+  // 归属 icon 表达，按钮只留「删除」二字，后端名靠 `title` 提示。
+  const del = items.filter(m => m.custom).map(m => `<button class="danger" data-model-delete="${esc(m.id)}"${multi ? ` title="删除 ${esc(backendName(m.backend))} 下的 ${esc(m.id)}"` : ""}>删除</button>`).join("");
 
   // 多后端行的行名：当各成员的**裸名不一致**时用官方展示名，否则用裸名。
   //

@@ -41,6 +41,12 @@
    尺寸在这里定死（1em = 14px，与账号表同源），两个后端因此必然同尺寸。 */
 .model-id-line .account-icon{width:auto;height:auto;background:none;border-radius:0;font-size:14px;line-height:1}
 .model-line .mini-backend{flex-shrink:0}
+/* 倍率/上下文值前的后端标记：**只画 icon**（用户 2026-10-16 拍板，见 app.js tagFor）。
+   没有文字后，文字用的 1px 6px 内边距会让它变成一个空荡的长条，改成紧凑方片：
+   内边距减到 2px、字号提到 10px（图标跟着 em 放大到 10px，太小认不出形状）。
+   只作用于 .model-line —— 账号表、最近请求表的徽标仍带文字，不动。 */
+.model-line .mini-backend{padding:2px;font-size:10px;border-radius:5px;line-height:0}
+.model-line .mini-backend .backend-icon-svg{display:block;width:1em;height:1em}
 /* 徽标里的 SVG 跟着徽标字号走（9px）：用 em 而不是 px，改字号不必改这里。 */
 .mini-backend .backend-icon-svg{width:1em;height:1em}
 .mini-backend .backend-icon-text{font-size:1em}

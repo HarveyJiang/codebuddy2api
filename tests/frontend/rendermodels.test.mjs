@@ -124,9 +124,17 @@ const stepHtml = fn.renderModelGroup(step);
 check("step-5-preview 行内同时出现免费与 ×0.48",
       stepHtml.includes("免费") && stepHtml.includes("×0.48"));
 check("step-5-preview 行内两个后端标记都在",
-      (stepHtml.match(/mini-backend/g) || []).length >= 2
-      && stepHtml.includes("WB") && stepHtml.includes("Trae"),
+      (stepHtml.match(/mini-backend/g) || []).length >= 2,
       stepHtml.slice(0, 200));
+// 值前面的后端标记**只画 icon，不写后端名**（用户 2026-10-16 拍板）。
+// 这条是防回退的：曾经每个数值前都挂一个「WB」/「Trae」文字 pill。
+check("step-5-preview 值前的后端标记不带后端名文字",
+      !/>\s*WB\s*</.test(stepHtml) && !/>\s*Trae\s*</.test(stepHtml),
+      stepHtml.slice(0, 300));
+// 后端名只应出现在 title 属性里（悬停可确认）。
+check("step-5-preview 后端名保留在 title 里",
+      stepHtml.includes('title="WorkBuddy"') && stepHtml.includes('title="Trae"'),
+      stepHtml.slice(0, 300));
 check("行前归属图标渲染成内联 SVG（不是字符）",
       stepHtml.includes('class="backend-icon-svg"') && !stepHtml.includes(">⚡<"),
       stepHtml.slice(0, 260));
