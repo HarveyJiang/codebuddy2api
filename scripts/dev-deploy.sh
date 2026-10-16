@@ -6,11 +6,16 @@
 # 这个脚本把源码打包传到宿主机，在宿主机上 docker build，然后直接起一个
 # **与生产完全隔离**的开发实例指向 codebuddy-dev.2020224.xyz。
 #
-# 隔离的四件事（任何一条破了都可能影响生产）：
+# 隔离的三件事（任何一条破了都可能影响生产）：
 #   1. 容器名      workbuddy-oneclick  → workbuddy-dev
 #   2. 宿主机端口   8787                → 8788（都只绑 127.0.0.1）
-#   3. 数据目录    data/               → data/（整目录独立，state.db 不共享）
-#   4. 密钥        各自生成，永不复用生产的 ADMIN_KEY / API KEY
+#   3. 状态库      state.db            → 各自独立（dev 要跑 schema 迁移，且两套
+#                                       SQLite 并发写同一个库会真的锁坏）
+#
+# **密钥刻意与生产相同**（ADMIN_KEY / CODEBUDDY2OPENAI_KEY 直接取自生产 .env）：
+# 客户端只改 base URL 就能在 prod / dev 之间切，不用维护两套配置。
+# 这与「库要独立」不冲突——env 里的那个 API key 走 check_api 的 test_keys 兜底
+# 分支，根本不查库；库里那几条 key 才是各实例私有的。
 #
 # **账号用生产同一份凭据**（挂载生产的 auth 目录，不是复制）：
 #
@@ -45,6 +50,8 @@ DEV_URL="https://codebuddy-dev.2020224.xyz"
 
 # dev 直接挂生产同一份凭据目录（见文件头说明：挂载共享安全，复制才危险）
 SHARED_AUTH_DIR="${DEV_AUTH_DIR:-/opt/docker/workbuddy2api/data/auth}"
+# 密钥与生产共用，从生产的 .env 读取（脚本只在宿主机上 cat，不回显值）
+PROD_ENV="${DEV_PROD_ENV:-/opt/docker/workbuddy2api/.env}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -88,11 +95,11 @@ ok "已传输"
 # 传给远端。之前用不引用的 heredoc + 反斜杠转义 $ 是个坑：转义挡住了本地展开，
 # 远端 set -u 又会去展开同一个变量，结果 unbound。
 #
-# 参数：$1=DEV_DIR  $2=DEV_PORT  $3=DEV_TAG  $4=rebuild(0/1)  $5=共享 auth 目录
+# 参数：$1=DEV_DIR $2=DEV_PORT $3=DEV_TAG $4=rebuild $5=共享 auth 目录 $6=生产 .env
 ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes "$REMOTE" \
-    bash -s -- "$DEV_DIR" "$DEV_PORT" "$DEV_TAG" "$rebuild" "$SHARED_AUTH_DIR" <<'REMOTE_SCRIPT'
+    bash -s -- "$DEV_DIR" "$DEV_PORT" "$DEV_TAG" "$rebuild" "$SHARED_AUTH_DIR" "$PROD_ENV" <<'REMOTE_SCRIPT'
 set -euo pipefail
-DEV_DIR="$1"; DEV_PORT="$2"; DEV_TAG="$3"; REBUILD="$4"; SHARED_AUTH="$5"
+DEV_DIR="$1"; DEV_PORT="$2"; DEV_TAG="$3"; REBUILD="$4"; SHARED_AUTH="$5"; PROD_ENV="$6"
 
 # 必须先 export：下面的 compose heredoc 是**不引用**的，写文件时远端会展开
 # ${SHARED_AUTH_DIR}，那时还没定义的话 set -u 会直接报 unbound。
@@ -102,15 +109,55 @@ cd "$DEV_DIR"
 rm -rf src && mkdir -p src
 tar -xzf src.tar.gz -C src
 
-# 1) env —— 只在首次生成，之后复用。否则每次重建都换密钥，客户端全断线。
-if [ ! -f .env ]; then
-  umask 077
-  {
-    echo "ADMIN_KEY=admin-dev-$(openssl rand -hex 24)"
-    echo "CODEBUDDY2OPENAI_KEY=sk-dev-$(openssl rand -hex 24)"
-    echo "PORT=${DEV_PORT}"
-  } > .env
-  echo "  首次生成 .env（随机密钥，见 ${DEV_DIR}/.env）"
+# 1) env —— 密钥直接取自生产的 .env（不打印到日志）。
+#    每次部署重新生成：dev 侧没有任何需要保留的私有值，PORT 是常量。
+if [ ! -f "$PROD_ENV" ]; then
+  echo "  找不到生产 .env：$PROD_ENV" >&2
+  exit 1
+fi
+prod_admin=$(grep -E '^ADMIN_KEY=' "$PROD_ENV" | head -1 | cut -d= -f2-)
+prod_api=$(grep -E '^CODEBUDDY2OPENAI_KEY=' "$PROD_ENV" | head -1 | cut -d= -f2-)
+if [ -z "$prod_admin" ] || [ -z "$prod_api" ]; then
+  echo "  生产 .env 里 ADMIN_KEY / CODEBUDDY2OPENAI_KEY 缺失或为空" >&2
+  exit 1
+fi
+umask 077
+{
+  echo "ADMIN_KEY=${prod_admin}"
+  echo "CODEBUDDY2OPENAI_KEY=${prod_api}"
+  echo "PORT=${DEV_PORT}"
+} > .env
+
+# 共享密钥变了就重置 dev 库，理由必须讲清楚：
+# server.py 里「把 env 里的 initial_key 收编成一条 key」被
+#     if not accounts and not keys:
+# 门控 —— 那是**一次性引导**，不是持续同步。所以已经建过库的实例，
+# 换一个 CODEBUDDY2OPENAI_KEY 重启后并不会自动拥有新密钥，会静默 401。
+#
+# 这是产品设计而非缺陷：env 是引导种子，之后 DB 是唯一真相源；若改成每次启动
+# 都同步，UI 里建的 key 会被 env 覆盖，多密钥管理就废了。
+#
+# dev 的库本就是一次性的（要跑 schema 迁移、反复增删字段），所以这里在检测到
+# 共享密钥指纹变化时重置它，好让应用自己的收编逻辑重新跑一遍 —— 而不是从脚本
+# 里直接 INSERT keys 表（那会绕过应用、且列名随迁移变，脆）。
+fp_file="data/.shared-key-fp"
+new_fp=$(printf '%s' "$prod_api" | sha256sum | cut -c1-16)
+old_fp=$(cat "$fp_file" 2>/dev/null || echo "")
+# 指纹一变就必须重建容器——不只是「文件存在才重建」。env 的收编只发生在**启动时**
+# 且只在空库上，所以哪怕库文件已经不在了（上一轮删过），容器也仍持有旧内存里的
+# 旧密钥，不重启就等于没换。
+NEED_RESTART=0
+if [ "$new_fp" != "$old_fp" ]; then
+  if [ -f data/management/state.db ]; then
+    echo "  共享密钥已变 → 重置 dev 库"
+    rm -f data/management/state.db data/management/state.db-wal data/management/state.db-shm
+  else
+    echo "  共享密钥已变 → 库本就不存在，仍需重建以重新走启动收编"
+  fi
+  NEED_RESTART=1
+  printf '%s' "$new_fp" > "$fp_file"
+else
+  echo "  env：密钥复用生产（指纹 ${new_fp}，未变，保留 dev 库）"
 fi
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
@@ -164,7 +211,14 @@ else
 fi
 
 # 4) 起
-docker compose up -d
+#    重置过库就**必须**强制重建：env 没变时 compose 判定配置未变、不会重启，
+#    容器会继续用着旧内存（旧密钥），于是删了库却仍然 401 —— 删库不重建是白删。
+if [ "$NEED_RESTART" = "1" ]; then
+  echo "  强制重建容器（需重新走一遍启动收编，否则仍在用旧密钥的内存）"
+  docker compose up -d --force-recreate
+else
+  docker compose up -d
+fi
 
 # 5) 等健康（最多 90s）
 for _ in $(seq 1 45); do
@@ -202,7 +256,8 @@ fi
 echo
 ok "开发环境就绪：$DEV_URL"
 cat <<INFO
-  · 管理密钥：ssh -p ${SSH_PORT} ${REMOTE} 'cat ${DEV_DIR}/.env'
+  · 密钥与生产相同，直接用 https://codebuddy.2020224.xyz 的那套
+  · dev 私有配置：ssh -p ${SSH_PORT} ${REMOTE} 'cat ${DEV_DIR}/.env'（内容=生产密钥+PORT）
   · 看日志：  scripts/dev-deploy.sh --logs
   · 进容器：  scripts/dev-deploy.sh --shell
   · 重新部署（改了源码就再跑一次本脚本，不用提交 GitHub）
