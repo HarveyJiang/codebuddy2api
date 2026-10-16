@@ -609,6 +609,16 @@ class ModelRegistry:
                      "context_length": (state["catalog"].get(mid) or {}).get("max_input_tokens") or 131072}
                     for mid in state["available"] if mid in state["catalog"]]
 
+    def catalog_updated(self, backend):
+        """该后端目录的「上次拉取时刻」；0 表示**从没拉到过**（仍是静态兜底）。
+
+        启动路径据此判断要不要拉一次动态目录（见 ``server._refresh_missing_catalogs``）：
+        0 才拉，已有快照就不打扰上游。对外提供这个读数是为了让 server 侧不必
+        伸手进 ``_state`` 私有结构。
+        """
+        with self._lock:
+            return int(self._state_for(backend)["updated"])
+
     # -- queries -----------------------------------------------------------
     def snapshot(self):
         """Full catalog with management flags and current promo, for the admin UI.

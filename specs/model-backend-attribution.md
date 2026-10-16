@@ -377,7 +377,79 @@ pinned_models = ("fast-model", "balanced-model", "deep-model")
 大忌**，这次真被咬到了。拆成 v13 后，无论 v12 是哪个版本写的，它都会跑到。
 `test_v12_db_without_deleted_column_is_upgraded` 专门造出那个半成品状态来守这条。
 
-### 10.6 遗留
+### 10.6 dev 验收反馈的三个修正（2026-10-16）
+
+用户在 dev 上验收后报了两个问题，排查下来是三个修正（第三项是前两项的连带）。
+
+**① Trae 全显示「内置(builtin)」——最要紧的一个**
+
+用户原话：「不是通过接口拉取上游的么」。查实：`trae` 的 20 行 `synced_at = 0`，
+即 **`refresh_catalog("trae")` 从未成功过**。
+
+根因不在 `fetch_models`（实测能正常返回 **24 条**真实数据，含倍率），而在
+**启动路径只铺静态兜底、从不拉动态目录**：
+
+```
+create_app() 里对每个后端只做 ensure_static_catalog(name)，
+动态目录只有两条路会用上 —— 每天 04:00 的 models_worker，和管理页的
+「刷新」按钮（POST /admin/api/models/refresh）。
+```
+
+于是任何新部署的实例，在整个白天里看到的都是静态表（`source=builtin`），
+直到次日 04:00。这与「Trae 明明能调通」矛盾，就是用户看到的怪象。
+
+修法：新增 `server._refresh_missing_catalogs(registry)`，在启动时对
+**「从没拉到过」（`catalog_updated(name) == 0`）的非默认后端**各拉一次。
+- 判据用 0（没拉到过），不是「每次启动都拉」——重启远比 04:00 频繁，
+  已有快照就不该再打扰上游；
+- 失败一律吞掉，继续用静态兜底，绝不因此让启动失败
+  （与 `refresh_catalog` 的「失败保留上次快照」语义一致）；
+- 为此在 `ModelRegistry` 上开了公开读数 `catalog_updated(backend)`，
+  server 侧不再伸手进 `_state` 私有结构。
+
+**② 排序「和需求不一致」——实为 ① 的连带**
+
+逐行核验过：四层排序在真实数据上**严格单调、0 处违规**。用户之所以觉得
+不一致，是因为 ① 让 Trae 的 20 行停在了 `builtin` 段，而 `builtin` 段里
+「3 条 WorkBuddy + 20 条 Trae」是混排的 —— 看起来 Trae 被夹在中间、不成块。
+① 修好、Trae 变成 24 行 `upstream` 后，自然形成
+「自定义 → 内置三档 → WorkBuddy 上游 → Trae 上游」两后端各成一块。
+**排序代码一行未改**（用户已确认按此方向）。
+
+**③ `◈` / `⚡` 视觉大小不一**
+
+两个后端用的是**同一个类** `.account-icon-backend`，字号本应一样；差异来自字形
+本身（`⚡` 比 `◈` 填得满，同字号下更宽更高）。原值 `font-size:16px` 又是从容器
+`.account-icon` 的 `font:20px Georgia,serif` 简写里「漏」出来的。修法：
+- `.account-icon-backend` 显式钉死 `font:14px/1 Georgia,serif` + 22×22 盒
+  （不再依赖容器简写）；
+- `.model-id-line .account-icon`（模型名前的场景）再钉一次 `font-size:14px`，
+  这样 flex 容器里两个字形用同一字号，宽窄差异不被放大。
+
+**三条修正的回归测试**（`tests/admin/test_catalog_backends.py`，新增 13 条）：
+`CatalogUpdatedAccessorTests`（读数语义与跨重启往返）、`StartupRefreshTests`
+（拉/不拉/失败/被总闸关四态，**用记账断言而非抛异常**）、
+`StartupRefreshThroughCreateAppTests`（走完整 `create_app`，钉住「启动路径确实
+调了这个函数」）。
+
+变异验证（实测，全部被抓）：
+| 变异 | 结果 |
+|---|---|
+| 删掉 `create_app` 里的调用 | ✅ 1 条红（仅端到端那条能抓，故必须走 create_app） |
+| 删掉「已有快照就不拉」守卫 | ✅ 1 条红 |
+| `catalog_updated` 恒返回 0 | ✅ 5 条红 |
+
+两处**测试写法**上的教训值得记：
+- 「抛异常＝不该被调用」在这个函数上**证明不了任何事** —— `refresh_catalog`
+  会吞掉 `Exception`（失败保留快照是其既有语义），删掉守卫后测试照样全绿。
+  必须改成**记账并断言调用次数为 0**。
+- 直接调 `_refresh_missing_catalogs` 的单测抓不住「`create_app` 忘记调它」，
+  所以补了一条走完整启动路径的用例。
+- `conftest.py` 的 `no_upstream_catalog_fetch` 装置**同步**补上了对
+  `_refresh_missing_catalogs` 的打桩（它同样会在启动时同步出网），
+  测它本身的用例用 `@pytest.mark.real_catalog_check` 关掉打桩。
+
+### 10.7 遗留
 
 - 无阻塞项。删除的持久化、带前缀模型的增删、迁移半成品修复都已在 dev 实测通过
   （删除后重启不复活，行以 `deleted=1` 保留供日志 join）。

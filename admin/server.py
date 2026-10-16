@@ -886,6 +886,35 @@ def _stale_catalog(registry):
     return credits != sorted(credits)
 
 
+def _refresh_missing_catalogs(registry):
+    """给「从没拉到过动态目录」的非默认后端各拉一次。返回是否有任何一份拉到。
+
+    为什么需要这一步：启动时的 ``ensure_static_catalog`` 只给每个后端铺**静态
+    兜底表**，动态目录原本全靠 04:00 的定时任务。于是新部署的实例在整整一个
+    白天里，Trae 的 20 条静态行都标着 ``source=builtin``——而它明明是能调通的
+    上游模型。用户看到「不是通过接口拉取上游的么」正是这个。
+
+    「从没拉到过」的判据是 ``state["updated"] == 0``（``load()`` 会把行上的
+    ``synced_at`` 汇总回 state）：已有快照的后端**不打扰上游**，避免每次重启
+    都多打一次接口——重启远比 04:00 频繁。
+
+    失败一律吞掉：拉目录是锦上添花，拉不到就继续用静态兜底，绝不因此让启动
+    失败（与 ``refresh_catalog`` 自身的「失败保留上次快照」语义一致）。
+    """
+    default = default_backend()
+    got_any, logger = False, logging.getLogger("admin.server")
+    for name in known_backends():
+        if name == default:
+            continue
+        if registry.catalog_updated(name):
+            continue
+        try:
+            got_any = registry.refresh_catalog(name) or got_any
+        except Exception:
+            logger.exception("启动时拉取 %s 的模型目录失败（保留静态兜底）", name)
+    return got_any
+
+
 def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=True):
     cfg = config.get()
     # 只在本进程还没配过日志时初始化：让 `uvicorn admin.server:create_app` 这类
@@ -945,6 +974,13 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     if _stale_catalog(model_registry):
         model_registry.fetch()
         model_registry.ensure_builtin()
+        model_registry.persist(store.db)
+    # 非默认后端的动态目录也要在**启动时**拉一次，否则新部署的实例在整个白天
+    # 都显示静态兜底表（source=builtin），直到 04:00 的定时任务才变成上游数据——
+    # 用户看到的现象就是「Trae 明明能调通，管理页却全标着『内置』」。
+    # 与上面的 _stale_catalog 同一模式：只在**确实没拉到过**时拉（updated=0），
+    # 已有快照就不打扰上游；拉失败也不影响启动，静态兜底照旧生效。
+    if _refresh_missing_catalogs(model_registry):
         model_registry.persist(store.db)
     @asynccontextmanager
     async def lifespan(app):

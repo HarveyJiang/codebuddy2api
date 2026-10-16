@@ -59,6 +59,10 @@ def no_upstream_catalog_fetch(monkeypatch, request):
     if "real_catalog_check" in request.keywords:
         return
     monkeypatch.setattr(admin_server, "_stale_catalog", lambda registry: False)
+    # 同一处也要挡住「非默认后端没拉到过就拉一次」（``_refresh_missing_catalogs``）：
+    # 它同样会在启动时**同步**出网（Trae 拿自己的账号打上游）。测试里的凭据是
+    # 假的，真打必然超时；要测这个函数的用例直接 import 它自己调，不经启动路径。
+    monkeypatch.setattr(admin_server, "_refresh_missing_catalogs", lambda registry: False)
 
 
 def credential(uid="one", name="测试账号"):

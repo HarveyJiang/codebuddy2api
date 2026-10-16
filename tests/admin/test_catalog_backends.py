@@ -18,6 +18,8 @@ import time
 import unittest
 from pathlib import Path
 
+import pytest
+
 from admin.db import Database
 from admin.models import ModelRegistry
 import core.backends.trae as T
@@ -253,6 +255,239 @@ class CatalogToggleTests(unittest.TestCase):
             seen.add(b)
         self.assertEqual(len(order), len(seen), f"后端行交错排列：{order}")
         self.assertEqual(order[0], "workbuddy", "默认后端应排在最前")
+
+
+class CatalogUpdatedAccessorTests(unittest.TestCase):
+    """``catalog_updated(backend)``：启动路径判断「要不要拉动态目录」的公开读数。
+
+    server 侧不再伸手进 ``_state`` 私有结构（``registry._state_for(x)["updated"]``），
+    而是问这一个方法。它必须与内部 state 完全同源、且**不把裸 0 与「拉过但空表」
+    混起来**——0 只有一个含义：从没拉到过，用静态兜底。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "state.db")
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_zero_when_never_fetched(self):
+        """静态兜底铺好但没拉过 → 0（启动路径据此决定拉一次）。"""
+        reg = registry()
+        reg.ensure_static_catalog("trae")
+        self.assertEqual(reg.catalog_updated("trae"), 0)
+
+    def test_nonzero_after_successful_refresh(self):
+        """拉到动态目录后 > 0（启动路径据此**不**再打扰上游）。"""
+        reg = registry(clock=lambda: 1_700_000_000)
+        reg.ensure_static_catalog("trae")
+
+        class FakeManager:
+            def fetch_models(self):
+                return [{"id": "dyn", "name": "Dyn", "context_length": 1024}]
+
+        reg.backend_credential_getter = lambda _b: FakeManager()
+        self.assertTrue(reg.refresh_catalog("trae"))
+        self.assertEqual(reg.catalog_updated("trae"), 1_700_000_000)
+
+    def test_survives_round_trip(self):
+        """跨重启读得回来 —— 否则每次重启都会多拉一次上游。"""
+        reg = registry()
+        reg.ensure_static_catalog("trae")
+        reg._state_for("trae")["updated"] = 1_700_000_000
+        reg._state_for("trae")["catalog"]["dyn"] = {"name": "Dyn", "source": "upstream"}
+        reg._state_for("trae")["available"].append("dyn")
+        reg.persist(self.db)
+
+        reg2 = registry()
+        reg2.load(self.db)
+        self.assertEqual(reg2.catalog_updated("trae"), 1_700_000_000)
+
+    def test_tracks_backends_independently(self):
+        """一个后端的时刻不影响另一个（启动路径按后端逐个判断）。"""
+        reg = registry()
+        reg.ensure_builtin()
+        reg.ensure_static_catalog("trae")
+        reg._state_for("workbuddy")["updated"] = 1_600_000_000
+        self.assertEqual(reg.catalog_updated("workbuddy"), 1_600_000_000)
+        self.assertEqual(reg.catalog_updated("trae"), 0)
+
+
+@pytest.mark.real_catalog_check   # 测的就是这个函数本身，别被 conftest 桩掉
+class StartupRefreshTests(unittest.TestCase):
+    """启动时给「从没拉到过」的非默认后端各拉一次动态目录。
+
+    回归：#98a5f31 部署后 Trae 的 20 条一直标 ``source=builtin``，因为启动路径
+    只铺静态兜底、动态目录全靠 04:00 定时任务。用户看到的就是「不是通过接口
+    拉取上游的么」。这个类钉住修复：**没拉到过就拉，拉到了就不打扰，拉失败也
+    不影响启动**。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "state.db")
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def _registry(self):
+        reg = registry()
+        reg.ensure_builtin()
+        reg.ensure_static_catalog("trae")
+        return reg
+
+    def test_fetches_when_never_fetched(self):
+        """从没拉过 → 拉一次，Trae 行由 builtin 变 upstream。"""
+        from admin.server import _refresh_missing_catalogs
+        reg = self._registry()
+
+        class FakeManager:
+            def fetch_models(self):
+                return [{"id": "dyn-a", "name": "DynA", "context_length": 2048}]
+
+        reg.backend_credential_getter = lambda _b: FakeManager()
+        self.assertTrue(_refresh_missing_catalogs(reg))
+        self.assertEqual([m["id"] for m in reg.catalog_entries("trae")], ["dyn-a"])
+        self.assertGreater(reg.catalog_updated("trae"), 0)
+
+    def test_skips_when_already_fetched(self):
+        """已有快照 → 不打扰上游（重启远比 04:00 频繁）。
+
+        记账而不是靠抛异常：``refresh_catalog`` 会把 ``Exception`` 吞掉（失败保留
+        上次快照是它的既有语义），所以「抛了就算失败」在这里证不了任何事 ——
+        必须断言**调用次数为 0**。这条是变异测试逼出来的：最初用 ``Boom`` 抛异常，
+        删掉守卫后测试仍全绿。
+        """
+        from admin.server import _refresh_missing_catalogs
+        reg = self._registry()
+        reg._state_for("trae")["updated"] = 1_700_000_000
+
+        hits = []
+
+        class Rec:
+            def fetch_models(self):
+                hits.append(1)
+                return [{"id": "x", "name": "X", "context_length": 1}]
+
+        reg.backend_credential_getter = lambda _b: Rec()
+        self.assertFalse(_refresh_missing_catalogs(reg))
+        self.assertEqual(hits, [], "已有快照时不该再拉上游")
+
+    def test_never_touches_default_backend(self):
+        """默认后端不在这里拉 —— 它有自己的 fetch()/静态兜底路径。"""
+        from admin.server import _refresh_missing_catalogs
+        reg = registry()      # 默认后端也没有快照
+
+        seen = []
+
+        class Rec:
+            def fetch_models(self):
+                seen.append("trae")
+                return [{"id": "x", "name": "X", "context_length": 1}]
+
+        reg.backend_credential_getter = lambda b: (seen.append(b), Rec())[1]
+        _refresh_missing_catalogs(reg)
+        self.assertNotIn("workbuddy", seen)
+
+    def test_failure_does_not_raise(self):
+        """拉失败静默吞掉：启动不该因拉目录失败而挂。"""
+        from admin.server import _refresh_missing_catalogs
+        reg = self._registry()
+
+        class Boom:
+            def fetch_models(self):
+                raise T.TraeAPIError("boom", status=500)
+
+        reg.backend_credential_getter = lambda _b: Boom()
+        self.assertFalse(_refresh_missing_catalogs(reg))   # 不抛
+        self.assertEqual(len(reg.catalog_entries("trae")), 20)  # 静态兜底还在
+
+    def test_disabled_backend_is_not_fetched(self):
+        """总闸关掉的后端不拉（refresh_catalog 自身的前置守卫）。
+
+        同样用记账而非抛异常 —— 让「关掉的后端确实没被碰」变成可断言的事实。
+        """
+        from admin.server import _refresh_missing_catalogs
+        from core.backends.registry import set_enabled_provider
+        reg = self._registry()
+
+        hits = []
+
+        class Rec:
+            def fetch_models(self):
+                hits.append(1)
+                return [{"id": "x", "name": "X", "context_length": 1}]
+
+        reg.backend_credential_getter = lambda _b: Rec()
+        set_enabled_provider(lambda: {"trae": False})
+        try:
+            self.assertFalse(_refresh_missing_catalogs(reg))
+            self.assertEqual(hits, [], "被总闸关掉的后端不该拉")
+        finally:
+            set_enabled_provider(lambda: {})
+
+
+class StartupRefreshThroughCreateAppTests(unittest.TestCase):
+    """端到端钉住「启动路径**确实调了** _refresh_missing_catalogs」。
+
+    上面那组单测直接调函数，所以「把 create_app 里的调用删掉」这种变异抓不住
+    ——实测确认过。这里补一条走完整 ``create_app`` 的用例：造一个真实的 Trae
+    凭据文件 + 打桩的上游，启动后断言 Trae 目录已变成动态表。
+
+    用 ``real_catalog_check`` 关掉 conftest 里对 ``_refresh_missing_catalogs``
+    的自动打桩，否则测不到真路径。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @pytest.mark.real_catalog_check
+    def test_create_app_fetches_trae_catalog_on_boot(self):
+        import json as _json
+        from fastapi.testclient import TestClient
+        from admin.server import create_app
+        from conftest import credential
+
+        auth = Path(self.tmp.name) / "auth"
+        auth.mkdir()
+        # 必须是一份 backend=trae 的凭据，make_credential 才会分派 TraeCredentialManager。
+        # refreshToken 是 validate_credential 的硬要求，缺了这份账号直接被拒收。
+        (auth / "trae-1.info").write_text(_json.dumps({
+            "backend": "trae",
+            "account": {"uid": "trae-1", "nickname": "t"},
+            "auth": {"accessToken": "tok", "refreshToken": "rtok",
+                     "expiresAt": int(time.time()) + 3600},
+        }), encoding="utf-8")
+        # 默认后端的账号也放一份：不然后端总闸的「≥1 启用」等启动检查可能报警。
+        (auth / "wb-1.info").write_text(_json.dumps(credential(uid="wb-1")), encoding="utf-8")
+
+        calls = []
+
+        def fake_fetch(self):
+            calls.append(1)
+            return [{"id": "dyn-trae", "name": "DynTrae", "context_length": 4096, "credits": 0.5}]
+
+        import core.backends.trae as _trae
+        orig = _trae.TraeCredentialManager.fetch_models
+        _trae.TraeCredentialManager.fetch_models = fake_fetch
+        try:
+            app = create_app(str(Path(self.tmp.name) / "mgmt"), str(auth),
+                             "k", "admin-key-long-enough-123")
+            client = TestClient(app)
+            with client:   # 触发 lifespan
+                pass
+        finally:
+            _trae.TraeCredentialManager.fetch_models = orig
+
+        self.assertTrue(calls, "create_app 启动时必须拉一次 Trae 目录")
+        reg = app.state.store  # 仅确认 app 建起来了
+        self.assertIsNotNone(reg)
 
 
 if __name__ == "__main__":
