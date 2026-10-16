@@ -557,3 +557,18 @@ class ListedMetaTests(unittest.TestCase):
         # 上下文缺失时兜底 131072，不是 None（与 catalog_entries 同口径）。
         for row in meta.values():
             self.assertIsInstance(row["context_length"], int)
+
+    def test_upstream_payload_carries_output_and_capability_fields(self):
+        """上游 maxOutputTokens / 能力标志透传到 listed_meta（用户 2026-10-16）。
+
+        models.json 添加模型要手填输出上限、勾能力开关 —— 上游给了就直接给出。
+        """
+        registry = self._registry()
+        meta = registry.listed_meta()
+        for mid, row in meta.items():
+            # 布尔能力字段要么缺席、要么是真布尔 —— 绝不能是 None 混进响应。
+            for k in ("supports_tool_call", "supports_images", "supports_reasoning"):
+                if k in row:
+                    self.assertIsInstance(row[k], bool)
+            if "max_output_tokens" in row:
+                self.assertIsInstance(row["max_output_tokens"], int)

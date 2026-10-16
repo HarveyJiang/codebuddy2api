@@ -651,7 +651,9 @@ def list_models(
             # 行自带 backend 时直接用它（每行一个后端）；否则按 §9.6 判策略第一名
             # （客户端拿这个判断「这个 id 实际会路由到谁」）。
             "owned_by": spec_for(backend or _owner_backend_for(mid)).owned_by,
-            **({k: meta[mid] for k in ("context_length", "credits", "description")
+            **({k: meta[mid] for k in ("context_length", "max_output_tokens",
+                                       "supports_tool_call", "supports_images",
+                                       "supports_reasoning", "credits", "description")
                 if meta.get(mid, {}).get(k) is not None} if meta else {}),
         }
         for mid, backend in rows

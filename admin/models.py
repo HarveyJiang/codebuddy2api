@@ -470,11 +470,18 @@ class ModelRegistry:
                     builtin = BUILTIN_MODELS.get(mid)
                     if builtin is not None and builtin.get("description"):
                         description = builtin["description"]
+                # 输出上限与能力标志：models.json 添加模型时要手填 maxOutputTokens、
+                # 勾能力开关 —— 上游给了就直接透传（用户 2026-10-16）。布尔字段
+                # 上游可能省略（省略 ≠ False），存 None 表示「未知」，展示层不渲染。
                 catalog[mid] = {
                     "name": raw.get("name") if isinstance(raw.get("name"), str) else mid,
                     "description": description,
                     "credits": _credits_multiplier(raw.get("credits")),
                     "max_input_tokens": max_in if isinstance(max_in, int) else None,
+                    "max_output_tokens": raw.get("maxOutputTokens") if isinstance(raw.get("maxOutputTokens"), int) else None,
+                    "supports_tool_call": raw.get("supportsToolCall") if isinstance(raw.get("supportsToolCall"), bool) else None,
+                    "supports_images": raw.get("supportsImages") if isinstance(raw.get("supportsImages"), bool) else None,
+                    "supports_reasoning": raw.get("supportsReasoning") if isinstance(raw.get("supportsReasoning"), bool) else None,
                     "source": SOURCE_UPSTREAM,
                 }
                 available.append(mid)
@@ -611,12 +618,14 @@ class ModelRegistry:
         return True
 
     def listed_meta(self):
-        """`/v1/models` 每行的元数据：裸名 -> {context_length, credits, description}。
+        """`/v1/models` 每行的元数据：裸名 -> 上下文/输出上限/能力/倍率/描述。
 
-        外部工具（cherry studio、one-api 等）添加模型时必须手动填上下文长度 ——
-        直接在 /v1/models 里给出，工具能自动带出（用户 2026-10-16）。同名模型
-        在两个后端各一行时取**先注册的后端**值（倍率可能不同，取第一个遇到的；
-        展示用途，精度足够）。上下文缺失时报 131072 兜底（与 catalog_entries 同口径）。
+        外部工具（cherry studio、one-api、models.json 等）添加模型时必须手动填
+        上下文长度、输出上限并勾能力开关 —— 直接在 /v1/models 里给出，工具能
+        自动带出（用户 2026-10-16）。同名模型在两个后端各一行时取**先注册的
+        后端**值（倍率可能不同，取第一个遇到的；展示用途，精度足够）。
+        上下文缺失时报 131072 兜底（与 catalog_entries 同口径）；其余字段缺失
+        （None）时该字段整体省略，不给客户端「看起来有值其实是猜的」错觉。
         """
         with self._lock:
             out = {}
@@ -626,11 +635,18 @@ class ModelRegistry:
                     if mid in out:
                         continue
                     entry = state["catalog"].get(mid) or {}
-                    out[mid] = {
+                    row = {
                         "context_length": entry.get("max_input_tokens") or 131072,
                         "credits": entry.get("credits"),
                         "description": entry.get("description"),
                     }
+                    for src, dst in (("max_output_tokens", "max_output_tokens"),
+                                     ("supports_tool_call", "supports_tool_call"),
+                                     ("supports_images", "supports_images"),
+                                     ("supports_reasoning", "supports_reasoning")):
+                        if entry.get(src) is not None:
+                            row[dst] = entry[src]
+                    out[mid] = row
             return out
 
     def catalog_entries(self, backend):
