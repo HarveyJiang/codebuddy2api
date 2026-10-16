@@ -69,8 +69,60 @@ function goPage(next) {
   if (next === "usage") initUsagePage();
   if (next === "settings") loadBackups().catch(e => toast(e.message));
 }
+// 密钥列表的排序 / 筛选（specs/keys-last-used-at.md §8）。密钥总数是个位数到几十，
+// overview 一次全量返回，所以前端做即可，不引入服务端参数。默认不排序——
+// 保持既有插入顺序，不因新增一列就悄悄改变顺序。
+let keysSort = {key: null, dir: 0};
+const SEC = 1000;
+// 「从未使用」（last_used_at 为空）**无论升降序一律排最后**。
+// 升序时 0 会天然顶到最前，看起来像「最久没用」——但「从未使用」和「一年前用过
+// 一次」不是一回事，前者更可能是配错的 key，混排会让清理优先级判断错。
+const lastUsedRank = k => (k.last_used_at ? 0 : 1);
+function sortKeys(keys) {
+  const {key, dir} = keysSort;
+  if (!key || !dir) return keys;
+  const val = k => key === "name" ? String(k.name || "")
+    : key === "count" ? (k.usage?.count || 0)
+    : key === "last_used_at" ? (k.last_used_at || 0)
+    : (k.created || 0);
+  return [...keys].sort((a, b) => {
+    if (key === "last_used_at") {
+      const rank = lastUsedRank(a) - lastUsedRank(b);
+      if (rank) return rank;
+    }
+    const x = val(a), y = val(b);
+    const cmp = typeof x === "string" ? x.localeCompare(y) : x - y;
+    return cmp * dir;
+  });
+}
+function filterKeys(keys) {
+  const mode = $("keys-filter-mode")?.value || "";
+  if (!mode) return keys;
+  const now = Date.now() / 1000;
+  if (mode === "never") return keys.filter(k => !k.last_used_at);
+  if (mode === "today") {
+    // 北京时间今天 00:00（与后端 _today() 同口径）。
+    const cn = new Date(Date.now() + (8 * 60 + new Date().getTimezoneOffset()) * 60000);
+    const midnight = Math.floor(new Date(cn.getFullYear(), cn.getMonth(), cn.getDate()).getTime() / SEC);
+    return keys.filter(k => (k.last_used_at || 0) >= midnight);
+  }
+  const days = mode === "stale-1d" ? 1 : 7;
+  return keys.filter(k => k.last_used_at && k.last_used_at < now - days * 86400);
+}
+function paintKeysSort() {
+  document.querySelectorAll("[data-sort]").forEach(th => {
+    const on = th.dataset.sort === keysSort.key && keysSort.dir;
+    th.dataset.active = on ? (keysSort.dir > 0 ? "asc" : "desc") : "";
+    // 指针样式 + 方向箭头都在 th 上，不另找 CSS：表头本来就该可点。
+    th.style.cursor = "pointer";
+    th.title = on ? (keysSort.dir > 0 ? "升序（点击改为降序）" : "降序（点击取消排序）")
+                  : "点击按此列排序";
+  });
+}
+
 function render() {
-  const {accounts, keys, models, events} = overview;
+  const {accounts, models, events} = overview;
+  const keys = sortKeys(filterKeys(overview.keys || []));
   renderLoginModes();
   const active = accounts.find(a => a.enabled && a.pool_state === "available") || accounts.find(a => a.enabled);
   paintVersion(overview.version?.label);
@@ -101,8 +153,11 @@ function render() {
     const expired = !!k.expires_at && k.expires_at <= now;
     const scope = (list, noun) => (Array.isArray(list) && list.length)
       ? `<span class="pill amber" title="${esc(list.join(", "))}">${list.length} 个${noun}</span>` : `<span class="muted">全部</span>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型、可用账号与分配策略">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${k.last_used_at ? `<span class="mono">${esc(stamp(k.last_used_at * 1000))}</span>` : '<span class="muted">从未使用</span>'}</td><td>${scope(k.models, "模型")}</td><td>${scope(k.accounts, "账号")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td><td class="align-right"><div class="actions">${revoked ? "" : `<button data-bind="${k.id}" title="设置可用模型、可用账号与分配策略">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button><button data-limit="${k.id}" title="设置每日最大请求数">限额</button><button data-toggle="${k.id}">${k.enabled ? "停用" : "恢复"}</button>`}<button class="danger" data-revoke="${k.id}">撤销</button></div></td></tr>`;
   }).join("");
+  paintKeysSort();
+  const shown = keys.length, total = (overview.keys || []).length;
+  $("keys-filter-note").textContent = shown === total ? "" : `显示 ${shown} / ${total} 个`;
   renderModels();
   const modelIds = Array.isArray(models?.models) ? models.models.filter(m => m.enabled).map(m => m.id) : [];
   const selected = $("model").value || "deepseek-v4-flash";
@@ -820,6 +875,16 @@ $("accounts-body").addEventListener("click", async e => {
   if (b.dataset.action === "toggle") confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？", "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。", () => update({enabled:!a.enabled}));
   if (b.dataset.action === "delete") confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。`, () => api("accounts/" + a.id, {method:"DELETE"}));
 });
+// 表头排序：点击同一列在 升 → 降 → 取消 之间循环。
+document.querySelectorAll("[data-sort]").forEach(th => th.addEventListener("click", () => {
+  const key = th.dataset.sort;
+  keysSort = keysSort.key === key
+    ? {key, dir: keysSort.dir === 1 ? -1 : (keysSort.dir === -1 ? 0 : 1)}
+    : {key, dir: 1};
+  render();
+}));
+$("keys-filter-mode").addEventListener("change", render);
+
 $("keys-body").addEventListener("click", e => {
   // 分配策略做成「图标 + 短名」的 chip，点击进设置弹框统一编辑（与「设置」按钮同一个弹框）。
   const chip = e.target.closest("[data-routing-edit]");

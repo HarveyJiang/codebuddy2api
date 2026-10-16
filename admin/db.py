@@ -197,7 +197,21 @@ def _v9_to_v10(db):
         db._write.execute("ALTER TABLE settings ADD COLUMN backend_enabled TEXT NOT NULL DEFAULT '{}'")
 
 
-SCHEMA_VERSION = 10
+def _v10_to_v11(db):
+    """v10 → v11：给 keys 补 last_used_at（specs/keys-last-used-at.md）。
+
+    可空、无回填：历史调用没有逐 key 留时刻（``key_usage_daily`` 只有按天聚合，
+    精度到天，答不了「现在还在用吗」），回填不出来。NULL 即「从未使用」。
+
+    写入零额外开销——``keys_dirty`` 本来就因 ``usage.count`` 每次请求都置位，
+    新增这个 int 走的是同一条 5 秒防抖 flush，不增加任何落库次数。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(keys)")}
+    if "last_used_at" not in columns:
+        db._write.execute("ALTER TABLE keys ADD COLUMN last_used_at INTEGER")
+
+
+SCHEMA_VERSION = 11
 
 MICRO = 1_000_000
 
@@ -232,6 +246,9 @@ ACCOUNT_INT_COLUMNS = frozenset(ACCOUNT_STATUS_COLUMNS) - {
 KEY_COLUMNS = (
     "name", "hash", "hint", "created", "enabled", "revoked_at", "expires_at", "daily_limit",
     "usage_date", "usage_count", "usage_tokens", "models", "accounts", "routing",
+    # 最后一次通过鉴权且未超配额的时刻（specs/keys-last-used-at.md §2）。
+    # 可空：历史调用没有逐 key 留时刻，NULL 即「从未使用」。
+    "last_used_at",
 )
 
 MODEL_COLUMNS = (
@@ -332,7 +349,8 @@ class Database:
         revoked_at INTEGER, expires_at INTEGER, daily_limit INTEGER,
         usage_date TEXT, usage_count INTEGER NOT NULL DEFAULT 0,
         usage_tokens INTEGER NOT NULL DEFAULT 0,
-        models TEXT NOT NULL DEFAULT '[]', accounts TEXT NOT NULL DEFAULT '[]', routing TEXT)"""
+        models TEXT NOT NULL DEFAULT '[]', accounts TEXT NOT NULL DEFAULT '[]', routing TEXT,
+        last_used_at INTEGER)"""
 
     # 逐条执行而不用 executescript()：后者会先隐式 COMMIT，
     # 把外层显式事务直接结束掉，导致随后 COMMIT 报 no transaction is active。
@@ -545,7 +563,7 @@ class Database:
     # -- migrations ---------------------------------------------------------
     # (目标版本, 迁移函数)，按目标版本升序；pending 取 target > current 的。
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
-                  (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10))
+                  (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -676,7 +694,12 @@ class Database:
                          _to_int(usage.get("tokens")),
                          _dumps(_decode_list(item.get("models"))),
                          _dumps(_decode_list(item.get("accounts"))),
-                         item.get("routing")))
+                         item.get("routing"),
+                         # 原样传，不走 _to_int：那个函数把 None 变成 0，
+                         # 会把「从未使用」写成 0（1970 年）。这里 NULL 必须
+                         # 保持 NULL —— 前端按真值判断显示「从未使用」，
+                         # 而将来的「早于某时间」比较也依赖 0 与 NULL 可区分。
+                         item.get("last_used_at")))
         with self.transaction():
             self._write.execute("DELETE FROM keys")
             self._write.executemany(

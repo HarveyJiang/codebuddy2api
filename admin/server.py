@@ -278,7 +278,10 @@ class Store:
                 "usage": {"date": row.get("usage_date"), "count": row.get("usage_count", 0),
                           "tokens": row.get("usage_tokens", 0)},
                 "models": row.get("models") or [], "accounts": row.get("accounts") or [],
-                "routing": row.get("routing")}
+                "routing": row.get("routing"),
+                # 必须恢复：不恢复的话重启后内存里没这个键，save_keys 会把
+                # item.get("last_used_at") 缺失值(None) 写回 DB，永久抹掉。
+                "last_used_at": row.get("last_used_at")}
         settings = self.db.get_settings()
         # 池设置可能来自旧数据（缺新字段），用默认值补齐缺失项。
         self.data["pool"] = {**AccountPool.POOL_DEFAULTS, **(settings or {})}
@@ -628,7 +631,9 @@ class Store:
                                   # routing=None 表示动态跟随 settings.default_routing。
                                   "routing": None,
                                   # 空列表 = 不限制：该密钥可使用所有已启用模型 / 所有可用账号。
-                                  "models": _id_list(models), "accounts": _id_list(accounts)}
+                                  "models": _id_list(models), "accounts": _id_list(accounts),
+                                  # 尚未被任何请求使用过；首次通过鉴权后由 check_api 刷新。
+                                  "last_used_at": None}
         self.keys_dirty = True
         return kid, value
 
@@ -707,6 +712,18 @@ class Store:
                     limit = item.get("daily_limit")
                     if limit is not None and usage.get("count", 0) >= limit:
                         raise HTTPException(429, "该密钥今日请求数已达上限")
+                    # 「最后使用」记在这里而不是 record_key_usage：后者只在
+                    # 「真正打到上游」的三条路径上被调用，而鉴权通过后还有 5 条
+                    # 早退路径（503 无可用账号 / 403 模型白名单 / 400 后端或模型
+                    # 被禁用 / 413 请求体过大）会绕过它们。放在这里则一律覆盖。
+                    #
+                    # 不放在更前面是有意的：429 超配额**不**算「使用」——请求没
+                    # 真正用掉服务，管理员问的是「最后一次真的用上」。
+                    #
+                    # 写入零额外开销：keys_dirty 本来就因上面的 usage 计数置位，
+                    # 走同一条 5 秒防抖 flush（pool.py 的 debounce_persist）。
+                    item["last_used_at"] = int(time.time())
+                    self.keys_dirty = True
                     return kid
             if hashed in self.test_keys:
                 return None
