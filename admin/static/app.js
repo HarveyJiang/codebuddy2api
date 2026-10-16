@@ -1154,7 +1154,8 @@ function openKeyBind(k) {
   };
   const models = (overview.models?.models || []).filter(m => m.enabled)
     .map(m => ({value: m.id, name: m.name || "", backend: m.backend}));
-  const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state, backend:a.backend}));
+  const accounts = overview.accounts.map(a => ({value:a.id, name:a.name, state:a.pool_state, backend:a.backend,
+    remaining:a.remaining, expiring_soon:a.expiring_soon}));
   // 可用模型按归属分页签（用户拍板）：同一份 check-list，页签只控制**哪些行
   // 显示**，勾选状态保留 —— 切页签不丢已勾的项，保存时仍取全部勾选值。
   // 页签数据来自注册表（/admin/api/backends），不写死后端名。
@@ -1187,9 +1188,14 @@ function openKeyBind(k) {
   paintBindTabs();
   paintBindModels();
   // 可用账号：名字前带账号类型 icon（用户拍板）—— 多后端账号池里一眼分清
-  // 这是哪个上游的账号，与模型页签的 icon 口径一致。
+  // 这是哪个上游的账号，与模型页签的 icon 口径一致。括号里不显示 id 前缀
+  // （机器可读对人不友好，用户拍板）：改显示 余额 / 最近过期积分。
   list($("key-bind-accounts"), accounts, Array.isArray(k.accounts) ? k.accounts : [],
-    a => `${a.name}（${a.value.slice(0,6)}…）`);
+    a => {
+      const bal = typeof a.remaining === "number" ? `余 ${creditsFmt(a.remaining)}` : "待查询";
+      const soon = a.expiring_soon > 0 ? ` · ${creditsFmt(a.expiring_soon)} 将过期` : "";
+      return `${a.name}（${bal}${soon}）`;
+    });
   $("key-bind-accounts").querySelectorAll(".check-item").forEach((el, i) => {
     const a = accounts[i];
     if (!a) return;
