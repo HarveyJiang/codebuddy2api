@@ -106,8 +106,9 @@ backend 是循环变量，**写盘时已知**。今天把它拼成 `prefix + bar
   1. `persist()`：循环变量直接写；
   2. `add(mid)`：用户输入的 id 无归属信息，只能前缀推导（多选 UI 落地后，
      前端传显式 `backend` 参数，见 §4.3 修订）。
-- 回填（v10 迁移的一部分）：历史行按前缀推导填——这是**一次性**的，
+- 回填（迁移的一部分）：历史行按前缀推导填——这是**一次性**的，
   与「每次读都推导」有本质区别。回填后列即权威。
+  线上当前 v9；本迁移与 `canonical`（路由方案）各自独立，版本号按落地顺序顺延。
 
 ### drift 防护（列与前缀不一致时怎么办）
 
@@ -118,6 +119,10 @@ backend 是循环变量，**写盘时已知**。今天把它拼成 `prefix + bar
    等于行归属（不需要经过字符串）；
 2. drift 断言：全表 `backend != 前缀推导(model_id)` 的行必须为零。
    这条是结构性的——将来有人改了写入路径漏设列，它先红。
+   **例外**：`pinned_models` 声明的私有模型（`fast-model` 等）由 §4.2 的声明
+   决定归属，断言对它们比对 `pinned_models` 声明而非前缀推导——
+   两者今天结论一致（无前缀 ⇒ 默认后端），但断言必须走同一条权威路径，
+   否则将来 Trae 声明了自己的私有模型时断言会误报。
 
 ### 不变的东西
 
@@ -223,12 +228,16 @@ pinned_models = ("fast-model", "balanced-model", "deep-model")
 | `admin/static/style.css` | 行前 icon 样式（复用 `account-icon-backend` 语义） | 极小 |
 | `core/backends/workbuddy.py` | `WorkBuddyBackend` 加 `pinned_models` 声明 | 3 行 |
 | `core/backends/base.py` | 基类加 `pinned_models = ()` 默认 + 注释约定 | ~10 行 |
-| `admin/models.py` 或 `registry.py` | `backend_for_model_id` 先查 `pinned_models` 再走前缀 | ~10 行 |
+| `admin/models.py` 或 `registry.py` | `backend_for_model_id` 先查 `pinned_models` 再走前缀；`persist`/`load`/`snapshot`/`enabled_models` 改读 `backend` 列不再逐行解析 | ~30 行 |
+| `admin/db.py` | `models` 加 `backend` 列 + `MODEL_COLUMNS` + 迁移（回填按前缀推导，一次性） | ~25 行 |
 | `tests/` | pin 声明测试（换后端/改默认后端不影响三档归属）+ arch guard 天然覆盖字面量分支；前端 `pooltable`-风格的结构测试 | 中 |
 | `scripts/check_admin_ui.py` | 新增 id（归属多选框）自动纳入检查，无需改脚本 | 0 |
 
-**不动**：`models` 表结构、`POST /admin/api/models` 接口形状、
-`ModelRegistry.add` 语义、队列/亲和/账本。
+**要动**（2026-10-16 修订，原写「不动 `models` 表结构」与 §3.1 加列矛盾）：
+`models` 表**加 `backend` 列**（§3.1），迁移只加列 + 按前缀回填。
+
+**不动**：`POST /admin/api/models` 接口形状、`ModelRegistry.add` 语义、
+队列/亲和/账本、`/v1/models` 输出顺序。
 
 ---
 
