@@ -145,19 +145,28 @@ tr:hover .model-name-cell .model-del{opacity:1}
    caption 标出分组语义；每张卡内字段走两列网格 —— 高频的短字段并排，
    不再一列到底。 */
 .settings-caption{font-size:11px;letter-spacing:1.5px;color:#6d8478;margin:0 0 10px}
-.settings-groups{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
+/* 卡片标题旁的小问号（用户 2026-10-16 拍板）：说明文字收进悬停提示，
+   卡片不再渲染整段 <p>，空间立刻省出来。原生 title 即可，无需 JS。 */
+.settings-card h3{display:flex;align-items:center;gap:7px}
+.q-help{width:17px;height:17px;border-radius:50%;background:#e7efe4;color:#5b7f68;
+  font-size:11px;font-weight:700;line-height:1;display:inline-flex;align-items:center;
+  justify-content:center;cursor:help;flex-shrink:0;padding:0}
+.q-help:hover{background:#d5e4d0}
+/* 设置页分组：**上下整行排满**（用户 2026-10-16 拍板：不要左右分栏，卡片
+   内字段一行排满）—— 两栏布局在卡片文字长短不一时留下大片空白。 */
+.settings-groups{display:grid;grid-template-columns:1fr;gap:14px;align-items:start}
 .pool-settings .settings-groups{margin-bottom:20px}
 .settings-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px 24px;margin:0}
 .settings-card h3{font-size:16px;color:#416c54;margin:0 0 9px}
 .settings-card>p{font-size:11px;color:#809789;line-height:1.9;margin:0 0 16px}
-.settings-card .pool-controls{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
+.settings-card .pool-controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0 18px}
 .settings-card .pool-controls label{min-width:0;width:auto;margin:0 0 13px}
 .settings-card .pool-controls label.inline-checkbox,
 .settings-card .pool-controls #backend-toggles label{grid-column:1 / -1}
 /* 备份卡带动作按钮，独占一行放卡底。 */
 #backup-card .pool-controls{grid-template-columns:1fr 1fr 1fr}
 #backup-card .pool-controls button{grid-column:auto;align-self:end}
-@media(max-width:1100px){.settings-groups{grid-template-columns:1fr}.settings-card .pool-controls{grid-template-columns:1fr 1fr}}
+@media(max-width:1100px){.settings-card .pool-controls{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}}
 @media(max-width:760px){.settings-groups{grid-template-columns:1fr}.settings-card{padding:18px}.settings-card .pool-controls{grid-template-columns:1fr}}
 .settings-card .pool-controls .inline-checkbox{align-self:flex-start;width:auto}
 .settings-card .pool-controls button{margin:4px 0 0;align-self:flex-start}
