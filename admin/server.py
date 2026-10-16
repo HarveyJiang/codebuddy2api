@@ -164,13 +164,18 @@ def _dumps_backend_flags(flags: dict) -> str:
 def _validate_backend_flags(raw, store) -> str:
     """校验总闸提交，返回落库用的 JSON 串。非法即 400（不静默改写）。
 
-    三条规则：
+    四条规则：
     1. 必须是 {后端名: 布尔}；未知后端名报错而不是忽略——静默忽略会让用户
        以为自己关掉了某个后端（前端传错名字时尤其容易发生）。
     2. **不变量：启用集合恒 ≥ 1**（用户拍板）。全关等于服务活着但没功能，
        是最难排障的状态，所以这里硬拒而不是给提示。
     3. 环境逃生门关着的后端**不计入**候选（CODEBUDDY_ENABLE_TRAE=0 时那个
        后端本来就不参与服务，不该因为「界面开着它」就允许把它算进启用集合）。
+    4. **逃生门关着的后端，其键保留原值，不被本次提交覆盖**（规则 3 的必然推论）。
+       前端把它渲染成未勾选（`enabled` 含逃生门），所以它提交的 false 其实是
+       「逃生门造成的假象」而非用户意图。若照单写回，运维临时设一次环境变量、
+       管理员随后保存任意设置，撤掉环境变量后该后端就**自动恢复启用**——
+       用户的显式选择被一次无关的保存动作静默抹掉。
     """
     if not isinstance(raw, dict):
         raise HTTPException(400, "后端启用状态格式无效")
@@ -182,12 +187,22 @@ def _validate_backend_flags(raw, store) -> str:
         if not isinstance(value, bool):
             raise HTTPException(400, f"后端 {key} 的启用状态必须是布尔值")
         flags[key] = value
-    # 缺失的后端按「启用」补齐：前端可能只提交变化过的键。
     live = [name for name in known if not spec_for(name).env_disabled()]
+    if not live:
+        # 所有后端都被环境门关着：没有候选，不施加不变量，原样回写。
+        # （今天不可达——只有 Trae 声明了逃生门；但它是与规则 3 绑定的地雷。）
+        return _dumps_backend_flags(store.backend_flags())
+    # 缺失的后端按「启用」补齐：前端可能只提交变化过的键。
     enabled = [name for name in live if flags.get(name, True)]
     if not enabled:
         raise HTTPException(400, "至少需要保留一个后端启用")
-    return _dumps_backend_flags({name: name in enabled for name in live})
+    merged = {name: name in enabled for name in live}
+    # 逃生门关着的后端：保留库里现值，不接受本次提交（规则 4）。
+    current = store.backend_flags()
+    for name in known:
+        if name not in merged:
+            merged[name] = bool(current.get(name, True))
+    return _dumps_backend_flags(merged)
 
 
 class Store:
@@ -271,6 +286,7 @@ class Store:
         # 原始 JSON 串兜底 —— save_settings 是整行 INSERT OR REPLACE、值从
         # data["pool"] 取，键缺失会写 NULL 撞 NOT NULL（与 models_updated 同理）。
         self._backend_flags = _decode_backend_flags(self.data["pool"].get("backend_enabled"))
+        self._backend_flags = self._guard_enabled_invariant(self._backend_flags)
         self.data["pool"]["backend_enabled"] = _dumps_backend_flags(self._backend_flags)
         self.data["session_bindings"] = self.db.load_bindings()
 
@@ -504,10 +520,13 @@ class Store:
         只过滤**当前状态**——账本/日志/事件流不过滤，历史事实照常可查
         （与「账本记事实，不记意图」同一条原则）。
         """
+        # 启用状态按**后端**算一次，而不是每个账号问一遍：is_enabled 会取 store 锁
+        # 并复制 dict（O(账号数) 次加锁）。账号通常远多于后端数，先算 map 再查。
+        live = {name: is_backend_enabled(name) for name in known_backends()}
         result = []
         for aid, item in self.data["accounts"].items():
             backend = item.get("backend", default_backend())
-            if not is_backend_enabled(backend):
+            if not live.get(backend, True):
                 continue
             row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "created": item["created"], "backend": backend}
             try:
@@ -624,6 +643,23 @@ class Store:
         return datetime.fromtimestamp(time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
 
     # -- 后端总闸 ----------------------------------------------------------
+
+    def _guard_enabled_invariant(self, flags: dict) -> dict:
+        """加载期兜底：库里若记着「全部后端都关」，回落全启用并告警。
+
+        HTTP 层已有校验，但那是**防手滑**不是**防一切**：手改库、恢复一份坏备份、
+        或将来任何直接写 ``data["pool"]`` 的代码都可能绕过它。到那时进程活着、
+        健康检查绿、所有请求 400/503——正是 specs/backend-toggle.md §4.1 要杀的
+        「活着但没功能」状态。这里是最后一道：宁可全启用（总闸暂时失效）也不能
+        全关（服务不可用），且必留告警。
+        """
+        live = [n for n in known_backends() if not spec_for(n).env_disabled()]
+        if live and not any(flags.get(n, True) for n in live):
+            logging.getLogger("admin.server").warning(
+                "数据库里记录的后端启用集合为空，已回落为全部启用"
+                "（请检查 settings.backend_enabled 是否被手工改坏）")
+            return {}
+        return flags
 
     def backend_flags(self) -> dict:
         """registry 的总闸数据源（注入点）。返回**副本**：调用方只读，

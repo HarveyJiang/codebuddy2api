@@ -407,3 +407,232 @@ def test_tick_skips_checkin_for_disabled_backend():
     finally:
         registry.set_enabled_provider(None)
         store.db.close()
+
+# --------------------------------------------------------------------------
+# 5. 端到端：文案必须真的送到客户端
+# --------------------------------------------------------------------------
+
+class _EndToEndTests(unittest.TestCase):
+    """打真实的 ``/v1/chat/completions``，验用户**实际收到**的响应。
+
+    为什么必须走 e2e：原实现的「XX 后端已被管理员禁用」写在
+    ``registry.resolve_backend`` 里，而 PoolMiddleware 的**模型门**先于它命中
+    （``enabled_models`` 已排除禁用后端、``snapshot_ids`` 没有），于是用户实际
+    收到的是「模型 X 已在管理页禁用」。只单测 ``resolve_backend`` 全绿——
+    因为那条路径在生产上根本不可达。这条测试就是为了钉住「用户看到的那个字符串」。
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.auth = self.root / "auth"
+        self.auth.mkdir()
+        for name, backend in (("wb", "workbuddy"), ("tr", "trae")):
+            _write_cred(self.auth, name, backend)
+        self.app = create_app(str(self.root / "mgmt"), str(self.auth), API, ADMIN)
+        self.client = TestClient(self.app, base_url="https://console.test")
+        csrf = self.client.post("/admin/api/login", json={"key": ADMIN}).json()["csrf"]
+        self.headers = {"X-CSRF-Token": csrf}
+
+    def tearDown(self):
+        registry.set_enabled_provider(None)
+        self.client.close()
+
+    def _disable(self, backend):
+        flags = {b: True for b in registry.known_names()}
+        flags[backend] = False
+        r = self.client.patch("/admin/api/pool/settings", json={"backend_enabled": flags},
+                              headers=self.headers)
+        assert r.status_code == 200, r.text
+
+    def _ask(self, model):
+        return self.client.post("/v1/chat/completions",
+                                json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+                                headers={"Authorization": "Bearer " + API})
+
+    def test_disabled_backend_request_says_backend_disabled(self):
+        """关掉 Trae 后，请求 Trae 模型要说「后端已被管理员禁用」。"""
+        self._disable("trae")
+        for model in ("trae/glm-5.2", "trae/压根不存在的模型"):
+            r = self._ask(model)
+            assert r.status_code == 400, f"{model} → {r.status_code} {r.text}"
+            assert "已被管理员禁用" in r.text, f"{model} 的文案是 {r.text}"
+            # 关键：不能是「模型已在管理页禁用」——那是把后端下线说成模型禁用，
+            # 排障时会跑去模型页找一个从没被动过的开关。
+            assert "已在管理页禁用" not in r.text, f"{model} 命中了模型门的误导文案"
+
+    def test_disabling_default_backend_also_reports_correctly(self):
+        """对称：关掉默认后端（WorkBuddy）走同一条路（specs §4 的对称语义）。"""
+        self._disable("workbuddy")
+        r = self._ask("glm-5.2")  # 裸名 → 硬绑默认后端
+        assert r.status_code == 400
+        assert "已被管理员禁用" in r.text, r.text
+
+    def test_v1_models_hides_disabled_backend(self):
+        """/v1/models 也不该再列出禁用后端的模型（已有 is_enabled 派生，e2e 钉住）。"""
+        self._disable("trae")
+        data = self.client.get("/v1/models", headers={"Authorization": "Bearer " + API}).json()["data"]
+        assert not [m for m in data if m["id"].startswith("trae/")], "禁用后端仍在 /v1/models 里"
+        assert [m for m in data if not m["id"].startswith("trae/")], "默认后端的模型不该被牵连"
+
+    def test_env_gate_state_survives_an_unrelated_save(self):
+        """逃生门开着时保存任意设置，**不得**抹掉用户对总闸的显式选择。
+
+        前端永远提交完整 map，所以每次保存设置都会带上后端开关。逃生门关着的
+        后端被渲染成未勾选，若照单写回，撤掉环境变量后它就自动恢复启用——
+        用户的显式选择被一次无关的保存动作静默抹掉。
+        """
+        self._disable("trae")
+        store = self.app.state.store
+        assert store.backend_flags().get("trae") is False
+        os.environ["CODEBUDDY_ENABLE_TRAE"] = "0"
+        try:
+            r = self.client.patch("/admin/api/pool/settings",
+                                  json={"checkin_time": "10:00",
+                                        "backend_enabled": {"workbuddy": True, "trae": False}},
+                                  headers=self.headers)
+            assert r.status_code == 200, r.text
+            assert store.backend_flags().get("trae") is False, "逃生门开着时的保存抹掉了用户选择"
+        finally:
+            os.environ.pop("CODEBUDDY_ENABLE_TRAE", None)
+        assert not registry.is_enabled("trae"), "撤掉逃生门后应恢复为用户选定的「禁用」"
+
+    def test_backends_endpoint_exposes_env_disabled_separately(self):
+        """前端要能区分「被环境门禁用」与「用户关掉了」——靠这个独立字段置灰。"""
+        os.environ["CODEBUDDY_ENABLE_TRAE"] = "0"
+        try:
+            data = self.client.get("/admin/api/backends").json()["backends"]
+            flags = {b["name"]: b for b in data}
+            assert flags["trae"]["env_disabled"] is True
+            assert flags["trae"]["enabled"] is False
+            assert flags["workbuddy"]["env_disabled"] is False
+            assert flags["workbuddy"]["enabled"] is True
+        finally:
+            os.environ.pop("CODEBUDDY_ENABLE_TRAE", None)
+
+
+def test_load_time_invariant_guard():
+    """加载期兜底：库里记着「全关」时回落全启用并告警（最后一道防线）。
+
+    HTTP 层校验防手滑，防不了手改库 / 坏备份 / 将来直接写 data["pool"] 的代码。
+    到那时进程活着、健康绿、所有请求失败——正是 §4.1 要杀的状态。
+    """
+    from admin.db import Database
+    from admin.pool import AccountPool
+    root = Path(tempfile.mkdtemp())
+    (root / "mgmt").mkdir()
+    auth = root / "auth"
+    auth.mkdir()
+    db = Database(root / "mgmt" / "state.db")
+    db.save_settings({**AccountPool.POOL_DEFAULTS,
+                      "backend_enabled": '{"workbuddy": false, "trae": false}'})
+    db.close()
+    store = Store(str(root / "mgmt"), str(auth), API, ADMIN)
+    try:
+        assert store.backend_flags() == {}, "全关应回落为全启用"
+        registry.set_enabled_provider(store.backend_flags)
+        assert registry.is_enabled("workbuddy"), "回落后服务必须可用"
+    finally:
+        registry.set_enabled_provider(None)
+        store.db.close()
+
+
+def _pool_with_one_trae_account():
+    """造一个带单个 Trae 账号的池，返回 (store, pool, acted)。"""
+    from admin.pool import AccountPool
+    root = Path(tempfile.mkdtemp())
+    auth = root / "auth"
+    auth.mkdir()
+    (root / "mgmt").mkdir()
+    _write_cred(auth, "tr", "trae")
+    store = Store(str(root / "mgmt"), str(auth), API, ADMIN)
+    acted = []
+    pool = AccountPool(store)
+    pool.operate = lambda aid, action: (acted.append(aid), {"ok": True})[1]
+    pool.pool_status = lambda aid: (acted.append(aid), {"ok": True})[1]
+    store.data["accounts"] = {
+        "tr1": {"name": "tr", "file": "tr.info", "enabled": True, "created": 0, "backend": "trae"},
+    }
+    store.data["account_status"]["tr1"] = {"credits_updated": 0}
+    # 批量签到默认有 0~90 秒随机错峰延迟，不归零的话这条测试要跑一分半——
+    # 而且随机延迟会让「有没有调用过」变得依赖时序，慢且脆。
+    store.data["pool"]["batch_spread"] = 0
+    registry.set_enabled_provider(store.backend_flags)
+    return store, pool, acted
+
+
+def test_batch_checkin_skips_disabled_backend():
+    """概览「批量签到」也不打禁用后端。
+
+    账号表已隐藏这些账号，批量动作却去签到，会让用户看到「表格里不存在的行在报
+    签到成功」，正好破坏本次刻意对齐的「计数与表格行数一致」。
+    """
+    import asyncio
+    store, pool, acted = _pool_with_one_trae_account()
+    try:
+        asyncio.run(pool.batch("checkin"))
+        assert acted == ["tr1"], "启用时应批量签到"
+        acted.clear()
+        store.set_backend_flags({"trae": False})
+        asyncio.run(pool.batch("checkin"))
+        assert acted == [], "禁用后不该再批量签到"
+    finally:
+        registry.set_enabled_provider(None)
+        store.db.close()
+
+
+def test_refresh_credits_skips_disabled_backend():
+    """页面每次加载都会 `pool/refresh-credits` —— 不该对已下线后端逐账号打上游。"""
+    import asyncio
+    store, pool, acted = _pool_with_one_trae_account()
+    try:
+        asyncio.run(pool.refresh_credits())
+        assert acted == ["tr1"], "启用时应刷新积分"
+        acted.clear()
+        store.set_backend_flags({"trae": False})
+        store.data["account_status"]["tr1"]["credits_updated"] = 0  # 复位节流窗口
+        asyncio.run(pool.refresh_credits())
+        assert acted == [], "禁用后不该再刷新积分"
+    finally:
+        registry.set_enabled_provider(None)
+        store.db.close()
+
+
+def test_credential_pre_refresh_skips_disabled_backend():
+    """凭据预刷新（低峰时段）也不打禁用后端——与签到/积分刷新同一口径。
+
+    这条曾经是盲区：tick 里签到有测试、凭据预刷新没有，删掉守卫照样全绿。
+    """
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+    store, pool, acted = _pool_with_one_trae_account()
+    try:
+        # 预刷新只在 sync_start~sync_end 窗口内动作，且要账号两小时内到期。
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        store.data["pool"].update({"sync_start": "00:00", "sync_end": "23:59"})
+        store.data["account_status"]["tr1"].update(
+            # refresh_slot_date 必须是**今天**：不等就会在 tick 里重抽一个随机时段
+            # （那个时刻多半还没到 → 直接 continue），测试于是随机红。
+            {"refresh_slot": "00:00", "refresh_slot_date": today,
+             "refresh_window_date": "", "token_refreshed": 0})
+        _write_cred(store.auth_dir, "tr", "trae", expires_delta=3600)
+        row = store.account_rows()[0]
+        row["expires_at"] = int((time.time() + 3600) * 1000)
+        pool.store.account_rows = lambda: [row]
+        asyncio.run(pool.tick())
+        assert "tr1" in acted, "启用时应预刷新凭据"
+        acted.clear()
+        store.set_backend_flags({"trae": False})
+        # 两轮之间复位「今天还没预刷新」，否则第二轮被当天标记直接跳过，
+        # 断言会因「压根没走到守卫」而假绿。
+        store.data["account_status"]["tr1"].update(
+            {"refresh_window_date": "", "token_refreshed": 0})
+        asyncio.run(pool.tick())
+        assert acted == [], "禁用后不该再预刷新凭据"
+    finally:
+        registry.set_enabled_provider(None)
+        store.db.close()
+
+
+def test_test_file_ends_with_newline():
+    """末尾换行：POSIX 文本文件约定，也让 git 不再报 no newline at end of file。"""
+    assert Path(__file__).read_text(encoding="utf-8").endswith("\n")

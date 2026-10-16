@@ -267,13 +267,15 @@ def test_registry_modules_have_no_stray_backend_branches():
 
     review 指出注册表自己就是硬编码后端名的重灾区（``known_names`` 的 order 字典、
     ``default_name`` 的 ``return "workbuddy"``、``spec_for`` 的 ``if name in ("trae",)``）。
-    现在 ``_REGISTRY`` 是唯一允许出现后端名的地方；剩下的两处按名字判断是
-    **有意保留**的，各自有理由，这条测试把它们记下来，多出来的就是新的渗透点：
+    现在 ``_REGISTRY`` 是唯一允许出现后端名的地方；剩下**一处**按名字判断是
+    **有意保留**的，这条测试把它记下来，多出来的就是新的渗透点：
 
-    1. ``is_enabled`` —— 每个后端的 kill switch 是**环境变量**，与能力无关，
-       按名字查是「这个名字有没有开关」的白名单；
-    2. ``resolve_backend`` —— 某个后端的模型名映射（``map_model``）是它私有的
-       归一规则，形状各后端差异大，不适合塞进声明。
+    - ``resolve_backend`` —— 某个后端的模型名映射（``map_model``）是它私有的
+      归一规则，形状各后端差异大，不适合塞进声明。
+
+    上限从 2 收到 1（2026-10-16）：原先的第二处是 ``is_enabled`` 里的
+    ``if name == "trae"``（后端总闸上线时顺带改成了读
+    ``BackendSpec.kill_switch_env`` 声明），所以现在**一处都不剩余地**。
     """
     import re
     src = (registry.__file__ and Path(registry.__file__).read_text(encoding="utf-8")) or ""
@@ -294,8 +296,8 @@ def test_registry_modules_have_no_stray_backend_branches():
         code = line.split("#", 1)[0]
         if re.search(r'==\s*["\'](?:workbuddy|trae)["\']|in\s*\(\s*["\'](?:workbuddy|trae)["\']', code):
             hits.append(f"registry.py:{i}: {code.strip()}")
-    # 允许 is_enabled 与 resolve_backend 各一处（见 docstring）。
-    assert len(hits) <= 2, (
+    # 只允许 resolve_backend 一处（见 docstring）。
+    assert len(hits) <= 1, (
         "注册表出现新的按后端名分支（应改为从 _REGISTRY / 声明派生）：\n  " + "\n  ".join(hits)
     )
 

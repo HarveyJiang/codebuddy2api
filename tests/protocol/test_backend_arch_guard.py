@@ -227,7 +227,8 @@ def test_callers_do_not_use_backend_specific_names():
 
     例外：``registry.trae_backend`` 那个**唯一**的懒构造入口（backend 模块自己的
     工厂），以及 kill switch 的 ``trae_enabled``——后者的理由是它读的是环境变量，
-    与后端能力无关。两者都在注册表/后端模块内部，不在调用方文件里。
+    与后端能力无关（总闸上线后它已降级为「只看环境门」的兼容入口，整体启停问
+    ``is_enabled``）。两者都在注册表/后端模块内部，不在调用方文件里。
     """
     offenders = []
     for rel, path in _caller_files():

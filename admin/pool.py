@@ -890,7 +890,11 @@ class AccountPool:
             raise HTTPException(409, "已有批量任务进行中，请稍后刷新")
         async with self.jobs:
             with self.store.lock:
-                ids = list(self.store.data["accounts"])
+                # 总闸关掉的后端不参与（specs/backend-toggle.md §2 第 7 条）：
+                # 概览账号表已隐藏它们，批量动作却去签到，会让用户看到
+                # 「表格里没有的行在报签到成功」，正好破坏刻意对齐的计数口径。
+                ids = [aid for aid, item in self.store.data["accounts"].items()
+                       if is_backend_enabled(item.get("backend", default_backend()))]
             semaphore = asyncio.Semaphore(3)
             async def run(aid):
                 # 批量签到错峰：每个账号在 0~spread 秒内随机延迟后再发起，避免同时打满上游。
@@ -1005,7 +1009,8 @@ class AccountPool:
         limit = max(0, int(self.store.data["pool"].get("credit_min_interval", self.REFRESH_MIN_INTERVAL)))
         with self.store.lock:
             ids = [aid for aid, item in self.store.data["accounts"].items()
-                   if self.store.data["account_status"].get(aid, {}).get("credits_updated", 0)
+                   if is_backend_enabled(item.get("backend", default_backend()))
+                   and self.store.data["account_status"].get(aid, {}).get("credits_updated", 0)
                    < self.clock() - limit]
         if not ids:
             return {"refreshed": 0, "skipped": True}
@@ -1130,7 +1135,8 @@ class AccountPool:
         with self.store.lock:
             due = []
             for aid, item in self.store.data["accounts"].items():
-                if not item["enabled"]:
+                # 总闸关掉的后端不打上游（与 tick 同一口径）。
+                if not item["enabled"] or not is_backend_enabled(item.get("backend", default_backend())):
                     continue
                 status = self.store.data["account_status"].get(aid, {})
                 # usage_synced_at 语义是「最后同步成功时间」，失败时不改它；
@@ -1174,7 +1180,8 @@ class AccountPool:
         """
         with self.store.lock:
             targets = [aid for aid, item in self.store.data["accounts"].items()
-                       if item["enabled"] and (not account_id or aid == account_id)]
+                       if item["enabled"] and is_backend_enabled(item.get("backend", default_backend()))
+                       and (not account_id or aid == account_id)]
         if not targets:
             return {"synced": 0, "failed": 0, "skipped": [], "message": "没有可拉取的账号"}
         if self.jobs.locked():
@@ -1261,6 +1268,21 @@ class PoolMiddleware:
                 body = json.loads(raw) if raw else {}
             except ValueError:
                 body = {}
+            # 后端总闸优先于模型门：后端下线时，报「该后端已被管理员禁用」而不是
+            # 「模型 X 已在管理页禁用」——后者把「后端下线」说成「你禁用了某个模型」，
+            # 排障时会跑去模型页找一个从没被动过的开关。
+            # 顺序不能反：enabled_models() 已排除禁用后端而 snapshot_ids() 没有，
+            # 不先拦的话下面那句模型门会先命中，把真正的原因盖掉。
+            if isinstance(body, dict):
+                _raw_model = body.get("model")
+                if isinstance(_raw_model, str) and _raw_model:
+                    _backend = backend_name_for(_raw_model)
+                    if not is_backend_enabled(_backend):
+                        raise HTTPException(400, {
+                            "error": {
+                                "message": f"{spec_for(_backend).label} 后端已被管理员禁用",
+                                "type": "invalid_request_error",
+                            }})
             # 管理页禁用的模型直接拒绝，不打上游。
             if self.model_registry is not None and isinstance(body, dict):
                 model = body.get("model")

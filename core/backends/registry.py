@@ -290,7 +290,11 @@ def backend_meta() -> list[dict]:
             "order": spec.order,
             "prefix": spec.model_prefix,
             "login_kind": spec.login_kind,
+            # 两个字段分开给：enabled = 总闸 ∧ 逃生门（整体启不启用），
+            # env_disabled = 单看逃生门。前端靠后者把这类框置灰并说明原因——
+            # 否则用户勾上一个被环境变量禁用的后端，保存成功但毫无效果（静默 no-op）。
             "enabled": is_enabled(spec.name),
+            "env_disabled": spec.env_disabled(),
             "default": spec.default_for_missing_backend,
         })
     return sorted(out, key=lambda m: (m["order"], m["name"]))

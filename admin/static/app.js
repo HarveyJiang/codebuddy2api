@@ -128,7 +128,7 @@ function applyBackends(list) {
 function paintBackendToggles() {
   const box = $("backend-toggles");
   if (!box) return;
-  box.innerHTML = backends.map(b => `<label class="inline-checkbox"><input type="checkbox" data-backend-toggle="${esc(b.name)}"${b.enabled ? " checked" : ""}>${esc(backendIcon(b.name))} ${esc(b.label)}</label>`).join("")
+  box.innerHTML = backends.map(b => `<label class="inline-checkbox" data-env-locked="${b.env_disabled ? "1" : ""}" title="${esc(b.env_disabled ? "该后端已被环境变量 CODEBUDDY_ENABLE_TRAE=0 禁用，开关不生效" : "")}"><input type="checkbox" data-backend-toggle="${esc(b.name)}"${b.enabled ? " checked" : ""}>${esc(backendIcon(b.name))} ${esc(b.label)}${b.env_disabled ? '<span class="pill">环境禁用</span>' : ""}</label>`).join("")
     || `<span class="muted">没有可用后端</span>`;
   lockBackendToggles();
 }
@@ -136,11 +136,17 @@ function paintBackendToggles() {
 // 两处都要有——只靠前端的话 curl 直打接口就能绕过）。
 function lockBackendToggles() {
   const boxes = [...document.querySelectorAll("[data-backend-toggle]")];
-  const on = boxes.filter(b => b.checked);
+  // 环境门关着的复选框**永远**置灰，不参与「至少留一个」的计数——
+  // 它们本来就不可用，勾它既没效果也不该拿来凑不变量。
+  const live = boxes.filter(b => b.closest("label")?.dataset.envLocked !== "1");
+  const on = live.filter(b => b.checked);
   boxes.forEach(b => {
-    const solo = on.length === 1 && b.checked;
-    b.disabled = solo;
-    b.closest("label").title = solo ? "至少需要保留一个后端启用" : "";
+    const label = b.closest("label");   // markup 一旦变动这里会变 undefined，
+    const envLocked = label?.dataset.envLocked === "1";  // 所以全程用 ?. 与判空
+    const solo = !envLocked && on.length === 1 && b.checked;
+    b.disabled = envLocked || solo;
+    if (envLocked || !label) return;   // title 保留 paint 时写的环境禁用说明
+    label.title = solo ? "至少需要保留一个后端启用" : "";
   });
 }
 const backendToggle = $("backend-toggles");
@@ -149,6 +155,8 @@ if (backendToggle) {
   backendToggle.addEventListener("click", () => setTimeout(lockBackendToggles, 0));
 }
 // 提交用：{后端名: 是否启用}。置灰的那项仍是 checked，照实提交（它就是那个保留的）。
+// 环境门关着的项照实回传现值：服务端会保留库里的原值（规则 4），
+// 这里保持同样口径，免得两边对「提交值代表什么」的理解不一致。
 const backendFlagsBody = () => Object.fromEntries(
   [...document.querySelectorAll("[data-backend-toggle]")].map(b => [b.dataset.backendToggle, b.checked]));
 
