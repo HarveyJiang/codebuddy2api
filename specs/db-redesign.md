@@ -165,22 +165,31 @@
 
 | 字段名 | 类型 | 可空 | 默认 | 说明 |
 |---|---|---|---|---|
-| model_id | TEXT PK | 否 | — | 如 glm-5.2 |
+| model_id | TEXT PK | 否 | — | 对外 id，Trae 行带 `trae/` 前缀（如 `trae/kimi-k3`）；归属由前缀推导，不另设 `backend` 列（见 `specs/model-backend-attribution.md` §3） |
 | name | TEXT | 否 | — | 展示名 |
 | description | TEXT | 是 | NULL | 只存中文 descriptionZh |
 | credits_micro | INTEGER | 是 | NULL | 单价倍率 ×1e6；NULL=标准计费，排序视为 0 |
 | max_input_tokens | INTEGER | 是 | NULL | 上下文上限 |
-| source | TEXT | 否 | 'builtin' | upstream / builtin |
+| source | TEXT | 否 | 'builtin' | upstream / builtin / **custom**（三值；`normalize_source` 收敛，不认识的按 upstream） |
 | available | INTEGER | 否 | 1 | 是否在上游 cli 列表 |
 | enabled | INTEGER | 否 | 1 | 管理页是否启用 |
 | sort_order | INTEGER | 否 | 0 | 上游顺序，排序 tiebreak |
 | promo | TEXT | 是 | NULL | 促销展示文本；见下"促销取舍" |
+| synced_at | INTEGER | 否 | 0 | 该行所属后端的目录上次成功拉取时刻（schema v9；未知=0。按后端记，不进 `settings`——见第 3 阶段记录） |
+| canonical | TEXT | 是 | NULL | **预留，未实现**。跨后端同名模型的规范名（如 `kimi-k3-1` 与 `trae/kimi-k3` 都是 `kimi-k3`）；裸名自动选后端的候选键（见 `specs/model-routing-by-policy.md` §6.1）。空 = 无跨后端同名者 |
+
+> 注：本节最初按「查表替代内存 registry」设计（v2 迁移），实际落地时
+> `ModelRegistry` 保留内存态、表只做持久化。`canonical` 列待裸名自动选后端
+> 排期后以 v10 迁移加入（加列，幂等，安全类型）。
 
 刷新策略：**UPSERT 不删行**。上游消失的模型标 `available=0` 保留，保证 `request_logs.model_id` / `upstream_request_usage.model` 长期可 join。`enabled` 仅由用户操作改写，刷新时不动。
 
 **`available=0` 的行不进 registry**：`ModelRegistry` 只加载 `available=1` 的行填 `_catalog`/`_available`，`available=0` 只留在表里供日志 join。这样 `snapshot_ids()`（`models.py:254`）自然只含上游当前的模型，`PoolMiddleware`（`pool.py:565`）不会把"上游已下线"误报成"管理页已禁用"。管理页目录与现状一致：消失的模型从列表消失。
 
-展示排序 `ORDER BY enabled DESC, credits_micro, sort_order`，替代 `ModelRegistry.snapshot()` 内排序（`admin/models.py:242`）。
+展示排序：`ModelRegistry.snapshot()` 内存排序（表只做持久化，不替代排序），
+键为四层（2026-10-16 定，见 `specs/model-backend-attribution.md` §6）：
+来源（custom → builtin → upstream）→ 归属（注册表顺序）→ 启用优先 →
+倍率升序（NULL 视为 0），同分用目录原顺序决胜。仅管理页；`/v1/models` 顺序不动。
 
 **可用列表查询必须显式带 `available=1 AND enabled=1`**：`enabled_models()`（`models.py:249`）现语义是"available 减 disabled"，改查表后若只写 `enabled=1`，会漏掉 available 条件。注意 `/v1/models`（`converter.py:530`）读的是 product.json/`DEFAULT_MODELS`，不查本表——**保持现状**，可用性的实际拦截以 `PoolMiddleware` + `enabled_models()` 为准，spec 不改这一处。
 
