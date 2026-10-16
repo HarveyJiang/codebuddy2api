@@ -385,16 +385,6 @@ def render_local_receiver(base_url: str, fid: str, secret: str, port: int = DEFA
     )
 
 
-def local_command(base_url: str, fid: str, secret: str) -> dict:
-    """各平台一行命令（管理页展示 / 一键复制）。"""
-    quote = urllib.parse.quote
-    url = f"{base_url.rstrip('/')}/trae/local.py?f={quote(fid)}&t={quote(secret)}"
-    return {
-        "posix": f'curl -s "{url}" | python3 -',
-        "windows": f'python -c "import urllib.request as u;exec(u.urlopen(r\'{url}\').read())"',
-    }
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="TRAE SOLO 登录（写入 trae-{uid}.info）")
     ap.add_argument(

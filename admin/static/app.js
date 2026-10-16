@@ -259,12 +259,6 @@ function backendBadge(b) {
   if (!b) return '<span class="muted">—</span>';
   return `<span class="mini-backend mini-${esc(b)}" title="该请求由 ${esc(b)} 账号处理">${esc(backendLabel(b))}</span>`;
 }
-// 带后端名的徽标（账号表、模型表用），形如「◈ WorkBuddy」。
-function backendTag(b) {
-  const key = b || backends[0]?.name;
-  return `<span class="mini-backend mini-${esc(key)}" title="${esc(backendName(key))} 账号">${backendIconSvg(key)} ${esc(backendName(key))}</span>`;
-}
-
 function renderModels() {
   const catalog = overview?.models;
   const list = (Array.isArray(catalog?.models) ? catalog.models : [])

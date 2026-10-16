@@ -34,7 +34,6 @@ const snippets = [
   /const SVG_ALLOWED_TAGS = [^\n]*\n/,
   /const backendIconSvg = [\s\S]*?\n\};\n/,
   /const backendLabel = [^\n]*\n/,
-  /function backendTag\(b\) \{[\s\S]*?\n\}\n/,
   /function backendBadge\(b\) \{[\s\S]*?\n\}\n/,
   /const creditsText = [^\n]*\n/,
   /const ctxText = [^\n]*\n/,

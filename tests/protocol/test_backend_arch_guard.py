@@ -32,7 +32,7 @@
 - 展示用的 label / icon / 颜色 / 顺序 → `label` / `icon` / `color` / `order`
 
 如果**确实**是「全局唯一、与具体后端无关」的开关，用 `# arch-guard: ok` 在该行注明
-理由（例如 `trae_enabled()` 里的 kill switch 环境变量），守卫会放过该行。
+理由（例如 kill switch 环境变量 ``CODEBUDDY_ENABLE_TRAE``），守卫会放过该行。
 """
 from __future__ import annotations
 
@@ -226,9 +226,9 @@ def test_callers_do_not_use_backend_specific_names():
     「为某一个后端写的」标识符 —— 它们是上一个后端留下的专用分支，加后端就要再抄一份。
 
     例外：``registry.trae_backend`` 那个**唯一**的懒构造入口（backend 模块自己的
-    工厂），以及 kill switch 的 ``trae_enabled``——后者的理由是它读的是环境变量，
-    与后端能力无关（总闸上线后它已降级为「只看环境门」的兼容入口，整体启停问
-    ``is_enabled``）。两者都在注册表/后端模块内部，不在调用方文件里。
+    工厂），以及环境变量逃生门 ``CODEBUDDY_ENABLE_TRAE``（读环境变量、与后端能力
+    无关，整体启停问 ``is_enabled``）。两者都在注册表/后端模块内部，不在调用方
+    文件里。
     """
     offenders = []
     for rel, path in _caller_files():

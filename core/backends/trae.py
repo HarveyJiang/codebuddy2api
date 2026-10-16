@@ -585,11 +585,6 @@ def function_chain(model: str) -> list[str]:
     return [first] + [s for s in (FUNCTION, FUNCTION_FALLBACK, AGENT_STEP) if s != first]
 
 
-def remember_function(model: str, fn: str) -> None:
-    with _FUNCTION_LOCK:
-        _FUNCTION_CACHE[str(model or "")] = fn
-
-
 def _is_param_invalid(err: BackendHTTPError) -> bool:
     """上游 4001 ＝ function 与模型不匹配（param invalid），可换 function 重试。
 
@@ -1209,20 +1204,11 @@ class TraeBackend(BackendSpec):
     def set_catalog_provider(self, provider):
         self._catalog_provider = provider
 
-    def model_catalog(self) -> list[dict]:
-        """本实例当前生效的模型目录（兼容 trae_model_catalog 的模块级调用）。"""
-        return self.catalog_entries()
-
     def chat_url(self) -> str:
         return AGENT_HOST + EP_CHAT
 
     def make_credential(self, path):
         return TraeCredentialManager(path)
-
-    def function_for(self, model: str) -> str:
-        """该模型首选 function（自适应结果缓存优先，默认 FUNCTION）。"""
-        with _FUNCTION_LOCK:
-            return _FUNCTION_CACHE.get(str(model or ""), FUNCTION)
 
     async def astream(self, headers, body, *, timeout=None, raise_on_error=False):
         model = str((body or {}).get("model") or "")

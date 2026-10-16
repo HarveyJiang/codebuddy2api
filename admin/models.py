@@ -224,38 +224,6 @@ class ModelRegistry:
         return self._state_for("trae")
 
     @property
-    def _trae_catalog(self):
-        return self._trae_state["catalog"]
-
-    @_trae_catalog.setter
-    def _trae_catalog(self, value):
-        self._trae_state["catalog"] = value
-
-    @property
-    def _trae_available(self):
-        return self._trae_state["available"]
-
-    @_trae_available.setter
-    def _trae_available(self, value):
-        self._trae_state["available"] = value
-
-    @property
-    def _trae_disabled(self):
-        return self._trae_state["disabled"]
-
-    @_trae_disabled.setter
-    def _trae_disabled(self, value):
-        self._trae_state["disabled"] = value
-
-    @property
-    def _trae_updated(self):
-        return self._trae_state["updated"]
-
-    @_trae_updated.setter
-    def _trae_updated(self, value):
-        self._trae_state["updated"] = value
-
-    @property
     def _trae_error(self):
         return self._trae_state["error"]
 

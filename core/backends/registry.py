@@ -19,15 +19,13 @@ _BACKENDS: dict[str, BackendSpec] = {}
 
 #: 后端注册表 —— **唯一**允许出现后端名的地方（`core/backends/registry.py`）。
 #:
-#: 「加一个后端」在这里加一行就够了：注册表按 `lazy` 决定是立即 import 还是
-#: 用到才 import（后者是为了不让 Trae 的整套私有协议与登录态进入所有部署形态）。
-#: 其余一切（顺序、默认后端、前缀、元数据、白名单、凭据分派）都从
-#: `BackendSpec` 的**声明**派生 —— 见 `known_names` / `default_name` / `spec_for`。
+#: 「加一个后端」在这里加一行：按 `lazy` 决定立即 import 还是用到才 import
+#: （后者不让 Trae 的私有协议与登录态进入所有部署形态）。顺序、默认后端、
+#: 前缀、元数据、凭据分派全部从 `BackendSpec` 声明派生（见 `known_names` /
+#: `default_name` / `spec_for`）。`order` 显式写在这里是因为读 `spec.order`
+#: 就得先构造 spec，而构造正是要推迟的事。
 #:
-#: `order` 显式写在这里而不是读 `spec.order`：读声明就得先构造 spec，而构造
-#: 正是我们要推迟的事（懒后端）。它决定管理页展示顺序，必须稳定。
-#:
-#: `module` / `attr` 用字符串描述构造入口，避免在模块顶部 import 后端模块。
+#: `module` / `attr` 用字符串描述构造入口，避免模块顶部 import 后端模块。
 _REGISTRY: tuple[dict, ...] = (
     {"name": "workbuddy", "order": 0, "module": "core.backends.workbuddy",
      "attr": "WorkBuddyBackend", "lazy": False},
@@ -151,13 +149,10 @@ def canonical_name(model) -> str:
 
 #: 设置页总闸的数据源（``{后端名: 是否启用}``，缺键即启用）。
 #:
-#: **为什么要注入而不是直接读 DB**：本模块是 core 层，不能 import admin
-#: （admin 依赖 registry，反向 import 成环）。admin 在启动时把一个「读内存
-#: 字典」的可调用对象塞进来——与 ``trae.set_catalog_provider`` 同一模式
-#: （core 侧对象持有 admin 启动时注入的可调用对象）。
-#:
-#: 为什么必须是**内存**字典而不是每次查库：``is_enabled`` 在请求路径上
-#: （``resolve_backend`` 每次请求都问一次），不能带一次 SQLite 查询。
+#: 注入而非直接读 DB：core 层不能 import admin（admin 依赖 registry，反向成环）。
+#: admin 启动时塞进一个「读内存字典」的可调用对象——与
+#: ``trae.set_catalog_provider`` 同一模式。必须是内存字典因为 ``is_enabled``
+#: 在请求路径上（每次 ``resolve_backend`` 都问一次），不能带 SQLite 查询。
 _enabled_provider = None
 
 
@@ -235,15 +230,6 @@ def backend_name_for(model) -> str:
     if pinned is not None:
         return pinned
     return default_name()
-
-
-def trae_enabled() -> bool:
-    """环境逃生门：CODEBUDDY_ENABLE_TRAE=0 时全链路禁用 Trae（模型列表/路由/目录）。
-
-    保留这个函数名给既有调用方/测试用；它只看环境变量，**不含**设置页总闸
-    ——要问「整体启不启用」用 :func:`is_enabled`。
-    """
-    return os.environ.get("CODEBUDDY_ENABLE_TRAE", "1") != "0"
 
 
 def resolve_backend(model, routed=None) -> tuple[BackendSpec, str]:
@@ -373,8 +359,3 @@ def catalog_ids(backend) -> list[str]:
     module = backend_module(backend)
     fallback = getattr(module, f"{backend}_model_catalog", None)
     return [m["id"] for m in fallback()] if callable(fallback) else []
-
-
-def trae_model_ids() -> list[str]:
-    """Trae 模型表的 id 列表（保留旧名；实现已泛化为 catalog_ids）。"""
-    return catalog_ids("trae")

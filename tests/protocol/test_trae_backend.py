@@ -19,7 +19,7 @@ import pytest
 from core import converter
 from core.backends import trae as T
 from core.backends.base import BackendHTTPError
-from core.backends.registry import backend_name_for, resolve_backend, trae_model_ids
+from core.backends.registry import backend_name_for, catalog_ids, resolve_backend
 from core.backends.workbuddy import WorkBuddyBackend
 
 from conftest import ROOT as CONFTEST_ROOT  # 项目根，见 tests/conftest.py
@@ -208,7 +208,7 @@ def test_map_model_does_not_strip_prefix_anymore():
 
 def test_trae_static_models_count():
     assert len(TRAE_MODELS := T.TRAE_STATIC_MODELS) == 20
-    assert len(trae_model_ids()) == 20
+    assert len(catalog_ids("trae")) == 20
     assert all(m["owned_by"] == "trae-solo" for m in TRAE_MODELS)
 
 
@@ -1460,7 +1460,8 @@ def test_manager_fetch_models_menu_failure_raises(tmp_path):
 def test_function_chain_prefers_cached_and_retries():
     """function 自适应：默认 work_lite，记住 agent 后优先 agent。"""
     assert T.function_chain("brand-new-model") == ["solo_work_lite", "solo_agent_remote", T.AGENT_STEP]
-    T.remember_function("brand-new-model", "solo_agent_remote")
+    with T._FUNCTION_LOCK:
+        T._FUNCTION_CACHE["brand-new-model"] = "solo_agent_remote"
     try:
         assert T.function_chain("brand-new-model") == ["solo_agent_remote", "solo_work_lite", T.AGENT_STEP]
     finally:
@@ -1677,13 +1678,13 @@ def test_ent_usage_falls_back_to_summary_without_packs():
 
 def test_catalog_provider_drives_map_model_and_ids():
     from core.backends import registry as R
-    assert R.trae_model_ids() == [m["id"] for m in T.TRAE_STATIC_MODELS]  # 无提供者→静态
+    assert R.catalog_ids("trae") == [m["id"] for m in T.TRAE_STATIC_MODELS]  # 无提供者→静态
     T.set_catalog_provider(lambda: [{"id": "brand-new-model", "name": "BN", "context_length": 999}])
     try:
         assert T.trae_model_catalog()[0]["id"] == "brand-new-model"
         assert T.map_model("brand-new-model") == "brand-new-model"
         assert T.map_model("brand_new_model") == "brand-new-model"
-        assert R.trae_model_ids() == ["brand-new-model"]
+        assert R.catalog_ids("trae") == ["brand-new-model"]
         with pytest.raises(T.UnknownTraeModel):
             T.map_model("glm-5.2")  # 动态表没有它 → 未知
     finally:

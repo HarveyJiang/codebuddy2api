@@ -94,7 +94,7 @@ DEFAULT_DOMAIN = "www.codebuddy.cn"
 #   值写 WorkBuddy → 上游记录 client="WorkBuddy"（目标）
 # 其余头保持「已验证能出值」的组合（见 git 历史 FULL 实验）。
 # 桌面端真实 UA 形如 WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0。
-# 本网关支持 WORKBUDDY_PRODUCT_* 环境变量覆盖（旧名 CLIENT_INFO_* 仍兼容）。
+# 网关支持 WORKBUDDY_PRODUCT_* 环境变量覆盖（旧名 CLIENT_INFO_* 仍兼容）。
 _PRODUCT_NAME = config.raw("WORKBUDDY_PRODUCT_NAME", "WorkBuddy")
 _PRODUCT_VERSION = config.raw("WORKBUDDY_PRODUCT_VERSION", "5.8.2")
 _UA_EXTENSION = config.raw("WORKBUDDY_UA_EXTENSION", "CLI/2.161.0")
@@ -1169,19 +1169,6 @@ async def _stream_upstream(
     _log_debug(
         f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8', 'replace')}"
     )
-
-
-def _safe_err(r: httpx.Response) -> dict:
-    try:
-        return {"error": r.json()}
-    except Exception:
-        return {
-            "error": {
-                "message": r.text[:500],
-                "type": "upstream_error",
-                "code": r.status_code,
-            }
-        }
 
 
 def _err_event(msg: bytes, status: int) -> bytes:

@@ -49,13 +49,10 @@ REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 REQUEST_LOG_CONTEXT = "codebuddy.request_log"
 #: 裸名路由的选定后端（§5），由池中间件写、converter 读。
 #:
-#: **为什么必须共享**：中间件在选号**之前**定后端（选号要按 backend 过滤），
-#: 而 converter 的 `resolve_backend` 也要给出同一个后端 —— 否则
-#: `_resolve_backend_or_http` 的「凭据-后端一致性闸门」会发现「选定后端 ≠
-#: 账号后端」而回 503，裸名请求全挂。
-#:
-#: 两处各算一遍是不行的：它们是**两次**独立决策，中间隔着选号（以及可能的排队
-#: 换号），任何一边的状态变化都会让两者分叉。所以只算一次、放在 scope 上。
+#: 必须共享：中间件在选号**之前**定后端（选号要按 backend 过滤），converter
+#: 的 `resolve_backend` 也要给出同一个后端——否则「凭据-后端一致性闸门」
+#: 会发现「选定后端 ≠ 账号后端」而回 503，裸名请求全挂。两处各算一遍会
+#: 分叉（中间隔着选号与可能的排队换号），所以只算一次、放在 scope 上。
 ROUTED_BACKEND = "codebuddy.routed_backend"
 _logger = logging.getLogger("admin.pool")
 CN = timezone(timedelta(hours=8))
@@ -1716,8 +1713,6 @@ class PoolMiddleware:
             raise
         finally:
             REQUEST_CREDENTIAL.reset(token)
-        # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
-        # 采信上游明示的恢复时刻（见 admin/reset_at.py）。
         # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
         # 采信上游明示的恢复时刻（见 admin/reset_at.py）。error_code 供 WAF
         # 判定（见 admin/rotation.py）。
