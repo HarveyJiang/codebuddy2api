@@ -559,6 +559,28 @@ class TraeEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert all(m["owned_by"] == "trae-solo" for m in trae)
         assert any(m["id"] == "trae/glm-5.2" for m in trae)
 
+    async def test_owned_by_comes_from_backend_declaration(self):
+        """`/v1/models` 的 owned_by 必须来自**后端声明**（BackendSpec.owned_by）。
+
+        回归：这里原先是 `"trae-solo" if m.startswith("trae/") else "codebuddy"`，
+        把「这个模型归哪个后端」硬编码在调用方。后果是——改了某后端的 owned_by
+        声明，`/v1/models` 不会跟着变；加一个后端也会悄悄落到 else 分支。
+        现在走 backend_name_for（先 pinned 后前缀）+ spec_for().owned_by。
+        这条逐条对照声明，任一处退回硬编码就会红。
+        """
+        from core.backends.registry import spec_for
+
+        r = await self.client.get("/v1/models", headers={"Authorization": "Bearer " + API})
+        data = r.json()["data"]
+        assert data
+        for m in data:
+            expected = spec_for(backend_name_for(m["id"])).owned_by
+            assert m["owned_by"] == expected, (
+                f"{m['id']} 的 owned_by={m['owned_by']}，声明是 {expected}")
+        # 两个后端的 owned_by 确实不同（否则上一条会退化成恒真）。
+        assert {m["owned_by"] for m in data} == {
+            spec_for("workbuddy").owned_by, spec_for("trae").owned_by}
+
     async def test_account_rows_trae_expiry_milliseconds(self):
         rows = {r["backend"]: r for r in self.app.state.store.account_rows()}
         assert "trae" in rows and "workbuddy" in rows

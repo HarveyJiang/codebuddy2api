@@ -180,8 +180,14 @@ def map_model(model: str) -> str:
     其他                      → UnknownTraeModel
     """
     name = (model or "").strip()
-    if name.startswith("trae/"):
-        name = name[len("trae/"):].strip()
+    # 剥掉本后端的前缀用**声明**（spec 里那个），不写死 "trae/" 字面量 ——
+    # 前缀是后端自己的属性，写死会让「改前缀」变成两处要同步的事。
+    # 局部 import 与 set_catalog_provider 同因：registry ↔ trae 模块级引用成环。
+    from .registry import spec_for
+
+    _prefix = spec_for("trae").model_prefix
+    if _prefix and name.startswith(_prefix):
+        name = name[len(_prefix):].strip()
     if name in ("", "auto", "default"):
         return DEFAULT_CONFIG_NAME
     if "__" in name:

@@ -64,6 +64,7 @@ from .backends.registry import (  # noqa: F401（re-export 便利）
     backend_name_for,
     make_credential,
     resolve_backend,
+    spec_for,
 )
 from .workbuddy_atrest_crypto import (  # issue #23：WorkBuddy 5.6.0 $wbEncrypted 信封
     decrypt_auth_field,
@@ -628,7 +629,11 @@ def list_models(
             "id": m,
             "object": "model",
             "created": 1700000000,
-            "owned_by": "trae-solo" if m.startswith("trae/") else "codebuddy",
+            # owned_by 取自**后端自己的声明**（BackendSpec.owned_by），不再用
+            # `m.startswith("trae/")` 猜——那是把「谁是我」的判断硬编码在调用方，
+            # 加/改后端时这里会悄悄失效（声明里改了 owned_by 也同步不过来）。
+            # backend_name_for 是「模型名 → 后端名」的唯一判定处（先 pinned 后前缀）。
+            "owned_by": spec_for(backend_name_for(m)).owned_by,
         }
         for m in models
     ]
