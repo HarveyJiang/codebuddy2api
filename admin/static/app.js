@@ -1214,8 +1214,13 @@ function openKeyBind(k) {
     list($("key-bind-models"), rows, selectedModels, m => {
       const bits = [creditsText(m)];
       if (m.promo) bits.push(`${m.promo.label} ×${m.promo.credits}`);
-      const extra = m.name && m.name !== m.value ? `（${m.name}）` : "";
-      return {text: `${m.value}${extra}（${bits.join(" · ")}）`, title: m.promo ? `${m.promo.label} 折扣后 ×${m.promo.credits}` : ""};
+      // name 只在**不是 id 的简单变体**时显示（用户反馈：MiniMax-M2.7
+      // 这类「id 换大小写」的 name 是冗余）。只显示首字母大小写差异的
+      // （去掉分隔符后忽略大小写相等）不重复展示。
+      const norm = s => String(s).replace(/[-_.\s]/g, "").toLowerCase();
+      const showName = m.name && m.name !== m.value && norm(m.name) !== norm(m.value);
+      return {text: `${m.value}${showName ? `（${m.name}）` : ""}（${bits.join(" · ")}）`,
+        title: m.promo ? `${m.promo.label} 折扣后 ×${m.promo.credits}` : ""};
     });
   };
   bindTabsBox.hidden = !bindTabs.length || models.length < 2;
