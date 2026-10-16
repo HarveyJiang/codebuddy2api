@@ -1199,6 +1199,10 @@ function openKeyBind(k) {
   bindTabsBox.hidden = !bindTabs.length || models.length < 2;
   paintBindTabs();
   paintBindModels();
+  // 勾选/取消模型时页签 badge 要实时刷新（用户报告：已勾选仍显示 0/20）——
+  // 只在打开和切页签时重画是不够的。用 onclick 而非 addEventListener：
+  // 本函数每次开弹框都会执行，onclick 赋值幂等，不会叠挂监听器。
+  $("key-bind-models").onclick = () => paintBindTabs();
   // 可用账号：名字前带账号类型 icon（用户拍板）—— 多后端账号池里一眼分清
   // 这是哪个上游的账号，与模型页签的 icon 口径一致。括号里不显示 id 前缀
   // （机器可读对人不友好，用户拍板）：改显示 余额 / 最近过期积分。
