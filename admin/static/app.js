@@ -1242,6 +1242,29 @@ async function copy(value) { try { await navigator.clipboard.writeText(value); t
 $("copy-key").addEventListener("click", () => copy($("new-key-value").textContent));
 document.querySelectorAll("[data-copy]").forEach(b => b.addEventListener("click", () => copy(b.dataset.copy)));
 $("base-url").textContent = location.origin + "/v1"; $("anthropic-url").textContent = location.origin;
+// -- 接口行内调试（用户拍板：接入指南每个接口行带「调试」按钮）-------------
+// GET /v1/models：走 /admin/api/debug/models —— 服务端用临时 test_key 打
+// **真实公开接口**（同一条 check_api 鉴权路径），把状态码/耗时/原样 body 带回。
+// 不从浏览器直接 fetch：那需要客户端完整 key，而 admin API 不会下发它（安全）。
+// POST 接口会真实消耗上游额度且需要请求体，引导到「连接测试」页（那里已有
+// 完整的模型选择与响应展示），不在这里重复一份。
+async function debugModels(btn) {
+  btn.disabled = true; btn.textContent = "请求中…";
+  try {
+    const r = await api("debug/models");
+    $("model-debug-meta").textContent = `${r.status} · ${r.ms}ms` + (r.count !== null && r.count !== undefined ? ` · ${r.count} 个模型` : "");
+    $("model-debug-output").textContent = r.body;
+    $("model-debug-dialog").showModal();
+  } catch (err) { toast("请求失败：" + err.message); }
+  finally { btn.disabled = false; btn.textContent = "调试"; }
+}
+document.querySelectorAll("[data-endpoint-debug]").forEach(b => b.addEventListener("click", () => {
+  const ep = b.dataset.endpointDebug;
+  if (ep === "models") { debugModels(b); return; }
+  // chat / responses / messages：跳连接测试页。models 下拉在测试页打开时
+  // 会随 refresh 填充，这里只需切页。
+  goPage("test");
+}));
 $("copy-base").addEventListener("click", () => copy(location.origin + "/v1")); $("copy-anthropic").addEventListener("click", () => copy(location.origin));
 $("host-label").textContent = location.host;
 $("models-refresh").addEventListener("click", async () => {

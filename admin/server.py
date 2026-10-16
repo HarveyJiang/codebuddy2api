@@ -2169,6 +2169,41 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             store.save()
         return {"ok": True}
 
+    @app.get("/admin/api/debug/models")
+    async def debug_models_endpoint(req: Request):
+        """接入指南「调试 /v1/models」：从服务端发起一次**真实的公开接口调用**。
+
+        管理页不能直接从浏览器 fetch /v1/models —— 那需要客户端完整 key，而
+        admin API 不会下发（安全）。走这里：临时 test_key 进 test_keys 集合、
+        经同一条 check_api 鉴权路径打真实 /v1/models，把状态码/耗时/原样 body
+        带回来。所见即客户端所得，但不需要把密钥暴露给前端。
+        """
+        store.require_admin(req)
+        if store.test_lock.locked():
+            raise HTTPException(409, "已有测试正在进行")
+        async with store.test_lock:
+            started = time.monotonic()
+            with store.lock:
+                temp_key = secrets.token_urlsafe(48)
+                store.test_keys.add(digest(temp_key))
+            internal_app = PoolMiddleware(converter.app, pool=pool, model_registry=model_registry)
+            try:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(internal_app, metrics, source="test", store=store)), base_url="http://internal") as client:
+                    result = await asyncio.wait_for(client.get("/v1/models", headers={"Authorization": "Bearer " + temp_key}), timeout=15)
+                body = result.text
+                try:
+                    body = json.dumps(json.loads(body), ensure_ascii=False, indent=2)
+                except (ValueError, TypeError):
+                    pass
+                count = len(result.json().get("data", [])) if result.status_code == 200 else None
+                return {"status": result.status_code, "ms": round((time.monotonic() - started) * 1000),
+                        "count": count, "body": body}
+            except (Exception, asyncio.TimeoutError):
+                raise HTTPException(502, "调用 /v1/models 失败或超时")
+            finally:
+                with store.lock:
+                    store.test_keys.discard(digest(temp_key))
+
     @app.post("/admin/api/test")
     async def test_model(req: Request):
         store.require_admin(req)
