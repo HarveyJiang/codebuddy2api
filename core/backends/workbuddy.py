@@ -20,8 +20,8 @@ class WorkBuddyBackend(BackendSpec):
     owned_by = "codebuddy"
     tencent_policies = True
 
-    # 默认后端：接管所有不带前缀的模型名（含 auto）。
-    model_prefix = ""
+    # 默认后端：裸名（以及 auto / 空）在没有候选时都落到本后端。
+    # `model_prefix` 留空 —— 本后端**从未**用过前缀（见 BackendSpec 的说明）。
     default_for_missing_backend = True
 
     # 管理页元数据（需求 2/5/7）

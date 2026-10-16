@@ -27,10 +27,14 @@ from core.backends.base import BackendSpec
 # --------------------------------------------------------------------------
 
 def test_every_backend_has_unique_prefix():
-    """前缀必须互不冲突，否则同一模型名会被两个后端争抢（路由不确定）。"""
+    """**历史前缀**（仅供迁移读取）必须互不冲突，否则迁移会剥错行。
+
+    v16 起运行期不再用前缀路由，所以这条已从「路由唯一性」降级为「迁移数据的
+    可判定性」：两个后端声明同一个历史前缀，剥前缀时无法区分是哪一家的行。
+    """
     prefixes = [registry.spec_for(n).model_prefix for n in registry.known_names()]
     nonempty = [p for p in prefixes if p]
-    assert len(nonempty) == len(set(nonempty)), f"前缀重复：{prefixes}"
+    assert len(nonempty) == len(set(nonempty)), f"历史前缀重复：{prefixes}"
 
 
 def test_default_backend_comes_from_the_declaration(monkeypatch):
@@ -327,7 +331,7 @@ def test_backend_meta_shape_and_order():
     meta = registry.backend_meta()
     assert {m["name"] for m in meta} == set(registry.known_names())
     for m in meta:
-        for key in ("name", "label", "short", "icon", "color", "order", "prefix", "login_kind", "enabled", "default"):
+        for key in ("name", "label", "short", "icon", "color", "order", "login_kind", "enabled", "default"):
             assert key in m, f"{m['name']} 缺字段 {key}"
         assert m["label"] and m["short"] and m["icon"], f"{m['name']} 展示字段为空"
     # 顺序：order 升序，默认后端在最前。
@@ -336,10 +340,14 @@ def test_backend_meta_shape_and_order():
     assert meta[0]["name"] == registry.default_name()
 
 
-def test_backend_meta_trae_carries_prefix_and_kind():
-    """Trae 的前缀与登录方式来自声明，前端据此渲染。"""
+def test_backend_meta_trae_carries_kind_not_prefix():
+    """Trae 的登录方式来自声明，前端据此渲染。
+
+    `prefix` **不再出现在元数据里**（v16 去前缀；前端也不再读它）——
+    这条顺带守住「有人把 prefix 加回元数据」的回归。
+    """
     trae = next(m for m in registry.backend_meta() if m["name"] == "trae")
-    assert trae["prefix"] == "trae/"
+    assert "prefix" not in trae, "去前缀后元数据不该再下发 prefix"
     assert trae["login_kind"] == "trae"
     assert trae["default"] is False
 
@@ -349,26 +357,39 @@ def test_backend_meta_trae_carries_prefix_and_kind():
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("model,expected", [
+    # v16 去前缀后 `backend_name_for` 只剩两条规则：pinned → 声明的后端；其余 → 默认后端。
+    # 它给的是**静态兜底**（同名多后端时不知道此刻该走谁——那是 pool 的裸名策略）。
     ("glm-5.2", "workbuddy"),
     ("auto", "workbuddy"),
     ("", "workbuddy"),
     (None, "workbuddy"),
     (123, "workbuddy"),
-    ("trae/glm-5.2", "trae"),
-    ("trae/", "trae"),
+    ("trae/glm-5.2", "workbuddy"),   # 前缀已无路由含义 → 归默认后端
     ("mytrae/x", "workbuddy"),
+    ("fast-model", "workbuddy"),     # pinned：声明归默认后端
 ])
-def test_backend_name_for_routes_by_declared_prefix(model, expected):
+def test_backend_name_for_is_pinned_else_default(model, expected):
     assert registry.backend_name_for(model) == expected
 
 
-def test_prefix_helpers_round_trip():
-    assert registry.prefix_for("trae/kimi") == "trae/"
-    assert registry.prefix_for("kimi") == ""
-    assert registry.strip_prefix("trae/kimi") == "kimi"
-    assert registry.strip_prefix("kimi") == "kimi"
-    # 前缀之外的空白要吃掉，避免 "trae/ kimi" 带着空格进 map_model。
-    assert registry.strip_prefix("trae/  kimi  ") == "kimi"
+def test_prefix_helpers_are_gone():
+    """前缀辅助函数已删除（v16 去前缀）。
+
+    守住「有人把它们加回来」：这几个函数的存在本身会吸引新代码写
+    `strip_prefix(model)` 这种运行期剥前缀，而它在新世界里只会把
+    `openrouter/free` 这类真实模型名误伤。
+    """
+    for name in ("prefix_for", "strip_prefix", "backend_name_for_prefix"):
+        assert not hasattr(registry, name), f"{name} 应已删除"
+
+
+def test_model_prefix_declaration_still_exists_for_migrations():
+    """`model_prefix` **不能删** —— `admin/db.py` 的两个迁移要靠它认历史前缀。
+
+    删了就只能写死 `"trae/"` 字面量，那正是「加后端要改多处」。
+    """
+    assert registry.spec_for("trae").model_prefix == "trae/"
+    assert registry.spec_for("workbuddy").model_prefix == ""
 
 
 def test_spec_for_unknown_falls_back_to_default():
@@ -391,7 +412,10 @@ class _FakeBackend(BackendSpec):
 
     name = "fake"
     owned_by = "fake-org"
+    # 历史前缀（仅供迁移读取）——本测试用它验证「声明仍被保留」。
     model_prefix = "fake/"
+    # 声明式路由：这些裸名永远归本后端（v16 后这是「加后端不用改调用方」的机制）。
+    pinned_models = ("fake-pinned",)
     label = "Fake"
     short = "FK"
     icon = "★"
@@ -478,14 +502,28 @@ def fake_backend(monkeypatch):
     return _FakeBackend
 
 
-def test_new_backend_is_routed_without_touching_callers(fake_backend):
-    """路由自动认新前缀 —— 调用方一行没改。"""
-    assert registry.backend_name_for("fake/whatever") == "fake"
-    assert registry.prefix_for("fake/whatever") == "fake/"
-    assert registry.strip_prefix("fake/whatever") == "whatever"
+def test_new_backend_is_recognized_without_touching_callers(fake_backend):
+    """新后端**无需改调用方**就被认出来：known_names / meta / spec_for / 账号分派。
+
+    v16 去前缀后不再有「按前缀路由」这条自动接线，所以这里改验**声明驱动的
+    三件事**仍然自动跟上：白名单、前端元数据、凭据分派。它们正是「加后端只改
+    一个文件」的实质 —— 前缀只是过去用来做路由的一种手段。
+    """
+    assert "fake" in registry.known_names()
+    assert registry.spec_for("fake").label == "Fake"
+    meta = {m["name"]: m for m in registry.backend_meta()}
+    assert meta["fake"]["owned_by"] if "owned_by" in meta["fake"] else True
+    assert meta["fake"]["icon"] == "★"
+    # `resolve_backend(fake/...)` 不再是「认前缀」而是「默认后端 + 原样名」：
+    # 想真的把请求路由到新后端，必须走 pinned 或 pool 的裸名策略。
     spec, upstream = registry.resolve_backend("fake/whatever")
-    assert spec.name == "fake"
-    assert upstream == "whatever"
+    assert spec.name == registry.default_name()
+
+
+def test_new_backend_pinned_models_route_by_declaration(fake_backend):
+    """新后端可以用 `pinned_models` 声明「这些裸名永远归我」——不用改任何调用方。"""
+    assert registry.pinned_model_owner("fake-pinned") == "fake"
+    assert registry.backend_name_for("fake-pinned") == "fake"
 
 
 def test_new_backend_appears_in_known_names_and_meta(fake_backend):
@@ -539,8 +577,10 @@ def test_make_credential_dispatches_lazy_backend_by_name(lazy_backend, tmp_path)
     f.write_text(json.dumps({"backend": "lazyfake", "auth": {}, "account": {}}), encoding="utf-8")
     # 分派到 _LazyFakeBackend.make_credential（返回 None），而不是默认后端的管理器。
     assert registry.make_credential(f) is None
-    # 尚未构造也能被路由（不是靠「已经构造过」）。
-    assert registry.backend_name_for("lazy/x") == "lazyfake"
+    # 尚未构造也能被凭据分派认出来（不是靠「已经构造过」）。
+    # 注意：v16 去前缀后 `backend_name_for("lazy/x")` 不再按前缀路由（恒为默认后端）——
+    # 「认不认得出这个后端」改由 **make_credential 的分派**验证（上面那一行）。
+    assert registry.spec_for("lazyfake").name == "lazyfake"
 
 
 def test_make_credential_does_not_eagerly_construct_lazy_backend(lazy_backend, tmp_path):
@@ -554,9 +594,8 @@ def test_make_credential_does_not_eagerly_construct_lazy_backend(lazy_backend, t
 
 
 def test_unknown_prefix_is_not_mistaken_for_a_backend():
-    """只有**声明过的**前缀才路由；别的名字照常走默认后端。"""
+    """只有**声明过的**名字才路由；带斜杠的名字照常走默认后端（v16 后无前缀语义）。"""
     assert registry.backend_name_for("notfake/x") == "workbuddy"
-    assert registry.strip_prefix("notfake/x") == "notfake/x"
 
 
 # --------------------------------------------------------------------------

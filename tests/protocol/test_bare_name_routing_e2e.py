@@ -153,11 +153,18 @@ class BareNameRoutingEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self._last_log_backend(), "workbuddy")
 
-    async def test_prefixed_request_bypasses_strategy(self):
-        """§4：`trae/xxx` 是用户点名要 Trae，绕过自动选择（行为不变）。"""
+    async def test_prefix_no_longer_selects_a_backend(self):
+        """§4 已废：`trae/xxx` 不再「点名 Trae」—— v16 去前缀后 id 就是上游裸名。
+
+        旧契约是「带前缀 = 用户点名后端、绕过策略」。去前缀后这个写法只剩两种
+        可能结局，两种都不该发生（请求名里不该再出现自造前缀）：
+        - 前缀名在任一目录里都不存在 → 400（`trae/glm-5.2` 不是一个真模型名）；
+        - 或（若恰好同名）被当成普通裸名按策略路由。
+
+        这里钉住**第一种**：自造前缀名应当 400，而不是被某个后端接住。
+        """
         r = await self._post("trae/glm-5.2")
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self._last_log_backend(), "trae")
+        self.assertEqual(r.status_code, 400, r.text)
 
     async def test_models_list_lists_every_backend_row_with_its_owner(self):
         """`/v1/models` 每行按**自己的后端**报 `owned_by`（用户 2026-10-16 拍板）。
@@ -292,8 +299,8 @@ class StrategyProviderIsolationTests(unittest.TestCase):
         # 裸名：策略炸了 → 回落静态归属（默认后端），不抛。
         got = _owner_backend_for("glm-5.3")
         self.assertEqual(got, "workbuddy")
-        # 带前缀的：根本不查策略（用户已点名）。
-        self.assertEqual(_owner_backend_for("trae/glm-5.3"), "trae")
+        # pinned（三档路由）：**不查策略**，直接取声明归属 —— 那条分支不依赖 provider。
+        self.assertEqual(_owner_backend_for("fast-model"), "workbuddy")
 
 
 if __name__ == "__main__":

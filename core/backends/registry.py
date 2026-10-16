@@ -126,28 +126,13 @@ def spec_for(name) -> BackendSpec:
     return spec_for(default_name())
 
 
-def prefix_for(model) -> str:
-    """模型名命中的后端前缀（无前缀 → 空串）。"""
-    for name in known_names():
-        prefix = spec_for(name).model_prefix
-        if prefix and isinstance(model, str) and model.startswith(prefix):
-            return prefix
-    return ""
-
-
-def strip_prefix(model) -> str:
-    """剥掉后端前缀，得到上游模型名（无前缀时原样返回）。"""
-    prefix = prefix_for(model)
-    return model[len(prefix):].strip() if prefix else (model or "")
-
-
 def canonical_name(model) -> str:
-    """模型名（对外 id 或上游 id）→ **规范名** —— 跨后端的同一个模型。
+    """模型名 → **规范名** —— 跨后端的同一个模型。
 
     规则（specs/model-routing-by-policy.md §4，用户已拍板）：
     1. 先看所属后端的 ``canonical_for`` 声明里有没有**非恒等**映射 ——
        有就用它（``kimi-k3-1 → kimi-k3``）；
-    2. 否则默认 = ``model_id`` **剥掉后端前缀**。
+    2. 否则默认 = ``model_id`` **原样**（v16 去前缀后它已是上游裸名）。
 
     只声明非恒等映射：恒等映射没有信息量，却让每个新后端都要为自己的每个
     模型抄一遍自己的 id，改上游 id 时反而多一处要同步的地方。
@@ -157,15 +142,11 @@ def canonical_name(model) -> str:
     """
     mid = str(model or "")
     backend = backend_name_for(mid)
-    upstream = strip_prefix(mid)
     mapping = spec_for(backend).canonical_for or {}
-    # 映射键优先按**上游 id**（剥前缀后）匹配：`canonical_for` 是「上游叫什么 →
-    # 规范名叫什么」，写声明时不用关心前缀（前缀是本后端的属性，不该抄进映射）。
-    if upstream in mapping:
-        return str(mapping[upstream]).strip() or upstream
+    # 映射键是「上游 id → 规范名」。v16 去前缀后 `mid` 就是上游 id，直接匹配。
     if mid in mapping:
-        return str(mapping[mid]).strip() or upstream
-    return upstream
+        return str(mapping[mid]).strip() or mid
+    return mid
 
 
 #: 设置页总闸的数据源（``{后端名: 是否启用}``，缺键即启用）。
@@ -236,35 +217,23 @@ def pinned_model_owner(model) -> str | None:
 
 
 def backend_name_for(model) -> str:
-    """中间件/池用：模型名 → 后端名（不 raise）。无前缀 → 默认后端。
+    """中间件/池用：模型名 → 后端名（不 raise）。
 
-    判定顺序（两处都读**声明**，不认后端名）：
+    判定顺序（读**声明**，不认后端名）：
 
     1. **私有模型**（``BackendSpec.pinned_models``）：无前缀的虚拟模型（三档
-       智能路由）由声明指定归属，不走「无前缀 ⇒ 默认后端」的兜底；
-    2. **前缀**：带前缀的 id 归声明了该前缀的后端。
+       智能路由）由声明指定归属，不走「一律默认后端」的兜底；
+    2. 否则 → 默认后端。
 
-    两处都没有 ⇒ 默认后端（``auto`` 及一切裸名走这里）。
-
-    **注意**：这里给的是「静态归属」，不含裸名策略选择（§5）。裸名请求要走
-    自动选择时用 ``admin/pool.py`` 的 `_resolve_backend_for`（它在
-    pinned/前缀之外还查候选集与顺序）。本函数仍是那些情形的正确答案，
-    也是 kill switch 关掉时的回落值。
+    **注意**：v16 去前缀后 `model_id` 是上游裸名，同名模型在两个后端各有一行
+    （生产实测 8 组），所以这个函数给出的只是「**静态兜底**」—— 想知道某个裸名
+    此刻该走谁，要用 ``admin/pool.py`` 的裸名策略（§5）；想读某一行**存下来**的
+    归属，要读 `models.backend` 列（`admin/models.py` 的 `load` 就是这么做的）。
+    本函数仍是 pinned 与「无候选时」的正确回落值，也是 kill switch 关掉时的回落值。
     """
     pinned = pinned_model_owner(model)
     if pinned is not None:
         return pinned
-    prefix = prefix_for(model)
-    if prefix:
-        return backend_name_for_prefix(prefix)
-    return default_name()
-
-
-def backend_name_for_prefix(prefix) -> str:
-    """前缀 → 后端名（无匹配 → 默认后端）。"""
-    for name in known_names():
-        if spec_for(name).model_prefix == prefix:
-            return name
     return default_name()
 
 
@@ -280,26 +249,25 @@ def trae_enabled() -> bool:
 def resolve_backend(model, routed=None) -> tuple[BackendSpec, str]:
     """返回 (spec, upstream_model)。
 
-    `trae/<名>` → TraeBackend + map_model 归一后的 config_name；
-    未知 Trae 模型 → HTTPException(400)（CODEBUDDY_TRAE_ALLOW_UNKNOWN_MODELS=1 时放行透传）。
-    其余 → WorkBuddyBackend + 原模型名（空/auto 由各端点自行 setdefault）。
+    v16 去前缀后**所有**请求模型名都是上游裸名（不再有 `trae/<名>` 这种写法）。
+    归属由 `routed` 给出——池中间件按 §5 策略选定的后端；不传（旧调用/单测/
+    无中间件的部署形态）则回落「默认后端」。
+
+    Trae 的裸名仍要经 ``map_model`` 归一（别名 → config_name），未知模型 → 400
+    （``CODEBUDDY_TRAE_ALLOW_UNKNOWN_MODELS=1`` 时放行透传）。
 
     ``routed``：池中间件为**裸名**请求选定的后端（§5 裸名路由）。
-    传了就按它解析（中间件已经做过候选集与策略判定，这里是同一个答案）；
-    不传（旧调用/单测/无中间件的部署形态）则回落「裸名走默认后端」。
 
     **为什么不让这里自己算一遍**：中间件的决策发生在**选号之前**，而这里的
     调用发生在选号**之后**（凭据已经绑在请求上）。两次独立决策之间状态可能变
     （排队换号、启停），算两遍就会分叉 —— 分叉的直接后果是凭据-后端一致性闸门
     回 503。所以决策只做一次，这里只**消费**结果。
     """
-    prefix = prefix_for(model)
-    if not prefix and routed:
-        # 裸名 + 中间件已选定后端：按选定后端的归属解析上游模型名。
+    if routed:
         name = routed
         if not is_enabled(name):
-            # 与下面带前缀分支同一句话：中间件启用时它就在候选里，能走到这里
-            # 说明是极端竞态（决策后立刻被禁用），照旧给可理解的文案。
+            # 中间件启用时它就在候选里，能走到这里说明是极端竞态
+            # （决策后立刻被禁用），照旧给可理解的文案。
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -309,40 +277,35 @@ def resolve_backend(model, routed=None) -> tuple[BackendSpec, str]:
                     }
                 },
             )
-        return spec_for(name), (model if isinstance(model, str) else "")
-    if prefix:
-        name = backend_name_for(model)
-        if not is_enabled(name):
-            # 文案不区分「谁关的」：环境逃生门关掉时提示「管理员禁用」也不算错
-            # （管理员就是运维），统一一句比让用户对着两种措辞猜要省事。
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "message": f"{spec_for(name).label} 后端已被管理员禁用",
-                        "type": "invalid_request_error",
-                    }
-                },
-            )
-        raw = strip_prefix(model)
-        if name == "trae":
-            trae = backend_module("trae")
-            if os.environ.get("CODEBUDDY_TRAE_ALLOW_UNKNOWN_MODELS", "0") == "1":
-                return spec_for("trae"), raw
-            try:
-                return spec_for("trae"), trae.map_model(raw)
-            except trae.UnknownTraeModel as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": {
-                            "message": f"未知的 Trae 模型：{raw}",
-                            "type": "invalid_request_error",
-                        }
-                    },
-                ) from e
-        return spec_for(name), raw
-    return spec_for(default_name()), (model if isinstance(model, str) else "")
+        return spec_for(name), _upstream_name_for(name, model)
+    return spec_for(default_name()), _upstream_name_for(default_name(), model)
+
+
+def _upstream_name_for(backend_name, model):
+    """该后端的**上游模型名**：Trae 走 map_model 归一，其余原样。
+
+    单独抽出来是因为「routed 分支」与「回落默认后端分支」要用**同一套**归一逻辑
+    —— 两处各写一遍，将来给某个后端加归一时必然漏掉一处（漏的那处表现为
+    「走策略时能调通、回落时 400」这种只在特定路径出现的怪象）。
+    """
+    raw = model if isinstance(model, str) else ""
+    if backend_name != "trae":
+        return raw
+    trae = backend_module("trae")
+    if os.environ.get("CODEBUDDY_TRAE_ALLOW_UNKNOWN_MODELS", "0") == "1":
+        return raw
+    try:
+        return trae.map_model(raw)
+    except trae.UnknownTraeModel as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"未知的 Trae 模型：{raw}",
+                    "type": "invalid_request_error",
+                }
+            },
+        ) from e
 
 
 def make_credential(path):
@@ -384,7 +347,6 @@ def backend_meta() -> list[dict]:
             "icon_svg": spec.icon_svg,
             "color": spec.color,
             "order": spec.order,
-            "prefix": spec.model_prefix,
             "login_kind": spec.login_kind,
             # 两个字段分开给：enabled = 总闸 ∧ 逃生门（整体启不启用），
             # env_disabled = 单看逃生门。前端靠后者把这类框置灰并说明原因——

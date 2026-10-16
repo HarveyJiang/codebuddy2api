@@ -180,14 +180,6 @@ def map_model(model: str) -> str:
     其他                      → UnknownTraeModel
     """
     name = (model or "").strip()
-    # 剥掉本后端的前缀用**声明**（spec 里那个），不写死 "trae/" 字面量 ——
-    # 前缀是后端自己的属性，写死会让「改前缀」变成两处要同步的事。
-    # 局部 import 与 set_catalog_provider 同因：registry ↔ trae 模块级引用成环。
-    from .registry import spec_for
-
-    _prefix = spec_for("trae").model_prefix
-    if _prefix and name.startswith(_prefix):
-        name = name[len(_prefix):].strip()
     if name in ("", "auto", "default"):
         return DEFAULT_CONFIG_NAME
     if "__" in name:
@@ -1133,7 +1125,10 @@ class TraeBackend(BackendSpec):
     owned_by = "trae-solo"
     tencent_policies = False
 
-    # 路由前缀：`trae/<名>` → 本后端，剥前缀后 map_model 归一为上游 config_name。
+    # 历史前缀（v16 起对外 id 就是上游裸名，运行期不再拼接）。
+    # **仅供 `admin/db.py` 的迁移读取**：老库里 `trae/glm-5.2` 这类行靠它认出来
+    # 剥掉；删了迁移就只能写死字面量。路由/展示/读库一律不得使用 —— 见
+    # `BackendSpec.model_prefix` 的说明与 arch guard。
     model_prefix = "trae/"
 
     # 管理页元数据（需求 2/5/7）

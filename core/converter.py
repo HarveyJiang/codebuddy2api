@@ -64,7 +64,6 @@ from .backends.registry import (  # noqa: F401（re-export 便利）
     backend_name_for,
     make_credential,
     pinned_model_owner,
-    prefix_for,
     resolve_backend,
     spec_for,
 )
@@ -663,16 +662,21 @@ def _listed_rows():
 
 
 def _owner_backend_for(model) -> str:
-    """`/v1/models` 里某个 id 的归属后端（§9.6）。
+    """`/v1/models` 里某个 id 的归属后端（**回落路径**）。
 
-    带前缀 / `pinned_models` → 声明的归属（不动，用户已点名）。
-    裸名 → **当前策略第一名**（与请求实际落点一致；客户端据此显示「这条会走谁」）。
+    **主路径**是 `ModelRegistry.listed_models()`：它逐行给出 `(id, backend)`，
+    于是同名模型在两个后端各一行、各自报自己的 `owned_by`（用户 2026-10-16 拍板）。
+    本函数只在**拿不到行清单**时兜底（admin 未加载 / 独立跑 converter / 单测）。
 
-    策略不可用时**回落** `backend_name_for`（今天的答案），不让展示路径因
+    兜底规则：
+    - `pinned_models` → 声明的归属（三档智能路由永远只可能归它）；
+    - 其余裸名 → **当前策略第一名**（与请求实际落点一致；客户端据此显示「这条会走谁」）。
+
+    策略不可用时**回落** `backend_name_for`（默认后端），不让展示路径因
     「没有可用候选」而报错 —— `/v1/models` 是**只读展示**，它列的模型可能此刻
     确实没有可用账号（全都禁用/冷却），那不是 500 的理由。
     """
-    if prefix_for(model) or pinned_model_owner(model) is not None:
+    if pinned_model_owner(model) is not None:
         return backend_name_for(model)
     try:
         from admin.bare_routing_provider import strategy_winner_for

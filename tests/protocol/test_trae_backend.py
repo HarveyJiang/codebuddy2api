@@ -185,7 +185,7 @@ def test_prepare_assistant_all_noname_drops_tool_calls():
     ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official"),
     ("deepseek_v4_pro_official", "DeepSeek-V4-Pro-Official"),  # 下划线/大小写不敏感兜底
     ("DEEPSEEK_V4_PRO_OFFICIAL", "DeepSeek-V4-Pro-Official"),
-    ("trae/kimi-k3", "kimi-k3"),
+    # v16：id 是上游裸名，`map_model` 不再剥前缀（`trae/kimi-k3` 不是合法上游名）。
 ])
 def test_map_model(model, expected):
     assert T.map_model(model) == expected
@@ -196,6 +196,16 @@ def test_map_model_unknown_raises():
         T.map_model("bogus-model")
 
 
+def test_map_model_does_not_strip_prefix_anymore():
+    """回归（v16）：`map_model` 必须**不再**剥 `trae/` 前缀。
+
+    去前缀前它靠 `spec_for("trae").model_prefix` 剥一层；现在上游 id 就是裸名，
+    再剥会把真正含斜杠的上游名（`openrouter/free` 这类）误伤成不存在的模型。
+    """
+    with pytest.raises(T.UnknownTraeModel):
+        T.map_model("trae/kimi-k3")
+
+
 def test_trae_static_models_count():
     assert len(TRAE_MODELS := T.TRAE_STATIC_MODELS) == 20
     assert len(trae_model_ids()) == 20
@@ -203,7 +213,12 @@ def test_trae_static_models_count():
 
 
 def test_resolve_backend_trae():
-    backend, upstream = resolve_backend("trae/deepseek_v4_pro_official")
+    """`routed="trae"` → TraeBackend + map_model 归一后的上游名。
+
+    v16 去前缀后，请求名是上游裸名（`deepseek_v4_pro_official`），
+    Trae 的归一（别名/大小写 → config_name）仍要走 `map_model`。
+    """
+    backend, upstream = resolve_backend("deepseek_v4_pro_official", routed="trae")
     assert backend.name == "trae"
     assert backend.tencent_policies is False
     assert upstream == "DeepSeek-V4-Pro-Official"
@@ -212,7 +227,7 @@ def test_resolve_backend_trae():
 def test_resolve_backend_unknown_trae_400():
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as ei:
-        resolve_backend("trae/bogus")
+        resolve_backend("bogus", routed="trae")
     assert ei.value.status_code == 400
 
 
@@ -220,18 +235,24 @@ def test_resolve_backend_kill_switch(monkeypatch):
     from fastapi import HTTPException
     monkeypatch.setenv("CODEBUDDY_ENABLE_TRAE", "0")
     with pytest.raises(HTTPException) as ei:
-        resolve_backend("trae/glm-5.2")
+        resolve_backend("glm-5.2", routed="trae")
     assert ei.value.status_code == 400
 
 
 def test_resolve_backend_escape_hatch(monkeypatch):
     monkeypatch.setenv("CODEBUDDY_TRAE_ALLOW_UNKNOWN_MODELS", "1")
-    backend, upstream = resolve_backend("trae/whatever")
+    backend, upstream = resolve_backend("whatever", routed="trae")
     assert backend.name == "trae"
     assert upstream == "whatever"
 
 
-@pytest.mark.parametrize("model,expected", [("glm-5.2", "workbuddy"), ("auto", "workbuddy"), (None, "workbuddy"), ("trae/x", "trae")])
+@pytest.mark.parametrize("model,expected", [
+    ("glm-5.2", "workbuddy"),
+    ("auto", "workbuddy"),
+    (None, "workbuddy"),
+    # v16：前缀不再有路由含义，`trae/x` 归默认后端（见 test_backends_workbuddy）。
+    ("trae/x", "workbuddy"),
+])
 def test_backend_name_for(model, expected):
     assert backend_name_for(model) == expected
 
@@ -1250,7 +1271,8 @@ def test_cred_backend_mismatch_503():
     token = pool.REQUEST_CREDENTIAL.set(_WBCred())
     try:
         with pytest.raises(Exception) as ei:
-            converter._resolve_backend_or_http("trae/glm-5.2")
+            # v16：用 `routed="trae"` 指定后端（前缀不再是路由手段）。
+            converter._resolve_backend_or_http("glm-5.2", routed="trae")
         assert getattr(ei.value, "status_code", None) == 503
     finally:
         pool.REQUEST_CREDENTIAL.reset(token)
@@ -1659,7 +1681,7 @@ def test_catalog_provider_drives_map_model_and_ids():
     T.set_catalog_provider(lambda: [{"id": "brand-new-model", "name": "BN", "context_length": 999}])
     try:
         assert T.trae_model_catalog()[0]["id"] == "brand-new-model"
-        assert T.map_model("trae/brand-new-model") == "brand-new-model"
+        assert T.map_model("brand-new-model") == "brand-new-model"
         assert T.map_model("brand_new_model") == "brand-new-model"
         assert R.trae_model_ids() == ["brand-new-model"]
         with pytest.raises(T.UnknownTraeModel):

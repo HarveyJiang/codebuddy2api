@@ -132,7 +132,8 @@ def test_collect_stream_keep_reasoning():
     ("auto", "workbuddy"),
     ("", "workbuddy"),
     (None, "workbuddy"),
-    ("trae/glm-5.2", "trae"),
+    # v16 去前缀后 `trae/...` 不再有路由含义 → 归默认后端。
+    ("trae/glm-5.2", "workbuddy"),
 ])
 def test_backend_name_for(model, expected):
     assert backend_name_for(model) == expected

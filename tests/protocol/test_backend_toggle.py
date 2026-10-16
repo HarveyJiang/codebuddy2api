@@ -150,15 +150,19 @@ class _StoreFixture(unittest.TestCase):
         # 明确「无可用账号」而不是静默串到别的后端的账号（隔离不变量）。
         self.assertEqual(ctx.exception.status_code, 503)
 
-    def test_resolve_backend_rejects_disabled_backend(self):
-        """带禁用后端前缀的请求 400，文案说「已被管理员禁用」（拍板项③）。"""
+    def test_resolve_backend_rejects_disabled_routed_backend(self):
+        """中间件选定了一个**已被管理员禁用**的后端时，报 400 且文案可读（拍板项③）。
+
+        v16 去前缀后，`resolve_backend` 不再按前缀分派；「禁用后端」的判定发生在
+        `routed` 分支（中间件决策后立刻被禁用这种竞态）。
+        """
         from fastapi import HTTPException
-        # 先确认启用时这个请求是通的（否则下面那个 400 可能来自别的原因）。
-        spec, raw = registry.resolve_backend("trae/glm-5.2")
+        # 先确认启用时按 routed 解析是通的（否则下面那个 400 可能来自别的原因）。
+        spec, raw = registry.resolve_backend("glm-5.2", routed="trae")
         self.assertEqual(spec.name, "trae")
         self.store.set_backend_flags({"trae": False})
         with self.assertRaises(HTTPException) as ctx:
-            registry.resolve_backend("trae/glm-5.2")
+            registry.resolve_backend("glm-5.2", routed="trae")
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("已被管理员禁用", str(ctx.exception.detail))
 
@@ -576,29 +580,80 @@ class _EndToEndTests(unittest.TestCase):
                                 headers={"Authorization": "Bearer " + API})
 
     def test_disabled_backend_request_says_backend_disabled(self):
-        """关掉 Trae 后，请求 Trae 模型要说「后端已被管理员禁用」。"""
+        """关掉 Trae 后，请求只有 Trae 有的模型要说**「后端已被管理员禁用」**。
+
+        v16 去前缀后请求发**裸名**；为了确保策略会选中 Trae，用一个 Trae 独有的
+        模型（`Doubao-Seed-Code`）——若用 `glm-5.2` 这种两边都有的名字，
+        关掉 Trae 后请求会被 WB 接住（那是**正确**行为，见下一条测试）。
+
+        回归背景（这条测试存在的理由，见类 docstring）：原因原先写在
+        `registry.resolve_backend`，而 `PoolMiddleware` 的模型门先命中，用户实际
+        收到的却是「模型 X 已在管理页禁用」。修复后归属在模型门**之前**由策略算出，
+        「后端下线」不会再被说成「你禁用了某个模型」。
+        """
         self._disable("trae")
-        for model in ("trae/glm-5.2", "trae/压根不存在的模型"):
-            r = self._ask(model)
-            assert r.status_code == 400, f"{model} → {r.status_code} {r.text}"
-            assert "已被管理员禁用" in r.text, f"{model} 的文案是 {r.text}"
-            # 关键：不能是「模型已在管理页禁用」——那是把后端下线说成模型禁用，
-            # 排障时会跑去模型页找一个从没被动过的开关。
-            assert "已在管理页禁用" not in r.text, f"{model} 命中了模型门的误导文案"
+        r = self._ask("Doubao-Seed-Code")
+        assert r.status_code == 400, f"{r.status_code} {r.text}"
+        assert "后端已被管理员禁用" in r.text, r.text
+        # 关键：不能是「模型已在管理页禁用」——那是把后端下线说成模型禁用，
+        # 排障时会跑去模型页找一个从没被动过的开关。
+        assert "已在管理页禁用" not in r.text, f"命中了模型门的误导文案：{r.text}"
+
+    def test_unknown_model_lists_every_backend_reason(self):
+        """两边目录都没有的名字 → 400，且逐后端说明原因（而不是笼统「未知模型」）。"""
+        r = self._ask("压根不存在的模型")
+        assert r.status_code == 400, f"{r.status_code} {r.text}"
+        # 每个后端各一条原因，用户据此判断「是不是我禁错/关了谁」。
+        for name in registry.known_names():
+            assert name in r.text, f"{r.text} 缺少 {name} 的原因"
+
+    def test_disabled_backend_falls_back_when_name_exists_elsewhere(self):
+        """同名模型在另一个后端也有时，关掉一方**不该**让请求失败 —— 它会落到另一方。
+
+        这是 §5 裸名策略的直接推论，也是「一个归属」设计的大前提：
+        关掉 Trae 之后 `glm-5.2` 仍然可用（策略从候选里剔掉被禁用的后端、选中 WB）。
+        旧的前缀时代这条请求会 400（用户点名了被禁的后端）；去前缀后「点名」不再存在。
+
+        判据取**策略结果**而不是 HTTP 状态码：本 fixture 没有假上游，真请求会打到
+        线上并 401 —— 那不是这条测试要验的东西。直接用与生产同一份代码的
+        `_resolve_backend_for` 问「落到了谁」。
+        """
+        self._disable("trae")
+        from admin.pool import PoolMiddleware
+
+        mw = PoolMiddleware.__new__(PoolMiddleware)
+        mw.pool = self.app.state.pool
+        mw.model_registry = self.app.state.model_registry
+        backend = mw._resolve_backend_for("glm-5.2", None)
+        assert backend == "workbuddy", f"关掉 Trae 后 glm-5.2 应落到 WB，实际 {backend}"
+        # 对照：Trae 独有模型在 Trae 关闭后**没有**候选（这才是 400 的那类）。
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            mw._resolve_backend_for("Doubao-Seed-Code", None)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("后端已被管理员禁用", str(ctx.exception.detail))
 
     def test_disabling_default_backend_also_reports_correctly(self):
-        """对称：关掉默认后端（WorkBuddy）走同一条路（specs §4 的对称语义）。"""
+        """对称：关掉默认后端（WorkBuddy）走同一条路（specs §4 的对称语义）。
+
+        v16：请求发裸名；用**只在 WB 有**的模型（`hy3`）确保策略选中它 ——
+        `glm-5.2` 在两个后端都有，关掉 WB 后它会被 Trae 接住（那是正确行为）。
+        """
         self._disable("workbuddy")
-        r = self._ask("glm-5.2")  # 裸名 → 硬绑默认后端
-        assert r.status_code == 400
+        r = self._ask("hy3")  # WB 独有 → 关掉 WB 后没有候选
+        assert r.status_code == 400, f"{r.status_code} {r.text}"
         assert "已被管理员禁用" in r.text, r.text
+        assert "已在管理页禁用" not in r.text, r.text
 
     def test_v1_models_hides_disabled_backend(self):
-        """/v1/models 也不该再列出禁用后端的模型（已有 is_enabled 派生，e2e 钉住）。"""
+        """/v1/models 也不该再列出禁用后端的模型（已有 is_enabled 派生，e2e 钉住）。
+
+        v16：id 是裸名，不再能靠 `startswith("trae/")` 筛，改用 `owned_by` 声明。
+        """
         self._disable("trae")
         data = self.client.get("/v1/models", headers={"Authorization": "Bearer " + API}).json()["data"]
-        assert not [m for m in data if m["id"].startswith("trae/")], "禁用后端仍在 /v1/models 里"
-        assert [m for m in data if not m["id"].startswith("trae/")], "默认后端的模型不该被牵连"
+        assert not [m for m in data if m["owned_by"] == "trae-solo"], "禁用后端仍在 /v1/models 里"
+        assert [m for m in data if m["owned_by"] == "codebuddy"], "默认后端的模型不该被牵连"
 
     def test_env_gate_state_survives_an_unrelated_save(self):
         """逃生门开着时保存任意设置，**不得**抹掉用户对总闸的显式选择。

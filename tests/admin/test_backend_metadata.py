@@ -76,7 +76,7 @@ class BackendMetadataTests(unittest.IsolatedAsyncioTestCase):
         for row in rows:
             # 前端 renderLoginModes / backendBadge / backendTag 逐字段用。
             for key in ("name", "label", "short", "icon", "icon_svg", "color", "order",
-                        "prefix", "login_kind", "enabled", "default", "accounts"):
+                        "login_kind", "enabled", "default", "accounts"):
                 self.assertIn(key, row, f"{row.get('name')} 缺字段 {key}")
             self.assertIsInstance(row["accounts"], int)
             self.assertIsInstance(row["enabled"], bool)
@@ -114,12 +114,13 @@ class BackendMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(defaults), 1)
         self.assertEqual(rows[0]["name"], defaults[0]["name"])
 
-    async def test_prefix_and_login_kind_come_from_backends(self):
+    async def test_login_kind_comes_from_backends_without_prefix(self):
+        """登录方式来自后端声明；**prefix 不再下发**（v16 去前缀，前端也不读它）。"""
         await self.login()
         rows = {r["name"]: r for r in (await self.client.get("/admin/api/backends")).json()["backends"]}
-        self.assertEqual(rows["trae"]["prefix"], "trae/")
+        self.assertNotIn("prefix", rows["trae"], "去前缀后不该再下发 prefix")
+        self.assertNotIn("prefix", rows["workbuddy"], "去前缀后不该再下发 prefix")
         self.assertEqual(rows["trae"]["login_kind"], "trae")
-        self.assertEqual(rows["workbuddy"]["prefix"], "")
         self.assertEqual(rows["workbuddy"]["login_kind"], "browser")
 
     async def test_accounts_counted_per_backend(self):
@@ -166,7 +167,7 @@ class BackendMetadataTests(unittest.IsolatedAsyncioTestCase):
                     upstream, canon,
                     f"{name} 声明了恒等映射 {upstream!r} → {canon!r}：删掉即可，"
                     "默认规则已经覆盖它")
-                # 声明键应写**上游 id**（不带上本后端前缀），值是非空字符串。
+                # 声明键应写**上游 id**（不带上本后端的历史前缀）。
                 self.assertFalse(
                     prefix and str(upstream).startswith(prefix),
                     f"{name} 的 canonical_for 键 {upstream!r} 带上了本后端前缀 "
@@ -174,21 +175,22 @@ class BackendMetadataTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(str(canon).strip(), f"{name} 的 {upstream!r} 规范名为空")
 
     async def test_canonical_merges_kimi_k3_across_backends(self):
-        """真实数据回归：腾讯 `kimi-k3-1` 与字节 `trae/kimi-k3` 必须同规范名。
+        """真实数据回归：腾讯 `kimi-k3-1` 与字节 `kimi-k3` 必须同规范名。
 
         这是这套机制存在的理由（用户 2026-10-16：「trae/kimi-k3，kimi-k3-1 怎么
         没有合并」）：两边上游 id 命名不一致，只靠字符串规则永远合不起来，
         必须在腾讯侧显式声明 `kimi-k3-1 → kimi-k3`。
-        """
-        from core.backends.registry import canonical_name, strip_prefix
 
-        wb, trae = canonical_name("kimi-k3-1"), canonical_name("trae/kimi-k3")
+        v16 去前缀后两边的**上游 id 本身就是裸名**（`kimi-k3-1` / `kimi-k3`），
+        不再需要「剥前缀」这一步 —— 映射直接按裸名匹配。
+        """
+        from core.backends.registry import canonical_name
+
+        wb, trae = canonical_name("kimi-k3-1"), canonical_name("kimi-k3")
         self.assertEqual(wb, trae, "kimi-k3 在两个后端必须归到同一规范名")
         self.assertEqual(wb, "kimi-k3")
-        # 反例守卫：规范化之后仍然是**各自剥前缀**，不能把裸名也改掉
-        # （裸名是路由键与账单 join 键，动它会断账本）。
-        self.assertEqual(strip_prefix("kimi-k3-1"), "kimi-k3-1")
-        self.assertEqual(strip_prefix("trae/kimi-k3"), "kimi-k3")
+        # 没声明映射的裸名原样返回（裸名是路由键与账单 join 键，动它会断账本）。
+        self.assertEqual(canonical_name("glm-5.3"), "glm-5.3")
 
     async def test_canonical_does_not_merge_distinct_models(self):
         """反例守卫：`hy3` 与 `hy3-x` 是**两个**真模型，规范名必须不同。

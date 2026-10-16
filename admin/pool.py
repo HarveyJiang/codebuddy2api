@@ -38,7 +38,6 @@ from core.backends.registry import (
     is_enabled as is_backend_enabled,
     known_names as known_backends,
     pinned_model_owner,
-    prefix_for,
     spec_for,
 )
 
@@ -1283,11 +1282,13 @@ class PoolMiddleware:
         `backend_name_for` 的结果 = 今天的行为（裸名走默认后端）。这是
         §8 阶段三要求的 kill switch。
         """
-        # 带前缀 / 私有模型（pinned）：行为与今天完全一致，不走策略。
-        # 这两类都不是「多个后端都有同名模型」的情形 —— pinned 是「本来就只可能
-        # 归我」（三档路由），带前缀是用户点名要哪个后端（§4 用户侧契约）。
+        # 私有模型（pinned）：行为与今天完全一致，不走策略。
+        # pinned 是「本来就只可能归我」（三档路由），不需要在候选集里挑。
         # 判定复用 registry 的声明（不是在这里重写一遍 `in spec.pinned_models`）。
-        if prefix_for(model) or pinned_model_owner(model) is not None:
+        #
+        # （v16 去前缀后不再有「带前缀 = 用户点名后端」这一类：id 一律是上游裸名，
+        #  所以这里只剩 pinned 一个例外。）
+        if pinned_model_owner(model) is not None:
             return backend_name_for(model)
 
         # `auto` / 空 = 「不指定」→ 默认后端（§4 表格末行：「不变：走默认后端」）。
@@ -1357,25 +1358,39 @@ class PoolMiddleware:
                 body = json.loads(raw) if raw else {}
             except ValueError:
                 body = {}
-            # 后端总闸优先于模型门：后端下线时，报「该后端已被管理员禁用」而不是
-            # 「模型 X 已在管理页禁用」——后者把「后端下线」说成「你禁用了某个模型」，
-            # 排障时会跑去模型页找一个从没被动过的开关。
-            # 顺序不能反：enabled_models() 已排除禁用后端而 snapshot_ids() 没有，
-            # 不先拦的话下面那句模型门会先命中，把真正的原因盖掉。
-            if isinstance(body, dict):
-                _raw_model = body.get("model")
-                if isinstance(_raw_model, str) and _raw_model:
-                    _backend = backend_name_for(_raw_model)
-                    if not is_backend_enabled(_backend):
-                        raise HTTPException(400, {
-                            "error": {
-                                "message": f"{spec_for(_backend).label} 后端已被管理员禁用",
-                                "type": "invalid_request_error",
-                            }})
-            # 管理页禁用的模型直接拒绝，不打上游。
+            # 模型名 → 后端（§5 裸名路由）**必须在模型门之前**：
+            #   - 后端已被管理员禁用 / 没有启用账号 / 目录里没这个模型 —— 这些原因
+            #     只有策略算得出来（它逐后端看候选），`_resolve_backend_for` 会以
+            #     400 抛出**逐条原因**（`NoCandidate`，如「trae：后端已被管理员禁用」）。
+            #   - 反过来先跑模型门会误报：`enabled_models()` 已排除被禁用后端的模型，
+            #     于是「Trae 下线了」被说成「模型 X 已在管理页禁用」——排障会跑去
+            #     模型页找一个从没被动过的开关（这正是这条注释顶上那段历史）。
+            #
+            # v16 去前缀后尤其不能再用 `backend_name_for(裸名)` 判后端：它对所有裸名
+            # 都返回默认后端（同名模型两边都有，静态判不出），Trae 会被当成 WB。
+            # 想读某一行**存下来**的归属是 `models.backend` 列；想判「此刻该走谁」
+            # 就是下面这次策略解析 —— 唯一真相源。
+            #
+            # 三档路由 / `auto` 由 `_resolve_backend_for` 内部处理（pinned → 声明归属，
+            # auto/空 → 默认后端），这里不再需要单独一分支。
+            backend = self._resolve_backend_for(
+                body.get("model") if isinstance(body, dict) else None, kid)
+            # 管理页显式**禁用某一条模型**时拒绝，不打上游。
+            #
+            # ⚠️ 这条门现在是**兜底**，主判定已在其上（`_resolve_backend_for` 逐后端看
+            # 候选，禁用行会记成 rejection；全部候选不可用时直接抛 `NoCandidate`）。
+            # 保留它的唯一理由：`_resolve_backend_for` 在**裸名路由被总闸关掉**或
+            # **没有注册表**（旧部署/单测）时会直接回落 `backend_name_for(model)`，
+            # 绕过候选过滤 —— 那种形态下这条门仍要挡住「已在管理页禁用」的请求
+            # （否则禁用会静默失效：`enabled_models()` 里没有它，但没人拦）。
+            #
+            # 判据用 `enabled_models()`/`snapshot_ids()` 的差集：前者排除被禁用后端
+            # 与被禁用行，后者含全部已知名 —— 差集 = 「已知但不可用」。
             if self.model_registry is not None and isinstance(body, dict):
                 model = body.get("model")
-                if isinstance(model, str) and model and model not in self.model_registry.enabled_models() and model in self.model_registry.snapshot_ids():
+                if isinstance(model, str) and model \
+                        and model not in self.model_registry.enabled_models() \
+                        and model in self.model_registry.snapshot_ids():
                     raise HTTPException(400, f"模型 {model} 已在管理页禁用")
             # 密钥的模型白名单：空白名单 = 不限制；显式列了模型则只放行列表内的。
             if kid is not None and isinstance(body, dict):
@@ -1383,14 +1398,11 @@ class PoolMiddleware:
                 allowed_models = self.pool.store.key_bindings(kid)[0]
                 if allowed_models and isinstance(model, str) and model and model not in allowed_models:
                     raise HTTPException(403, f"该密钥无权使用模型 {model}")
-            # 模型名 → 后端（§5 裸名路由）：
-            #   `trae/x` / 三档路由 → 声明的归属；
-            #   裸名 → 按策略在候选后端里选（候选集/排序/价格红线见 core/bare_routing）；
-            #   总闸关掉裸名路由 → 回落「裸名走默认后端」（今天的行为）。
-            backend = self._resolve_backend_for(
-                body.get("model") if isinstance(body, dict) else None, kid)
             # 把选定后端交给 converter（同一请求内的下一次决策必须给出同一个答案，
             # 否则凭据-后端一致性闸门会 503）。见 ROUTED_BACKEND 的说明。
+            #
+            # `backend` 在上面（模型门之前）就算好了 —— 顺序反过来的话，
+            # 「后端禁用」会被模型门误报成「模型已禁用」，见那段注释。
             scope[ROUTED_BACKEND] = backend
             affinity_key = request_affinity(headers, body)
             model_name = None

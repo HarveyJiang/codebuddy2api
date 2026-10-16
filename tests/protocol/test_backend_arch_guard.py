@@ -280,6 +280,40 @@ def test_callers_do_not_import_a_backend_module():
     )
 
 
+def test_callers_do_not_route_by_model_prefix():
+    """调用方**不得**再用「模型 id 前缀」判归属（v16 去前缀的核心不变量）。
+
+    去前缀前，`trae/glm-5.2` 靠 `prefix_for` / `strip_prefix` 判后端。改造后
+    这些函数**已删除**，id 就是上游裸名 —— 归属只有两个正确来源：
+
+    - 某一行**存下来**的归属：读 `models.backend` 列（`admin/models.py` 的 `load`）；
+    - 此刻**该走谁**：`admin/pool.py` 的裸名策略（§5）/ `converter._owner_backend_for`。
+
+    为什么必须守：`model_prefix` 声明**故意保留**（`admin/db.py` 的两个历史迁移
+    要靠它认老库里的前缀行）。只要声明还在，就有人会再写一句
+    `strip_prefix(model)` 去做运行期判定 —— 那会立刻把 `openrouter/free` 这类
+    **真实含斜杠的上游名**误伤成别的模型，且没有任何行为测试会红（今天没有
+    部署真的用这种模型名调过）。
+
+    允许出现的地方：`admin/db.py`（迁移）与 `core/backends/`（后端自己的声明）。
+    """
+    offenders = []
+    for rel, path in _caller_files():
+        if any(rel.startswith(a) for a in ALLOWED_FILES):
+            continue
+        for lineno, line, raw in _iter_code_lines(path):
+            if "arch-guard: ok" in raw:
+                continue
+            if re.search(r"\b(prefix_for|strip_prefix|backend_name_for_prefix)\b", line) \
+                    or re.search(r"\.model_prefix\b", line):
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "调用方按模型 id 前缀判归属（v16 已去前缀，这会把含斜杠的真名误伤）：\n  "
+        + "\n  ".join(offenders)
+        + "\n\n请改用 `models.backend` 列（存下来的归属）或 pool 的裸名策略（此刻该走谁）。"
+    )
+
+
 def test_frontend_has_no_backend_literals():
     """前端不得自行登记后端元数据（图标 / 名称 / 顺序 / 前缀）。
 

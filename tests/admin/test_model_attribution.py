@@ -47,8 +47,13 @@ class PinnedModelsTests(unittest.TestCase):
         self.assertEqual(backend_name_for("auto"), "workbuddy")
         self.assertEqual(backend_name_for("glm-5.2"), "workbuddy")
 
-    def test_prefix_still_wins_for_prefixed_ids(self):
-        self.assertEqual(backend_name_for("trae/kimi-k3"), "trae")
+    def test_prefixed_id_no_longer_wins(self):
+        """v16 去前缀：`trae/xxx` 这类前缀**不再有路由含义** → 归默认后端。
+
+        反过来说，前端/客户端不该再发这种名字：`/v1/models` 里已无带 `/` 的
+        自造 id（不变量 1）。这条守住「有人把前缀路由加回来」。
+        """
+        self.assertEqual(backend_name_for("trae/kimi-k3"), "workbuddy")
 
     def test_pinned_models_are_not_shared_with_trae(self):
         """Trae 没声明 pin，故三档不会漏给 Trae（防将来复制声明时抄错）。"""
@@ -381,14 +386,14 @@ class MigrationTests(unittest.TestCase):
         try:
             db.save_models({
                 "kimi-k3-1": {"name": "Kimi-K3", "backend": "workbuddy"},
-                "trae/kimi-k3": {"name": "Kimi-K3", "backend": "trae"},
+                "kimi-k3": {"name": "Kimi-K3", "backend": "trae"},
             })
             rows = db.load_models()
             self.assertEqual(rows["kimi-k3-1"]["canonical"], canonical_name("kimi-k3-1"))
-            self.assertEqual(rows["trae/kimi-k3"]["canonical"], canonical_name("trae/kimi-k3"))
+            self.assertEqual(rows["kimi-k3"]["canonical"], canonical_name("kimi-k3"))
             # 关键：两个**不同裸名**的腾讯/字节条目，规范名必须相同（否则合不起来）。
             self.assertEqual(rows["kimi-k3-1"]["canonical"],
-                             rows["trae/kimi-k3"]["canonical"])
+                             rows["kimi-k3"]["canonical"])
         finally:
             db.close()
 
@@ -536,10 +541,11 @@ class SortOrderTests(unittest.TestCase):
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         registry.ensure_builtin()
         registry.ensure_static_catalog("trae")
-        # 两条同名（bare 名相同）、分属两个后端、价格差很大。
-        registry.add("cheap-elsewhere", credits=9.9)
-        registry.add("trae/cheap-elsewhere", credits=0.01)
-        registry.add("mid-price", credits=0.5)
+        # 两条同名（同一个裸名）、分属两个后端、价格差很大。
+        # v16：同名靠 `backend` 参数区分（id 是裸名，两边相同）。
+        registry.add("cheap-elsewhere", credits=9.9, backend="workbuddy")
+        registry.add("cheap-elsewhere", credits=0.01, backend="trae")
+        registry.add("mid-price", credits=0.5, backend="workbuddy")
 
         models = registry.snapshot()["models"]
         custom = [m for m in models if m["source"] == "custom"]
@@ -553,7 +559,7 @@ class SortOrderTests(unittest.TestCase):
         self.assertLess(wb.index("cheap-elsewhere"), wb.index("mid-price"),
                         "组内最小值应参与排序（workbuddy 那条 9.9 也要按 0.01 排）")
         # 倍率取「跨后端的组内最小值」，不是「同一后端内」：trae 的 0.01 决定了整组。
-        self.assertIn("trae/cheap-elsewhere", keys)
+        self.assertEqual(len([m for m in custom if m["id"] == "cheap-elsewhere"]), 2)
 
     def test_group_min_spans_backends_not_just_same_backend(self):
         """组内最小值要**跨后端**取：workbuddy 贵、trae 便宜时以 trae 为准。
@@ -564,11 +570,14 @@ class SortOrderTests(unittest.TestCase):
         registry = ModelRegistry(get_credential=lambda: FakeManager())
         registry.ensure_builtin()
         registry.ensure_static_catalog("trae")
-        registry.add("only-cheap-on-trae", credits=9.9)
-        registry.add("trae/only-cheap-on-trae", credits=0.01)
-        registry.add("pricier", credits=0.5)
+        registry.add("only-cheap-on-trae", credits=9.9, backend="workbuddy")
+        registry.add("only-cheap-on-trae", credits=0.01, backend="trae")
+        registry.add("pricier", credits=0.5, backend="workbuddy")
 
-        keys = [m["id"] for m in registry.snapshot()["models"] if m["source"] == "custom"]
+        models = [m for m in registry.snapshot()["models"] if m["source"] == "custom"]
+        # 同 id 两条，取靠前的那条（排序后 workbuddy/trae 段各自的位次）；
+        # 关键是整组按组内最小值 0.01 排，故出现在 pricier 之前。
+        keys = [m["id"] for m in models]
         self.assertLess(keys.index("only-cheap-on-trae"), keys.index("pricier"))
 
     def test_snapshot_is_json_serializable(self):

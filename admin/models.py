@@ -78,15 +78,6 @@ def backend_for_model_id(mid, backend=None):
     return backend_name_for(mid)
 
 
-def strip_model_prefix(mid):
-    """模型 id → 上游原名。
-
-    去前缀后两者**已经是同一个东西**（`model_id` 存的就是上游裸名），这里只是
-    给老调用点留的恒等函数 —— 新代码直接用 id 即可，不必经过它。
-    """
-    return mid if isinstance(mid, str) else ""
-
-
 def normalize_source(value):
     """收敛到三种来源之一；不认识的历史值当作上游。"""
     return value if value in (SOURCE_UPSTREAM, SOURCE_BUILTIN, SOURCE_CUSTOM) else SOURCE_UPSTREAM
