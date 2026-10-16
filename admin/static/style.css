@@ -146,11 +146,13 @@ tr:hover .model-name-cell .model-del{opacity:1}
    不再一列到底。 */
 .settings-caption{font-size:11px;letter-spacing:1.5px;color:#6d8478;margin:0 0 10px}
 /* 卡片标题旁的小问号（用户 2026-10-16 拍板）：说明文字收进悬停提示，
-   卡片不再渲染整段 <p>，空间立刻省出来。原生 title 即可，无需 JS。 */
-.settings-card h3{display:flex;align-items:center;gap:7px}
-.q-help{width:17px;height:17px;border-radius:50%;background:#e7efe4;color:#5b7f68;
-  font-size:11px;font-weight:700;line-height:1;display:inline-flex;align-items:center;
-  justify-content:center;cursor:help;flex-shrink:0;padding:0}
+   卡片不再渲染整段 <p>，空间立刻省出来。h3 改 inline-flex，问号**贴着
+   标题文字**排（不占独立行，用户反馈）；原生 title 即可，无需 JS。 */
+.settings-card h3{display:inline-flex;align-items:center;gap:6px;margin-right:6px}
+.q-help{width:16px;height:16px;border-radius:50%;background:#e7efe4;color:#5b7f68;
+  font-size:10px;font-weight:700;line-height:1;display:inline-flex;align-items:center;
+  justify-content:center;cursor:help;flex-shrink:0;padding:0;vertical-align:middle;
+  transform:translateY(-1px)}
 .q-help:hover{background:#d5e4d0}
 /* 设置页分组：**上下整行排满**（用户 2026-10-16 拍板：不要左右分栏，卡片
    内字段一行排满）—— 两栏布局在卡片文字长短不一时留下大片空白。 */
