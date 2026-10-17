@@ -608,7 +608,7 @@ function renderAccounts() {
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
-    const actions = `<td><div class="actions">${checkinBtn}<button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
+    const actions = `<td><div class="actions"><button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
     return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }

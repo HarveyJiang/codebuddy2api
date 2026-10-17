@@ -95,6 +95,12 @@ check("设置按钮 → 开设置弹框", dispatchAction("settings"), "settings"
 check("账号池行模板渲染日志按钮且带 data-action=logs",
       src.includes('data-action="logs"') && src.includes('=== "logs") { openAccountLogs(a)'), true);
 check("设置弹框里 as-logs 已撤掉（入口挪到操作列）", /id="as-logs"/.test(html), false);
+// 行模板里不能引用未定义变量（2026-10-17 线上 bug：${checkinBtn} 让整个
+// renderAccounts 抛 ReferenceError，概览账号表整片消失）。
+check("账号行模板无未定义变量引用（checkinBtn 事故回归）",
+      /\$\{checkinBtn\}/.test(src), false);
+check("账号行模板只引用已定义的 checkinCell",
+      /\$\{checkinCell\}/.test(src), true);
 // 账号日志弹框带分页（用户 2026-10-17：最近 7 天 + 每页 100 条 + 翻页）
 check("账号日志弹框有分页控件", /id="account-logs-prev"/.test(html) && /id="account-logs-next"/.test(html), true);
 check("账号日志默认最近 7 天 + 每页 100 条", /since=\$\{since\}/.test(src) && /ACCOUNT_LOGS_SIZE = 100/.test(src), true);
