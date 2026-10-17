@@ -68,6 +68,8 @@ dialog::backdrop{background:#11272065;backdrop-filter:blur(3px)}.dialog-heading{
 /* 账号详情弹框（用户 2026-10-17 重设计）：原来的「原生 dl 两列」太素，
    改成与整体设计语言一致的卡片式呈现——头部身份区 + 三张指标卡 + 分组字段卡。
    配色沿用 :root 的深绿系（--deep/--green）与 .surface/.dashboard-metrics 同族。 */
+/* 短标识（详情弹框的 UID 前 8 位）：等宽 + 虚下划线暗示「悬停有全量」。 */
+.short-id{font-family:Consolas,"Cascadia Code",monospace;cursor:help;border-bottom:1px dotted var(--line)}
 .detail-hero{display:flex;align-items:center;gap:15px;margin:18px 0 0}
 .detail-hero .detail-avatar{display:grid;place-items:center;width:46px;height:46px;background:#eef2eb;border-radius:12px;flex-shrink:0;color:#4f6c51}
 .detail-hero .detail-avatar svg{width:24px;height:24px}

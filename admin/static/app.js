@@ -27,6 +27,18 @@ const labels = {
 };
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stamp = ts => ts ? new Date(ts).toLocaleString("zh-CN", {hour12:false}) : "未提供";
+// 账号的统一显示名 = 备注名（用户 2026-10-17：全站「上面的大标题」都用它，
+// 全局唯一）。上游昵称只作建档默认值，账号列表/详情/设置/日志四个位置都
+// 走这个函数，保证同一账号在任何弹框里叫同一个名字。
+const accountLabel = a => (a && a.name) || "账号";
+// 重名占用者：exceptId 是正在编辑/导入的账号自己（改自己名字不算占用）。
+// 返回占用者的显示名，查不到返回空串。overview 可能还没加载（深链进来），
+// 用可选链兜底，避免「没法预检」把整个保存流程带崩。
+const nameOwner = (name, exceptId) => {
+  if (!name) return "";
+  const hit = (overview?.accounts || []).find(x => x.name === name && x.id !== exceptId);
+  return hit ? accountLabel(hit) : "";
+};
 function toast(message) { $("toast").textContent = message; $("toast").hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $("toast").hidden = true, 4500); }
 function showLogin(message) {
   csrf = ""; overview = null; $("workspace").hidden = true; $("login").hidden = false; $("boot").hidden = true;
@@ -597,7 +609,7 @@ function renderAccounts() {
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
     const actions = `<td><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 请求日志 / 删除">⚙ 设置</button></td>`;
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -614,8 +626,9 @@ async function openAccountDetail(a) {
   const stampOr = v => v ? stamp(v * 1000) : "—";
   const numOr = v => v === null || v === undefined ? "—" : creditsFmt(v);
   const poolLabel = {available:["可用","green"],cooling:["冷却中","amber"],paused:["已暂停",""],exhausted:["积分耗尽","amber"],invalid:["凭据异常","red"]}[a.pool_state] || ["待查询",""];
-  $("account-detail-title").textContent = a.name || "账号详情";
-  $("account-detail-sub").textContent = `${backendName(a.backend)} 账号 · ${a.id}`;
+  $("account-detail-title").textContent = accountLabel(a);
+  // 副标题只留「什么后端的账号」——本地 aid 是 hex，对人类不可读（用户 2026-10-17）。
+  $("account-detail-sub").textContent = `${backendName(a.backend)} 账号`;
   // 头部：后端图标 + 状态/启用徽标（一眼看到「这个账号现在什么状态」）。
   $("account-detail-avatar").innerHTML =
     `<span class="account-icon-backend" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${backendIconSvg(a.backend)}</span>`;
@@ -638,8 +651,11 @@ async function openAccountDetail(a) {
   $("account-detail-body").innerHTML = [
     section("基本信息", [
       ["账号类型", `${backendIcon(a.backend)} ${backendName(a.backend)}`],
-      ["UID", a.uid || "—"],
-      ["昵称", a.nickname || "—"],
+      // UID 是上游 uuid（36 位），对人类不可读：只显前 8 位，完整值悬停可见
+      // （用户 2026-10-17：「uuid 不用显示，没有人类不可读」）。
+      ["UID", a.uid ? `<span class="short-id" title="${esc(a.uid)}">${esc(a.uid.slice(0, 8))}</span>` : "—"],
+      // 上游昵称只读（资料字段，本地改不了），标注出来避免去设置弹框里找它。
+      ["上游昵称", (a.nickname || "—") + `<small class="cell-note">来自上游资料，只读；要改显示名请改备注</small>`],
       ["凭据有效期", stamp(a.expires_at) + (a.expired ? "（已到期）" : "")],
     ]),
     section("积分与过期", [
@@ -1015,6 +1031,12 @@ async function pollOAuth(generation) {
 }
 $("oauth-start").addEventListener("click", async () => {
   clearOAuth(); const generation = oauthGeneration;
+  // 备注名唯一：用户填了非空备注才预检（留空时后端回落上游昵称，前端无从预判）。
+  const wantName = $("account-name").value.trim();
+  if (wantName) {
+    const owner = nameOwner(wantName);
+    if (owner) { $("account-error").textContent = `备注「${wantName}」已被账号「${owner}」占用，请换一个`; return; }
+  }
   $("oauth-start").disabled = true; $("oauth-start").textContent = "正在生成…";
   $("account-error").textContent = "";
   try {
@@ -1044,7 +1066,13 @@ $("account-form").addEventListener("submit", async e => {
   e.preventDefault(); e.submitter.disabled = true; $("account-error").textContent = "";
   try {
     let credential; try { credential = JSON.parse($("credential-json").value); } catch { throw new Error("请选择文件或粘贴有效的 JSON 内容"); }
-    await api("accounts", {method:"POST", body:{name:$("account-name").value.trim() || undefined, credential}});
+    // 备注名唯一：同 OAuth 链路，只在用户填了非空备注时预检（见 oauth-start）。
+    const wantName = $("account-name").value.trim();
+    if (wantName) {
+      const owner = nameOwner(wantName);
+      if (owner) { $("account-error").textContent = `备注「${wantName}」已被账号「${owner}」占用，请换一个`; e.submitter.disabled = false; return; }
+    }
+    await api("accounts", {method:"POST", body:{name: wantName || undefined, credential}});
     $("account-dialog").close(); await refresh(); toast("账号已导入");
   } catch (err) { $("account-error").textContent = err.message; } finally { e.submitter.disabled = false; }
 });
@@ -1112,8 +1140,8 @@ let settingsAccountId = null;
 function openAccountSettings(a) {
   if (!a) return;
   settingsAccountId = a.id;
-  $("account-settings-title").textContent = a.name || "账号设置";
-  $("account-settings-sub").textContent = `${backendName(a.backend)} 账号 · ${a.id}`;
+  $("account-settings-title").textContent = accountLabel(a);
+  $("account-settings-sub").textContent = `${backendName(a.backend)} 账号`;
   $("as-name").value = a.name || "";
   $("as-weight").value = a.weight || 0;
   $("account-settings-error").textContent = "";
@@ -1148,7 +1176,7 @@ let accountLogsId = null;
 async function openAccountLogs(a) {
   if (!a) return;
   accountLogsId = a.id;
-  $("account-logs-title").textContent = a.name || "账号请求日志";
+  $("account-logs-title").textContent = accountLabel(a);
   $("account-logs-sub").textContent = `${backendName(a.backend)} 账号 · 最近 50 条请求`;
   $("account-logs-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
   $("account-logs-dialog").showModal();
@@ -1180,9 +1208,14 @@ $("account-settings-form").addEventListener("submit", async e => {
   const a = settingsAccount(); if (!a) return;
   const w = Number($("as-weight").value);
   if (!Number.isInteger(w) || w < 0 || w > 100) { $("account-settings-error").textContent = "权重须为 0-100 的整数"; return; }
+  // 备注名全局唯一（用户 2026-10-17 定稿：硬拦，不让保存）。改自己名字不算
+  // 占用——exceptId 传自己的 id。占用者名字一并给出，用户才知道该换什么。
+  const want = $("as-name").value.trim() || a.name;
+  const owner = nameOwner(want, a.id);
+  if (owner) { $("account-settings-error").textContent = `备注「${want}」已被账号「${owner}」占用，请换一个`; return; }
   $("as-save").disabled = true;
   try {
-    await api("accounts/" + a.id, {method:"PATCH", body:{name: $("as-name").value.trim() || a.name, weight: w}});
+    await api("accounts/" + a.id, {method:"PATCH", body:{name: want, weight: w}});
     $("account-settings-dialog").close();
     await refresh(); toast("设置已保存");
   } catch (err) { $("account-settings-error").textContent = err.message; }
