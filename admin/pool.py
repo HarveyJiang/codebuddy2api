@@ -927,6 +927,8 @@ class AccountPool:
             return {"results": await asyncio.gather(*(run(aid) for aid in ids))}
 
     CHECKIN_SLOTS = [("上午", "08:00", "11:00"), ("中午", "11:00", "14:00"), ("下午", "14:00", "18:00"), ("晚间", "18:00", "22:00")]
+    # 单账号单日签到失败上限：触顶后当天跳过，跨天自动解除（见 _checkin_fails_today）。
+    CHECKIN_FAIL_LIMIT = 5
 
     def checkin_offset(self, aid, today, window_minutes):
         """每账号每天在上午/中午/下午/晚间中随机选一个时段，再在时段内随机取分钟，
@@ -951,6 +953,23 @@ class AccountPool:
             self.dirty = True
             return name, when
 
+    def _checkin_fails_today(self, aid, today):
+        """当日累计签到失败次数（跨天归零）。
+
+        ``checkin_fails`` 只按天计数：失败 5 次当天不再尝试，第二天自动重新开始。
+        早期版本不做按天隔离，触顶即永久跳过（只能手工改库），已修复——别回归。
+        """
+        status = self.store.data["account_status"].get(aid, {})
+        if status.get("checkin_fails_date") != today:
+            return 0
+        return status.get("checkin_fails", 0) or 0
+
+    def _bump_checkin_fails(self, aid, today):
+        """签到失败 +1；跨天先归零再计。"""
+        fails = self._checkin_fails_today(aid, today) + 1
+        self.update(aid, checkin_fails=fails, checkin_fails_date=today)
+        return fails
+
     async def tick(self):
         now = datetime.fromtimestamp(self.clock(), CN)
         with self.store.lock:
@@ -958,7 +977,16 @@ class AccountPool:
             # 自动签到覆盖两后端（WorkBuddy 走 billing，Trae 走 ug checkin_credits）。
             # is_backend_enabled：总闸关掉的后端不签到（specs/backend-toggle.md
             # §2 第 7 条）——后台定时任务不该去打一个用户已下线后端的上游。
-            due = [aid for aid, item in self.store.data["accounts"].items() if is_backend_enabled(item.get("backend", default_backend())) and spec_for(item.get("backend", default_backend())).supports_auto_checkin and self.store.data["account_status"].get(aid, {}).get("checkin_date") != now.strftime("%Y-%m-%d") and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock()-1800 and self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) < 5]
+            # checkin_fails 熔断按天重置：连续失败 5 次当天不再尝试，跨天自动解除。
+            # 早期版本是「失败 5 次永久跳过」，账号一旦触顶就再也不会被自动签到
+            # （只能手工改库），事实上把自动签到变成了薛定谔的猫——不要回归。
+            today = now.strftime("%Y-%m-%d")
+            due = [aid for aid, item in self.store.data["accounts"].items()
+                   if is_backend_enabled(item.get("backend", default_backend()))
+                   and spec_for(item.get("backend", default_backend())).supports_auto_checkin
+                   and self._checkin_fails_today(aid, today) < self.CHECKIN_FAIL_LIMIT
+                   and self.store.data["account_status"].get(aid, {}).get("checkin_date") != today
+                   and self.store.data["account_status"].get(aid, {}).get("auto_attempt", 0) < self.clock() - 1800]
         if cfg["auto_checkin"]:
             for aid in due:
                 _, due_time = self.checkin_offset(aid, now.strftime("%Y-%m-%d"), 0)
@@ -966,7 +994,7 @@ class AccountPool:
                     self.update(aid, auto_attempt=int(self.clock()))
                     try:
                         result = await asyncio.to_thread(self.operate, aid, "checkin")
-                        fails = 0 if result.get("ok") else self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) + 1
+                        fails = 0 if result.get("ok") else self._bump_checkin_fails(aid, today)
                         self.update(aid, checkin_fails=fails)
                     except HTTPException:
                         pass
@@ -977,7 +1005,7 @@ class AccountPool:
                         # 签到也不刷新——「加了字节不该影响腾讯」在这里被打破。
                         # 逐账号兜住并留痕，让其余账号照常推进。
                         _logger.exception("账号 %s 自动签到异常，已跳过（不影响其它账号）", aid)
-                        self.update(aid, checkin_fails=self.store.data["account_status"].get(aid, {}).get("checkin_fails", 0) + 1)
+                        self.update(aid, checkin_fails=self._bump_checkin_fails(aid, today))
         # 低峰凭据预刷新：expiresAt 2 小时内到期的账号提前刷新，避免请求撞上 401 再冷却。
         # 凭据预刷新：分散到白天时段，每个账号每天随机一个时刻，模拟正常使用时刷新，
         # 避免半夜集中刷新。仅在 access token 两小时内到期时才动作。

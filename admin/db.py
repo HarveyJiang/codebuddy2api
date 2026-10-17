@@ -413,7 +413,32 @@ def _v15_to_v16(db):
           file=sys.stderr)
 
 
-SCHEMA_VERSION = 16
+def _v16_to_v17(db):
+    """v16 → v17：accounts 补 checkin_fails_date（签到失败熔断按天重置）。
+
+    ## 为什么
+
+    原设计是「连续失败 5 次即熔断」，而 `tick()` 的 due 过滤是
+    `checkin_fails < 5`——触顶后**没有任何路径**把计数清零（只有签到成功
+    才清零，但熔断的账号永远等不到下一次尝试）：账号一旦失败 5 次就被调度器
+    永久跳过，自动签到事实上失效，只能手工改库。生产上真实发生过
+    （Trae 账号连续撞上上游 9074 限流后卡死）。
+
+    修法：`checkin_fails` 只按天计数。加一列 `checkin_fails_date` 记录计数
+    归属的日期，`_checkin_fails_today()` 发现日期不是今天就当 0 —— 跨天自动
+    解除熔断，当天内仍保留 5 次上限（避免一个坏账号把每小时都打满）。
+
+    ## 不回填
+
+    日期留空 = 历史计数作废（视为跨天）。这正是想要的效果：升级后所有已熔断
+    的账号立刻恢复尝试，不需要人工逐个重置。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
+    if "checkin_fails_date" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN checkin_fails_date TEXT")
+
+
+SCHEMA_VERSION = 17
 
 
 MICRO = 1_000_000
@@ -429,7 +454,8 @@ ACCOUNT_MONEY_COLUMNS = {
 # 金额列不在此列中——它们由 ACCOUNT_MONEY_COLUMNS 单独处理，避免重复建列。
 ACCOUNT_STATUS_COLUMNS = (
     "weight", "packages", "earliest_expiry", "expiring_soon_updated",
-    "credits_updated", "checkin_date", "checkin_fails", "auto_attempt", "checkin_slot",
+    "credits_updated", "checkin_date", "checkin_fails", "checkin_fails_date", "auto_attempt",
+    "checkin_slot",
     "checkin_when", "checkin_offset_date", "token_refreshed", "auth_invalid", "refresh_slot",
     "refresh_slot_date", "refresh_window_date", "consecutive_fails", "cooldown_until",
     "request_count", "last_request", "last_error", "usage_synced_at", "usage_sync_error",
@@ -561,7 +587,8 @@ class Database:
         remaining_micro INTEGER, packages INTEGER, earliest_expiry INTEGER,
         earliest_remaining_micro INTEGER, expiring_soon_micro INTEGER,
         expiring_soon_updated INTEGER, credits_updated INTEGER,
-        checkin_date TEXT, checkin_fails INTEGER NOT NULL DEFAULT 0, auto_attempt INTEGER,
+        checkin_date TEXT, checkin_fails INTEGER NOT NULL DEFAULT 0, checkin_fails_date TEXT,
+        auto_attempt INTEGER,
         checkin_slot TEXT, checkin_when TEXT, checkin_offset_date TEXT,
         token_refreshed INTEGER, auth_invalid INTEGER NOT NULL DEFAULT 0,
         refresh_slot TEXT, refresh_slot_date TEXT, refresh_window_date TEXT,
@@ -808,7 +835,7 @@ class Database:
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
-                  (16, _v15_to_v16))
+                  (16, _v15_to_v16), (17, _v16_to_v17))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")

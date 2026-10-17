@@ -230,15 +230,39 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.store.data['pool']['checkin_time'] = '00:00'
         status = self.store.data['account_status'].setdefault(self.a, {})
         status['checkin_fails'] = 5
+        status['checkin_fails_date'] = '2026-10-14'
         status['checkin_slot'] = '上午'
         status['checkin_when'] = '00:00'
         status['checkin_offset_date'] = '2026-10-14'
+        status['auto_attempt'] = 0
         # Also pin b so it does not check in and pollute the counter.
         bstatus = self.store.data['account_status'].setdefault(self.b, {})
         bstatus['checkin_date'] = '2026-10-14'
         self.now = datetime(2026, 10, 14, 10, 0, tzinfo=CN).timestamp()
         await self.pool.tick()
         self.assertEqual(self.checkin_posts, 0)  # failed 5 times today: stop retrying
+
+    async def test_checkin_fail_cap_auto_resets_next_day(self):
+        """熔断按天解除：失败 5 次当天跳过，第二天重新尝试（历史版本是永久跳过）。"""
+        self.store.data['pool']['auto_checkin'] = True
+        self.store.data['pool']['checkin_time'] = '00:00'
+        status = self.store.data['account_status'].setdefault(self.a, {})
+        status['checkin_fails'] = 5
+        status['checkin_fails_date'] = '2026-10-14'
+        status['checkin_slot'] = '上午'
+        status['checkin_when'] = '00:00'
+        status['checkin_offset_date'] = '2026-10-14'
+        bstatus = self.store.data['account_status'].setdefault(self.b, {})
+        bstatus['checkin_date'] = '2026-10-15'
+        self.now = datetime(2026, 10, 14, 10, 0, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        self.assertEqual(self.checkin_posts, 0)  # 当天仍触顶
+        # 跨天：熔断自动解除，重新参与签到。
+        status['checkin_date'] = ''
+        status['auto_attempt'] = 0
+        self.now = datetime(2026, 10, 15, 10, 0, tzinfo=CN).timestamp()
+        await self.pool.tick()
+        self.assertEqual(self.checkin_posts, 1)
 
     def test_key_daily_limit_blocks_after_quota(self):
         kid, value = self.store.add_key('limited', daily_limit=2)
