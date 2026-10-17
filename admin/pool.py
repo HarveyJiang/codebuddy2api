@@ -849,7 +849,7 @@ class AccountPool:
 
         ``backend`` 由 BackendSpec.account_ops_backend 分派传入，本方法目前只有
         Trae 一种实现（凭据管理器的 checkin_status / checkin_claim /
-        user_ent_usage 是 Trae 侧的能力）；第三个后端接入时按同样的接口实现，
+        user_ent_summary 是 Trae 侧的能力）；第三个后端接入时按同样的接口实现，
         pool 无需再改。
         """
         today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
@@ -893,14 +893,17 @@ class AccountPool:
                 if action == "checkin":
                     raise
                 checkin_error = "签到状态暂时无法查询"
-            remain = manager.user_ent_usage(client)
+            remain = manager.user_ent_summary(client)
             # remain>0 说明至少有一个权益包；为 0 时不置 packages（避免把「无权益包」
             # 误判成 exhausted，真实耗尽由上游 1005→402 冷却兜底）。
-            self.update(aid, remaining=float(remain), packages=1 if remain > 0 else 0,
+            # earliest_* / expiring_* 与 WorkBuddy 路径（summarize_packages）同字段名，
+            # 前端「最近过期 / 7 天内过期」两列对两个后端同一套渲染。
+            self.update(aid, **{k: v for k, v in remain.items() if k != "remaining"},
+                        remaining=remain["remaining"], packages=1 if remain["remaining"] > 0 else 0,
                         credits_updated=int(self.clock()), auth_invalid=False, last_error=checkin_error)
-            if remain > 0 and action == "checkin":
+            if remain["remaining"] > 0 and action == "checkin":
                 self.update(aid, cooldown_until=0)
-            return {"id": aid, "ok": True, "message": message, "remaining": float(remain)}
+            return {"id": aid, "ok": True, "message": message, "remaining": remain["remaining"]}
 
     async def batch(self, action):
         if self.jobs.locked():

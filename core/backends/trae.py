@@ -76,6 +76,9 @@ EP_ENT_USAGE = "/trae/api/v2/pay/ide_user_ent_usage"
 
 DEFAULT_CONFIG_NAME = "glm-5.2"
 REFRESH_SKEW_SECONDS = 24 * 3600  # token 预刷新窗口（Go RefreshSkew=24h）
+# 「7 天内过期」窗口（天），与 pool.EXPIRY_SOON_DAYS 同口径。core 不 import admin
+# （分层方向），两边各持一份字面量——改一处记得改另一处。
+EXPIRY_SOON_DAYS = 7
 
 # ---------------------------------------------------------------------------
 # 静态模型表（SPEC P3：32 个 config_name，来自逆向报告；动态拉取失败时回退）
@@ -699,15 +702,21 @@ def _num(value) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None,
-                   now: float | None = None) -> float:
-    """聚合**剩余**积分。
+def user_ent_summary(client: httpx.Client, headers: dict, ug_host: str | None = None,
+                     now: float | None = None) -> dict:
+    """聚合积分余额 + 过期信息，供账号池「最近过期 / 7 天内过期」两列。
 
-    口径：每个权益包可用额度 = `quota.credits_limit − usage.credits_amount`。
-    注意上游 `usage_summary.total_amount` 是 Σ`credits_limit`（**总额度**而非余额），
+    返回 {remaining, earliest_expiry, earliest_expiry_remaining, expiring_soon,
+    expiring_soon_updated}——字段名与 pool.summarize_packages（WorkBuddy 路径）
+    一致，前端两列对两个后端同一套渲染。
+
+    remaining 口径同旧 user_ent_usage：每个权益包可用额度 =
+    `quota.credits_limit − usage.credits_amount`。注意上游
+    `usage_summary.total_amount` 是 Σ`credits_limit`（**总额度**而非余额），
     直接对其求和会把已消耗部分算进去、导致余额虚高（实测 9100 vs 真实 5428.39）。
     逐包口径与其它字段（过期时间、包名）同源，便于跳过已过期包；
-    仅当没有任何权益包时回落到 `usage_summary.total_amount − consumed_amount`。
+    仅当没有任何权益包时回落到 `usage_summary.total_amount − consumed_amount`
+    （此路径无过期信息，earliest_expiry 为 None，前端不渲染该列）。
     """
     host = ug_host or UG_HOST
     r = client.post(host + EP_ENT_USAGE, headers=headers, json={})
@@ -722,21 +731,41 @@ def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = No
     ts = time.time() if now is None else now
     remain = 0.0
     counted = False
+    earliest = None
+    earliest_remaining = None
+    expiring_soon = 0.0
     for pack in _pick(data, "user_entitlement_pack_list") or []:
         if not isinstance(pack, dict):
             continue
         base = pack.get("entitlement_base_info") if isinstance(pack.get("entitlement_base_info"), dict) else {}
         quota = base.get("quota") if isinstance(base.get("quota"), dict) else {}
         usage = pack.get("usage") if isinstance(pack.get("usage"), dict) else {}
+        # expire_time/end_time 是 Unix 秒；缺失按「永不过期」处理（不参与过期统计）。
         expire = _num(pack.get("expire_time") or base.get("end_time") or 0)
         if expire and expire < ts:  # 已过期额度不可用
             continue
-        remain += max(_num(quota.get("credits_limit")) - _num(usage.get("credits_amount")), 0.0)
+        spendable = max(_num(quota.get("credits_limit")) - _num(usage.get("credits_amount")), 0.0)
+        remain += spendable
         counted = True
+        if expire and spendable > 0:
+            if earliest is None or expire < earliest:
+                earliest, earliest_remaining = expire, float(spendable)
+            if expire <= ts + EXPIRY_SOON_DAYS * 86400:
+                expiring_soon += spendable
     if not counted:
         summary = data.get("usage_summary") if isinstance(data.get("usage_summary"), dict) else {}
         remain = max(_num(summary.get("total_amount")) - _num(summary.get("consumed_amount")), 0.0)
-    return round(remain, 2)
+    return {"remaining": round(remain, 2),
+            "earliest_expiry": earliest,
+            "earliest_expiry_remaining": earliest_remaining,
+            "expiring_soon": round(expiring_soon, 2),
+            "expiring_soon_updated": int(ts)}
+
+
+def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None,
+                   now: float | None = None) -> float:
+    """只取剩余积分（旧签名保留）；完整口径见 user_ent_summary。"""
+    return user_ent_summary(client, headers, ug_host, now)["remaining"]
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +976,10 @@ class TraeCredentialManager:
 
     def user_ent_usage(self, client) -> float:
         return user_ent_usage(client, self.ug_headers())
+
+    def user_ent_summary(self, client) -> dict:
+        """积分余额 + 过期信息（账号池「最近过期」列的数据源）。"""
+        return user_ent_summary(client, self.ug_headers())
 
     def summary(self) -> dict:
         acct = self._account()

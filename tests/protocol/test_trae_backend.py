@@ -1700,6 +1700,52 @@ def test_ent_usage_falls_back_to_summary_without_packs():
         assert T.user_ent_usage(client, {}) == 5428.39
 
 
+def test_ent_summary_reports_earliest_expiry_and_soon():
+    """过期统计：earliest 取未过期包中最早者；expiring_soon 只算 7 天窗口内的余额。
+
+    生产背景：Trae 账号「最近过期」列曾恒空——user_ent_usage 早解析了 expire_time
+    却只用来跳过过期包，算完 remaining 就丢，account_status 里从不写
+    earliest_expiry（前端该列无数据可渲染）。
+    """
+    now = 1_800_000_000
+    payload = {"user_entitlement_pack_list": [
+        # 已过期：跳过，不进任何统计
+        {"entitlement_base_info": {"quota": {"credits_limit": 300}}, "usage": {},
+         "expire_time": now - 10},
+        # 3 天后过期，剩 200.5 → earliest
+        {"entitlement_base_info": {"quota": {"credits_limit": 300}}, "usage": {"credits_amount": 99.5},
+         "expire_time": now + 3 * 86400},
+        # 5 天后过期，剩 500 → 进 expiring_soon
+        {"entitlement_base_info": {"quota": {"credits_limit": 500}}, "usage": {},
+         "expire_time": now + 5 * 86400},
+        # 30 天后过期，剩 100 → 不进 soon，但 earliest 仍是第 2 个包
+        {"entitlement_base_info": {"quota": {"credits_limit": 100}}, "usage": {},
+         "expire_time": now + 30 * 86400},
+        # 已耗尽（余额 0）： earliest_remaining 不计它
+        {"entitlement_base_info": {"quota": {"credits_limit": 50}}, "usage": {"credits_amount": 50},
+         "expire_time": now + 86400},
+    ]}
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        s = T.user_ent_summary(client, {}, now=now)
+    assert s["remaining"] == 800.5            # 200.5 + 500 + 100 + 0
+    assert s["earliest_expiry"] == now + 3 * 86400
+    assert s["earliest_expiry_remaining"] == 200.5
+    assert s["expiring_soon"] == 700.5        # 200.5 + 500（30 天后与已耗尽不计）
+    assert s["expiring_soon_updated"] == now
+
+
+def test_ent_summary_without_packs_has_no_expiry():
+    """无权益包的 fallback 路径没有过期信息：earliest 为 None，前端不渲染该列。"""
+    payload = {"user_entitlement_pack_list": [],
+               "usage_summary": {"total_amount": 9100, "consumed_amount": 3671.61}}
+    with _REAL_SYNC_CLIENT(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload))) as client:
+        s = T.user_ent_summary(client, {})
+    assert s["remaining"] == 5428.39
+    assert s["earliest_expiry"] is None
+    assert s["earliest_expiry_remaining"] is None
+    assert s["expiring_soon"] == 0.0
+
+
 def test_catalog_provider_drives_map_model_and_ids():
     from core.backends import registry as R
     assert R.catalog_ids("trae") == [m["id"] for m in T.TRAE_STATIC_MODELS]  # 无提供者→静态
