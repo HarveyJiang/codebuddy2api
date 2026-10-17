@@ -55,7 +55,7 @@ else:
                     "queue-failover", "queue-model-fallback", "queue-retry",
                     "queue-cooldown", "queue-hold-ms", "queue-fallback-model",
                     "backup-card", "backup-enabled", "backup-interval", "backup-keep",
-                    "backup-now", "backup-save", "backup-body", "backup-empty",
+                    "backup-now", "backup-body", "backup-empty",
                     "backup-badge", "backup-schedule", "backup-dir-note"):
         if f'id="{element}"' not in block:
             failures.append(f"设置页缺少控件: {element}")

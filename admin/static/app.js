@@ -530,7 +530,7 @@ function renderLogRows(rows) {
   const accountCell = r => r.account_name
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}</td><td>${accountCell(r)}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}</td><td>${accountCell(r)}</td><td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
   const size = Number($("dash-page-size").value) || 10;
@@ -608,7 +608,7 @@ function renderAccounts() {
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
-    const actions = `<td><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 请求日志 / 删除">⚙ 设置</button></td>`;
+    const actions = `<td><div class="actions">${checkinBtn}<button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
     return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
@@ -750,7 +750,7 @@ $("dash-add").addEventListener("click", () => openAccount());
 $("dash-add-account").addEventListener("click", () => openAccount());
 $("empty-add").addEventListener("click", () => openAccount());
 $("accounts-back-dash").addEventListener("click", e => { e.preventDefault(); goPage("dashboard"); });
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody()}});await refresh();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{backup_enabled:$("backup-enabled").checked,backup_interval_hours:Number($("backup-interval").value),backup_keep:Number($("backup-keep").value),default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody()}});await refresh();await loadBackups();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 
 // ── 数据库备份 ──────────────────────────────────────────────────────────
@@ -783,10 +783,6 @@ function backupGuard(button, fn) {
     finally { backupBusy = false; button.disabled = false; button.textContent = original; }
   };
 }
-$("backup-save").addEventListener("click", backupGuard($("backup-save"), async () => {
-  await api("pool/settings", {method:"PATCH", body:{backup_enabled:$("backup-enabled").checked, backup_interval_hours:Number($("backup-interval").value), backup_keep:Number($("backup-keep").value)}});
-  await refresh(); await loadBackups(); toast("备份设置已保存");
-}));
 $("backup-now").addEventListener("click", backupGuard($("backup-now"), async () => {
   $("backup-now").textContent = "备份中…";
   const data = await api("backups", {method:"POST"});
@@ -1116,6 +1112,7 @@ $("accounts-body").addEventListener("click", async e => {
   }
   const a = overview.accounts.find(x => x.id === b.dataset.id); if (!a) return;
   if (b.dataset.action === "settings") { openAccountSettings(a); return; }
+  if (b.dataset.action === "logs") { openAccountLogs(a); return; }
   if (b.dataset.action === "checkin") {
     // 行内签到（用户 2026-10-17）：不在账号池行与设置弹框之间来回跳。
     b.disabled = true;
@@ -1164,12 +1161,6 @@ $("as-refresh").addEventListener("click", async e => {
   try { const r = await api(`accounts/${a.id}/actions/refresh`, {method:"POST"}); toast(r.message); await refresh(); }
   catch (err) { toast(err.message); } finally { e.target.disabled = false; }
 });
-// 「请求日志」快捷方式（用户 2026-10-17）：与侧边栏「请求日志」页同一套呈现，
-// 只是按当前账号预筛，取最近 50 条（账号详情原来的小表格撤掉后的替代入口）。
-$("as-logs").addEventListener("click", () => {
-  const a = settingsAccount(); if (!a) return;
-  openAccountLogs(a);
-});
 // 账号请求日志弹框：复用请求日志页的列与样式（account-cell-log / cell-note.inline），
 // 但没有「密钥」列以外的差异——这里不显示账号列（整个弹框就按这个账号筛的）。
 let accountLogsId = null;
@@ -1187,7 +1178,7 @@ async function openAccountLogs(a) {
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td>${esc(keyLabel(r))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}</td>`
-      + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td>`
+      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
       || '<tr><td colspan="5" class="history-empty">这个账号还没有请求记录。</td></tr>';
   } catch (err) {
@@ -1786,7 +1777,7 @@ async function loadKeyRequests(offset) {
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}</td>`
       + `<td>${r.account_name ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>` : "—"}</td>`
-      + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td>`
+      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
       || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';
     const pages = Math.max(1, Math.ceil(data.total / keyReqSize));

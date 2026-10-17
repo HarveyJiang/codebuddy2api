@@ -81,15 +81,20 @@ check("状态开关带 data-action=toggle（点得动）", stateToggle({enabled:
 check("已签到不渲染签到按钮", checkinCell({today_checked_in:true,id:"x"}), '<small class="cell-note">今日已签到</small>');
 check("未签到渲染签到按钮且带 data-action=checkin",
       checkinCell({today_checked_in:false,id:"x"}).includes('data-action="checkin" data-id="x"'), true);
-// 行内点击分派：三个新 action 都必须在 [data-action] 分支里被接住
+// 行内点击分派：新 action 都必须在 [data-action] 分支里被接住
 //（否则会掉进行情分支，弹详情弹框而不是执行操作）。
 const dispatchAction = (action) => {
-  const handled = ["settings", "checkin", "toggle"];
+  const handled = ["settings", "checkin", "toggle", "logs"];
   return handled.includes(action) ? action : "detail";
 };
 check("行内签到按钮 → 执行签到", dispatchAction("checkin"), "checkin");
 check("行内停用开关 → 执行停用", dispatchAction("toggle"), "toggle");
 check("设置按钮 → 开设置弹框", dispatchAction("settings"), "settings");
+// 操作列「日志」按钮（用户 2026-10-17：请求日志直接放操作列、设置后面，
+// 不再藏在设置弹框里）——渲染与分派都要在。
+check("账号池行模板渲染日志按钮且带 data-action=logs",
+      src.includes('data-action="logs"') && src.includes('=== "logs") { openAccountLogs(a)'), true);
+check("设置弹框里 as-logs 已撤掉（入口挪到操作列）", /id="as-logs"/.test(html), false);
 // 设置弹框里重复入口已撤掉：签到/暂停只该出现在账号池行内。
 check("设置弹框已无 as-checkin", /id="as-checkin"/.test(html), false);
 check("设置弹框已无 as-toggle", /id="as-toggle"/.test(html), false);
@@ -101,6 +106,31 @@ check("JS 已无 as-toggle 监听", /\$\("as-toggle"\)/.test(src), false);
 // 底部再放一个纯关闭按钮是冗余）—— 现在整个弹框只剩标题栏一个关闭钮。
 const detailDialog = /<dialog id="account-detail-dialog">[\s\S]*?<\/dialog>/.exec(html);
 check("详情弹框存在且可抽取", detailDialog !== null, true);
+// ---- 6.5 日志状态列只显示状态码数字，说明进美化 tooltip（用户 2026-10-17）----
+check("日志状态列不再有行内 cell-note 文字",
+      /log-status[\s\S]{0,120}cell-note inline/.test(src), false);
+check("日志状态列带 data-tip 气泡（三处：概览/账号日志/密钥明细）",
+      (src.match(/pill log-status/g) || []).length >= 3, true);
+check("日志弹框已加宽到 760px（治横向滚动）",
+      /#account-logs-dialog,#key-requests-dialog\{width:min\(760px/.test(css), true);
+
+// ---- 6.6 复选框救回：select 美化不能把 checkbox/radio 剥成下拉（用户 2026-10-17 报 bug）----
+check("checkbox/radio 恢复原生外观（appearance:auto）",
+      /input\[type=checkbox\][\s\S]{0,180}?appearance:auto/.test(css), true);
+check("复选框规则清掉了 select 的 chevron 背景图",
+      /input\[type=checkbox\][^}]*background-image:none/.test(css), true);
+
+// ---- 6.7 设置页卡片标题 inline-flex：q-help 是 h3 兄弟节点，flex 会把它挤下行 ----
+check("settings-card h3 用 inline-flex（问号贴标题不被挤走）",
+      /\.settings-card h3\{[^}]*display:inline-flex/.test(css), true);
+
+// ---- 6.8 备份只留一个「保存设置」+ 备份卡内「立即备份」（用户 2026-10-17）----
+check("HTML 已无 backup-save 按钮", /id="backup-save"/.test(html), false);
+check("JS 已无 backup-save 监听", /\$\("backup-save"\)/.test(src), false);
+check("主表单 PATCH 带上备份三字段",
+      /backup_enabled:\$\("backup-enabled"\)\.checked/.test(src), true);
+check("立即备份按钮仍在备份卡", /id="backup-now"/.test(html), true);
+
 check("详情弹框只有标题栏一个关闭钮（底部关闭已取消）",
       detailDialog ? (detailDialog[0].match(/<button/g) || []).length : -1, 1);
 
