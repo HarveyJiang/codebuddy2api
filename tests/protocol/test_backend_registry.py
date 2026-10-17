@@ -640,6 +640,13 @@ def test_auto_checkin_participation_is_declared():
     assert registry.spec_for("trae").supports_auto_checkin is True
 
 
+def test_upstream_usage_support_is_declared():
+    """上游用量对账只默认后端可用：Trae 的 token 打 WorkBuddy 计费域必然 401，
+    不声明就意味着不进同步队列（曾因无差别入队每天留一条永远清不掉的留痕）。"""
+    assert registry.spec_for("workbuddy").supports_upstream_usage is True
+    assert registry.spec_for("trae").supports_upstream_usage is False
+
+
 # --------------------------------------------------------------------------
 # 6. 上游错误的解释权归后端声明（pool 不得 import 后端模块去挑异常类）
 # --------------------------------------------------------------------------

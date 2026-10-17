@@ -192,6 +192,14 @@ class BackendSpec:
     #: 该后端是否参与自动签到（pool.tick）。默认 True。
     supports_auto_checkin: bool = True
 
+    #: 该后端是否有「上游用量明细」可对账（pool 的每日/手动同步）。默认 False。
+    #:
+    #: 用量对账接口**不是各后端通用**的：它打在默认后端的计费域上
+    #: （pool.USAGE_BILLING），只认默认后端的凭据。新后端接入时若无差别地
+    #: 进同步队列，就是每天拿它的 token 去打别人的域网关——必然 401，
+    #: 只会在 usage_sync_error 里堆一条永远清不掉的留痕。
+    supports_upstream_usage: bool = False
+
     #: 账号操作（积分/签到）由谁实现：None = 用 pool 里的默认实现（默认后端走这条路，
     #: 因为是 billing 接口）；否则是后端名，表示「交给该后端自己的实现」。
     #: 这么个形状的理由：默认后端的积分/签到是 pool 里唯一写死的一套，另建后端
