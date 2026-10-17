@@ -18,6 +18,7 @@ const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
+  logs: ["请求日志", "REQUEST LOG", "服务处理过的每一次请求，按时间倒序，支持翻页与按密钥追踪。"],
   models: ["模型管理", "MODEL CATALOG", "与官方客户端一致的模型列表，可按需启用或禁用。"],
   test: ["连接测试", "CONNECTION LAB", "经账号池按路由规则发起请求，确认模型能否正常响应。"],
   usage: ["用量明细", "USAGE LEDGER", "查看上游账单级的积分消耗，默认只读本地库，点击「拉取上游」才请求上游。"],
@@ -67,6 +68,7 @@ function goPage(next) {
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
   if (next === "usage") initUsagePage();
+  if (next === "logs") loadLogs(logOffset);
   if (next === "settings") loadBackups().catch(e => toast(e.message));
 }
 // 密钥列表的排序 / 筛选（specs/keys-last-used-at.md §8）。密钥总数是个位数到几十，
@@ -501,9 +503,15 @@ const ROUTING_SHORT = {"": "跟随默认", round_robin: "轮转", random: "随�
 // 显示成另一个策略，比显示一个陌生的英文词更容易误导。空串（未设置）才回落。
 const routingShort = r => r === "" || r == null ? ROUTING_SHORT[""] : (ROUTING_SHORT[r] || String(r));
 const routingIcon = r => r === "" || r == null ? ROUTING_ICON[""] : (ROUTING_ICON[r] || "•");
+// 密钥列只显示**名称**（用户 2026-10-17：API Key 不用全显示，打码）。
+// key_id 是完整 id， overview.keys 里有 name；找不到（老记录/已删除）显示 id 前 6 位。
+const keyLabel = r => {
+  const k = overview?.keys?.find(x => x.id === r.key_id);
+  return k ? k.name : (r.key_id ? String(r.key_id).slice(0, 6) + "…" : "—");
+};
 let logOffset = 0, logTotal = 0;
 function renderLogRows(rows) {
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note inline">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="6" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }
 async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
@@ -517,7 +525,7 @@ async function loadLogs(offset) {
     $("dash-page-info").textContent = logTotal ? `第 ${current} / ${pages} 页 · 共 ${logTotal.toLocaleString("zh-CN")} 条` : "暂无记录";
     $("dash-prev").disabled = data.offset <= 0;
     $("dash-next").disabled = data.offset + size >= logTotal;
-  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(e.message)}</td></tr>`; }
+  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="6" class="history-empty">${esc(e.message)}</td></tr>`; }
 }
 $("dash-prev").addEventListener("click", () => loadLogs(Math.max(0, logOffset - Number($("dash-page-size").value))));
 $("dash-next").addEventListener("click", () => loadLogs(logOffset + Number($("dash-page-size").value)));
@@ -639,7 +647,7 @@ async function refresh(loadCredits) {
     overview = await api("overview"); render(); $("load-error").hidden = true;
     // 用量页的账号下拉依赖 overview，deep-link 进来时它还是 null，这里补一次。
     if (usageInitialized) fillUsageAccounts();
-    if (page === "dashboard") loadLogs(logOffset);
+    if (page === "dashboard" || page === "logs") loadLogs(logOffset);
   }
   catch (e) { $("load-error").textContent = e.message; $("load-error").hidden = false; throw e; }
   finally { $("refresh").disabled = false; }
