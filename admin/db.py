@@ -1489,7 +1489,7 @@ class Database:
                 rows)
         return len(rows)
 
-    def _upstream_where(self, since=None, until=None, account_id=None):
+    def _upstream_where(self, since=None, until=None, account_id=None, backend=None):
         clauses, params = [], []
         if since is not None:
             clauses.append("request_time >= ?")
@@ -1500,17 +1500,24 @@ class Database:
         if account_id:
             clauses.append("account_id = ?")
             params.append(str(account_id))
+        if backend:
+            # 用量表本身没有 backend 列（账号才是后端的持有者），用子查询关联：
+            # account_id IN (SELECT id FROM accounts WHERE backend=?)。
+            # 账号已删时它的历史用量不再归属任何后端 tab——与「按账号筛不到已删
+            # 账号」的既有行为一致，不是新引入的取舍。
+            clauses.append("account_id IN (SELECT id FROM accounts WHERE backend=?)")
+            params.append(str(backend))
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", tuple(params)
 
     def page_upstream_usage(self, limit=100, offset=0, since=None, until=None,
-                            account_id=None):
+                            account_id=None, backend=None):
         """分页读上游用量（本地库，不打上游），返回 {rows, total, limit, offset}。
 
         total 是不带 limit/offset 的同条件总数，供前端画页码。条件全部参数绑定。
         """
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
-        where, params = self._upstream_where(since, until, account_id)
+        where, params = self._upstream_where(since, until, account_id, backend)
         total = self.query(
             f"SELECT COUNT(*) AS n FROM upstream_request_usage{where}", params)[0]["n"]
         rows = self.query(
@@ -1525,7 +1532,7 @@ class Database:
         return {"rows": result, "total": total, "limit": limit, "offset": offset}
 
     def upstream_usage_report(self, since=None, until=None, account_id=None,
-                              group_by="day", limit=500):
+                              group_by="day", limit=500, backend=None):
         """上游用量报表：按白名单维度分组，给积分合计、条数与免费/付费拆分。
 
         免费（credit_micro=0）与付费分开计——限免期模型照样记账，混入会低估单价。
@@ -1534,7 +1541,7 @@ class Database:
         if group_by not in UPSTREAM_GROUPS:
             raise ValueError(f"不支持的分组维度：{group_by}")
         expr = UPSTREAM_GROUPS[group_by]
-        where, params = self._upstream_where(since, until, account_id)
+        where, params = self._upstream_where(since, until, account_id, backend)
         rows = self.query(
             f"SELECT {expr} AS bucket, COUNT(*) AS n,"
             " SUM(credit_micro) AS credit_micro,"

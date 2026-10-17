@@ -690,7 +690,9 @@ async function refresh(loadCredits) {
     try { applyBackends((await api("backends"))?.backends); } catch (e) { /* 旧版本服务无此接口，helper 会回落默认值 */ }
     overview = await api("overview"); render(); $("load-error").hidden = true;
     // 用量页的账号下拉依赖 overview，deep-link 进来时它还是 null，这里补一次。
-    if (usageInitialized) fillUsageAccounts();
+    // tab 依赖 backends（上一行刚 apply），同样在这里补画：不进用量页时
+    // initUsagePage 不会跑，首次进入前 tab 条必须是空的而不是陈旧的。
+    if (usageInitialized) { fillUsageAccounts(); paintUsageTabs(); }
     if (page === "dashboard" || page === "logs") loadLogs(logOffset);
   }
   catch (e) { $("load-error").textContent = e.message; $("load-error").hidden = false; throw e; }
@@ -1642,6 +1644,10 @@ $("test-form").addEventListener("submit", async e => {
 });
 /* ---------- 用量明细页 ---------- */
 let usageOffset = 0, usageTotal = 0, usageSyncCooldown = 0;
+// 用量页 tab（用户 2026-10-17）：按后端筛，空 = 全部后端汇总。
+// 与模型页 tab 的区别：**有「全部」页签且默认选中** —— 用量是总账，
+// 先看合计再下沉到单个后端更自然（模型页按用户拍板无全部 tab）。
+let usageBackend = "";
 const usageStart = () => $("usage-start").value, usageEnd = () => $("usage-end").value;
 // datetime-local 给的是「无时区的墙上时间」，直接 new Date(v) 会按**浏览器本地
 // 时区**解析 —— 非 +08:00 的用户会把区间整体错开，报表按日分桶就偏一整个时区。
@@ -1657,6 +1663,7 @@ function usageQuery(extra = {}) {
   const a = usageUnix(usageStart()), b = usageUnix(usageEnd());
   if (a) q.set("start", a); if (b) q.set("end", b);
   const acc = $("usage-account").value; if (acc) q.set("account_id", acc);
+  if (usageBackend) q.set("backend", usageBackend);
   return q.toString();
 }
 function accountName(id) {
@@ -1683,6 +1690,26 @@ function initUsagePage() {
   const now = new Date(), past = new Date(now.getTime() - 30 * 86400000);
   $("usage-start").value = fmt(past); $("usage-end").value = fmt(now);
   fillUsageAccounts();
+  paintUsageTabs();
+}
+// 画用量页 tab：全部（默认）+ 每个后端一个。统计由服务端按 backend 裁，
+// 所以 count-badge 用当前区间该后端的记录数（loadUsage 拿到 report 后回填）。
+function paintUsageTabs(counts) {
+  const box = $("usage-tabs");
+  if (!box) return;
+  const total = counts && counts.__all__ != null ? counts.__all__ : null;
+  const tabs = [{name: "", label: "全部", all: true}]
+    .concat(backends.map(b => ({name: b.name, label: b.label || b.name})));
+  box.innerHTML = tabs.map(t => {
+    const sel = t.name === usageBackend;
+    const n = t.all ? total : counts && counts[t.name];
+    return `<button class="model-tab${sel ? " selected" : ""}" role="tab"`
+      + ` aria-selected="${sel ? "true" : "false"}" data-usage-tab="${esc(t.name)}"`
+      + ` title="只看 ${t.all ? "全部后端的用量汇总" : esc(t.label) + " 的用量"}">`
+      + `${t.all ? "" : backendIconSvg(t.name)}<span>${esc(t.label)}</span>`
+      + (n == null ? "" : `<span class="count-badge">${n.toLocaleString("zh-CN")}</span>`)
+      + `</button>`;
+  }).join("");
 }
 function renderUsageSummary(report) {
   const t = report.total || {};
@@ -1730,6 +1757,17 @@ async function loadUsage(offset, withReport = true) {
     if (withReport) {
       const report = await api("usage/report?" + usageQuery({group_by: $("usage-group").value}));
       renderUsageSummary(report); renderUsageGroups(report);
+      // 回填 tab 上的记录数：只按当前区间统计，切 tab / 改区间后由下一次 loadUsage 更新。
+      const byAcc = report.group_by === "account" ? (report.groups || []) : null;
+      const counts = {__all__: report.total ? report.total.count : 0};
+      if (byAcc) {
+        for (const g of byAcc) {
+          const hit = (overview && overview.accounts || []).find(a => a.id === g.bucket);
+          const key = hit ? hit.backend : null;
+          if (key) counts[key] = (counts[key] || 0) + g.count;
+        }
+      }
+      paintUsageTabs(counts);
     }
   } catch (e) {
     $("usage-body").innerHTML = `<tr><td colspan="6" class="history-empty">${esc(e.message)}</td></tr>`;
@@ -1748,7 +1786,8 @@ async function syncUsage() {
   try {
     const r = await api("usage/sync", {method: "POST", body: {
       start: usageUnix(usageStart()), end: usageUnix(usageEnd()),
-      account_id: $("usage-account").value || null}});
+      account_id: $("usage-account").value || null,
+      backend: usageBackend || null}});
     const skipped = (r.skipped || []).length;
     toast(skipped ? `已同步 ${r.synced} 个账号，跳过 ${skipped} 个（${r.message || "刚拉取过或任务进行中"}）`
                   : `已同步 ${r.synced} 个账号`);
@@ -1770,6 +1809,14 @@ $("usage-next").addEventListener("click", () => loadUsage(usageOffset + (Number(
 $("usage-page-size").addEventListener("change", () => loadUsage(0));
 $("usage-group").addEventListener("change", () => loadUsage(usageOffset));
 $("usage-account").addEventListener("change", () => loadUsage(0));
+// 用量 tab 点击（用户 2026-10-17）：切后端重新请求（统计走服务端 backend 参数）。
+document.addEventListener("click", e => {
+  const tab = e.target.closest("[data-usage-tab]");
+  if (!tab || tab.dataset.usageTab === usageBackend) return;
+  usageBackend = tab.dataset.usageTab;
+  paintUsageTabs();
+  loadUsage(0);
+});
 $("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsage(0); });
 
 /* ---------- 单个密钥的请求记录 ---------- */

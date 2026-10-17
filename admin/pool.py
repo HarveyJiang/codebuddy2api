@@ -1224,9 +1224,11 @@ class AccountPool:
                     results["synced"] += 1
         return results
 
-    async def sync_upstream_usage_manual(self, start, end, account_id=None):
+    async def sync_upstream_usage_manual(self, start, end, account_id=None, backend=None):
         """手动批量拉取：只打启用账号，走 jobs 并发锁防重入。
 
+        backend 限定只拉某后端的账号（用量页 tab 用：停在 Trae tab 上点
+        「拉取上游」就只拉 Trae 账号，不把另一个后端也打一遍）。
         被节流/失败的账号单独记在 results["skipped"] 里返回，不影响其它账号——
         连点按钮时应当看到「大部分已跳过」而不是整批报错。
         """
@@ -1234,7 +1236,8 @@ class AccountPool:
             targets = [aid for aid, item in self.store.data["accounts"].items()
                        if item["enabled"] and is_backend_enabled(item.get("backend", default_backend()))
                        and spec_for(item.get("backend", default_backend())).supports_upstream_usage
-                       and (not account_id or aid == account_id)]
+                       and (not account_id or aid == account_id)
+                       and (not backend or item.get("backend", default_backend()) == backend)]
         if not targets:
             if account_id:
                 # 指定了账号却拉不到：说清是「这个账号拉不了」，别让用户以为选错了人。

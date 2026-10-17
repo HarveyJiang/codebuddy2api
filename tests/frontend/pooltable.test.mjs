@@ -134,6 +134,21 @@ check("复选框规则清掉了 select 的 chevron 背景图",
 check("settings-card h3 用 inline-flex（问号贴标题不被挤走）",
       /\.settings-card h3\{[^}]*display:inline-flex/.test(css), true);
 
+// ---- 6.9 用量明细页按后端 tab（用户 2026-10-17）----
+check("用量页有 tab 容器（JS 填充）", /id="usage-tabs"/.test(html), true);
+check("usageBackend 全局且默认空（=全部后端）",
+      /let usageBackend = ""/.test(src), true);
+check("usageQuery 带 backend 参数", /if \(usageBackend\) q\.set\("backend", usageBackend\)/.test(src), true);
+check("syncUsage 拉取也按当前 tab 筛", /backend: usageBackend \|\| null/.test(src), true);
+check("paintUsageTabs 含「全部」tab 且默认选中",
+      /\{name: "", label: "全部", all: true\}/.test(src) && /t\.name === usageBackend/.test(src), true);
+check("tab 点击分派存在且切 tab 后重新加载",
+      /closest\("\[data-usage-tab\]"\)/.test(src) && /usageBackend = tab\.dataset\.usageTab/.test(src), true);
+check("loadUsage 拿到报表后回填 tab 记录数",
+      /paintUsageTabs\(counts\)/.test(src), true);
+check("筛选区改固定列宽（不再 auto-fit 铺满拉伸）",
+      /\.usage-filter\{[^}]*grid-template-columns:repeat\(4,auto\)/.test(css), true);
+
 // ---- 6.8 备份只留一个「保存设置」+ 备份卡内「立即备份」（用户 2026-10-17）----
 check("HTML 已无 backup-save 按钮", /id="backup-save"/.test(html), false);
 check("JS 已无 backup-save 监听", /\$\("backup-save"\)/.test(src), false);

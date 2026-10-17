@@ -343,6 +343,46 @@ class DatabaseTests(unittest.TestCase):
             db.upstream_usage_report(group_by="model; DROP TABLE keys")
         db.close()
 
+    def test_upstream_usage_filtered_by_backend(self):
+        # 用量页按后端 tab 筛（2026-10-17）：用量表无 backend 列，靠
+        # account_id IN (SELECT id FROM accounts WHERE backend=?) 关联。
+        db = Database(self.root / "t.db")
+        db.save_accounts({"a1": {"name": "一号", "backend": "workbuddy", "file": "a1.json"},
+                          "a2": {"name": "二号", "backend": "trae", "file": "a2.json"}}, {})
+        db.save_upstream_usage([
+            {"request_id": "r1", "account_id": "a1", "account_name": "一号",
+             "credit": 0.5, "model": "hy3", "client": "WorkBuddy",
+             "request_time": NOW - 60, "agent_purpose": ""},
+            {"request_id": "r2", "account_id": "a2", "account_name": "二号",
+             "credit": 0.0, "model": "trae-x", "client": "Trae",
+             "request_time": NOW - 30, "agent_purpose": ""},
+        ])
+        # 明细与 total 都只算该后端。
+        wb = db.page_upstream_usage(limit=10, backend="workbuddy")
+        self.assertEqual(wb["total"], 1)
+        self.assertEqual([r["request_id"] for r in wb["rows"]], ["r1"])
+        # 报表的合计与分组同样按后端裁。
+        report = db.upstream_usage_report(group_by="day", backend="trae")
+        self.assertEqual(report["total"]["count"], 1)
+        self.assertEqual(report["total"]["free"], 1)
+        # 两个后端都拿不到对方的数据。
+        self.assertEqual(db.page_upstream_usage(backend="trae")["total"], 1)
+        # 不传 backend = 全部后端（汇总 tab 的口径）。
+        self.assertEqual(db.page_upstream_usage()["total"], 2)
+        # 与时间/账号条件叠加仍成立。
+        combo = db.upstream_usage_report(backend="workbuddy", since=NOW - 120)
+        self.assertEqual(combo["total"]["count"], 1)
+        # 已删账号的历史用量不属于任何后端 tab（既有按账号筛的取舍一致）。
+        # 走 transaction()：直接 _write.execute 是 autocommit，但线程本地的只读
+        # 连接还停在旧读快照上，随后的断言会读到删之前的行。
+        with db.transaction():
+            db._write.execute("DELETE FROM accounts WHERE id = 'a1'")
+        self.assertEqual(db.page_upstream_usage(backend="workbuddy")["total"], 0)
+        # 汇总 tab（不传 backend）仍看得到已删账号的历史用量：它确实发生过，
+        # 只是无法归到某个现存后端 tab。这正是「汇总 + 按后端」的差别。
+        self.assertEqual(db.page_upstream_usage()["total"], 2)
+        db.close()
+
     def test_models_upsert_and_available_filter(self):
         db = Database(self.root / "t.db")
         self._write_models(db)

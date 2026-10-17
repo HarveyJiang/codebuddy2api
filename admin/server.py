@@ -1473,7 +1473,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             limit=_query_int(params, "limit", 100), offset=_query_int(params, "offset", 0),
             since=_query_time(params.get("start"), "start"),
             until=_query_time(params.get("end"), "end"),
-            account_id=params.get("account_id") or None)
+            account_id=params.get("account_id") or None,
+            backend=params.get("backend") or None)
         return result
 
     @app.get("/admin/api/usage/report")
@@ -1488,7 +1489,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             store.db.upstream_usage_report,
             since=_query_time(params.get("start"), "start"),
             until=_query_time(params.get("end"), "end"),
-            account_id=params.get("account_id") or None, group_by=group_by)
+            account_id=params.get("account_id") or None,
+            group_by=group_by,
+            backend=params.get("backend") or None)
 
     @app.post("/admin/api/usage/sync")
     async def usage_sync(req: Request):
@@ -1507,7 +1510,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             raise HTTPException(400, "开始时间必须早于结束时间")
         result = await pool.sync_upstream_usage_manual(
             datetime.fromtimestamp(start, CN), datetime.fromtimestamp(end, CN),
-            body.get("account_id") or None)
+            body.get("account_id") or None,
+            body.get("backend") or None)
         return result
 
     @app.post("/admin/api/models/refresh")
