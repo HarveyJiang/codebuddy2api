@@ -260,6 +260,9 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         # 跨天：熔断自动解除，重新参与签到。
         status['checkin_date'] = ''
         status['auto_attempt'] = 0
+        # offset_date 钉成今天：checkin_offset 见「今天已抽过」就直接返回已钉的
+        # 00:00，不再走随机抽取（否则可能抽到晚于 10:00 的时段，测试变 flaky）。
+        status['checkin_offset_date'] = '2026-10-15'
         self.now = datetime(2026, 10, 15, 10, 0, tzinfo=CN).timestamp()
         await self.pool.tick()
         self.assertEqual(self.checkin_posts, 1)
