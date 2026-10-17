@@ -1623,7 +1623,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
         store.require_admin(req)
-        if action not in ("refresh", "status", "checkin"):
+        if action not in ("refresh", "status", "checkin", "clear-cooldown"):
             raise HTTPException(404)
         return await asyncio.to_thread(pool.operate, aid, action)
 

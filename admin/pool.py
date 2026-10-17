@@ -853,6 +853,15 @@ class AccountPool:
             manager = self.store.manager_for(aid, item)
             spec = spec_for(item.get("backend", default_backend()))
             try:
+                if action == "clear-cooldown":
+                    # 手动解除冷却（用户 2026-10-18 拍板做按钮）：上游按**模型**限流
+                    # （如「Step-5-Preview 使用量已超出频率限制，14:23 重置」），但
+                    # 冷却记在**账号**上——期间该账号所有模型都不可用，即使别的模型
+                    # 还能用。用户要能自己决定提前放行，而不是干等到点。
+                    # 只清冷却；连续失败计数与 last_error 保留（再撞一次限流，
+                    # 下次退避从当前计数继续翻倍，不会清零重来）。
+                    self.update(aid, cooldown_until=0)
+                    return {"id": aid, "ok": True, "message": "冷却已解除，账号重新参与分配"}
                 if action == "refresh":
                     with manager._lock:
                         manager._refresh()

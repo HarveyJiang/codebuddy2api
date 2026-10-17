@@ -611,7 +611,11 @@ function renderAccounts() {
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
-    const actions = `<td><div class="actions"><button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
+    // 冷却中才给「解除冷却」（用户 2026-10-18）：上游按单个模型限流，但冷却记在
+    // 账号上——期间所有模型都不可用。按钮只在 cooldown_until 未过期时出现。
+    const cooling = a.cooldown_until > Date.now() / 1000;
+    const unfreezeBtn = cooling ? `<button class="btn-ghost" data-action="clear-cooldown" data-id="${a.id}" title="提前解除账号冷却，立即重新参与分配">解除冷却</button>` : "";
+    const actions = `<td><div class="actions">${unfreezeBtn}<button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
     return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
@@ -1116,6 +1120,17 @@ $("accounts-body").addEventListener("click", async e => {
   const a = overview.accounts.find(x => x.id === b.dataset.id); if (!a) return;
   if (b.dataset.action === "settings") { openAccountSettings(a); return; }
   if (b.dataset.action === "logs") { openAccountLogs(a); return; }
+  if (b.dataset.action === "clear-cooldown") {
+    // 解除冷却（用户 2026-10-18）：先确认一次——上游限流没重置就放行，下一个
+    // 请求大概率再撞一次，退避从当前连续失败计数继续翻倍，不会清零重来。
+    confirmAction("解除这个账号的冷却？",
+      "上游限流可能还没到重置时间，解除后下一个请求可能再次触发冷却。确定要立即让这个账号重新参与分配吗？",
+      async () => {
+        await api(`accounts/${a.id}/actions/clear-cooldown`, {method:"POST"});
+        await refresh();
+      });
+    return;
+  }
   if (b.dataset.action === "checkin") {
     // 行内签到（用户 2026-10-17）：不在账号池行与设置弹框之间来回跳。
     b.disabled = true;
@@ -1145,6 +1160,9 @@ function openAccountSettings(a) {
   $("as-name").value = a.name || "";
   $("as-weight").value = a.weight || 0;
   $("account-settings-error").textContent = "";
+  // 「解除冷却」只在真冷却着时出现（用户 2026-10-18：上游按模型限流却冷整个
+  // 账号，设置弹框里也要能放行，与账号行那颗按钮同一入口）。
+  $("as-unfreeze").hidden = !(a.cooldown_until > Date.now() / 1000);
   $("account-settings-dialog").showModal();
 }
 
@@ -1156,6 +1174,17 @@ $("as-status").addEventListener("click", async e => {
   e.target.disabled = true;
   try { const r = await api(`accounts/${a.id}/actions/status`, {method:"POST"}); toast(r.message); await refresh(); }
   catch (err) { toast(err.message); } finally { e.target.disabled = false; }
+});
+$("as-unfreeze").addEventListener("click", async e => {
+  e.preventDefault();
+  const a = settingsAccount(); if (!a) return;
+  confirmAction("解除这个账号的冷却？",
+    "上游限流可能还没到重置时间，解除后下一个请求可能再次触发冷却。确定要立即让这个账号重新参与分配吗？",
+    async () => {
+      await api(`accounts/${a.id}/actions/clear-cooldown`, {method:"POST"});
+      $("account-settings-dialog").close();
+      await refresh();
+    });
 });
 $("as-refresh").addEventListener("click", async e => {
   e.preventDefault();

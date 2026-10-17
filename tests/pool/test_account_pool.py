@@ -423,6 +423,34 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('：', err)
         self.assertIn('本地退避', err)
 
+    def test_operate_clear_cooldown_frees_account(self):
+        """手动解除冷却（用户 2026-10-18）：冷却中的账号一条 operate 就回到候选集。
+
+        上游按**单个模型**限流（「Step-5-Preview 使用量已超出频率限制，14:23
+        重置」），冷却却记在**账号**上——期间所有模型都不可用。用户要能自己
+        决定提前放行，而不是干等到点。
+        """
+        row = dict(self.store.data['accounts'][self.a], id=self.a, status='ok')
+        self.pool.record(self.a, 429)
+        self.assertEqual(self.pool.state(row), "cooling")
+        result = self.pool.operate(self.a, "clear-cooldown")
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.store.data['account_status'][self.a]['cooldown_until'], 0)
+        self.assertEqual(self.pool.state(row), "available")
+
+    def test_operate_clear_cooldown_keeps_fail_count(self):
+        """只清冷却，不清连续失败计数——再撞一次限流退避继续翻倍，不从头开始。
+
+        清零计数等于给账号「免费重试」，会在限流窗口内反复撞墙，每次都留一条
+        风控痕迹。
+        """
+        self.pool.record(self.a, 429)
+        self.pool.record(self.a, 429)
+        fails_before = self.store.data['account_status'][self.a]['consecutive_fails']
+        self.assertGreater(fails_before, 1)
+        self.pool.operate(self.a, "clear-cooldown")
+        self.assertEqual(self.store.data['account_status'][self.a]['consecutive_fails'], fails_before)
+
     def test_soft_cooldown_reason_carries_model(self):
         """软冷却（模型不可用）同样带上模型名，与硬冷却同一套格式。
 

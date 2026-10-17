@@ -170,6 +170,20 @@ check("主表单 PATCH 带上备份三字段",
       /backup_enabled:\$\("backup-enabled"\)\.checked/.test(src), true);
 check("立即备份按钮仍在备份卡", /id="backup-now"/.test(html), true);
 
+// ---- 6.9 手动解除冷却（用户 2026-10-18：上游按模型限流却冷整个账号）----
+check("账号行有解除冷却按钮且带 data-action=clear-cooldown",
+      /data-action="clear-cooldown"/.test(src), true);
+check("解除冷却按钮只在冷却中渲染（cooldown_until 未过期才拼）",
+      src.includes('const cooling = a.cooldown_until > Date.now() / 1000;')
+      && src.includes('const unfreezeBtn = cooling ?'), true);
+check("行内分派接住 clear-cooldown 并弹确认",
+      /=== "clear-cooldown"\) \{[\s\S]{0,300}?confirmAction/.test(src), true);
+check("解除冷却走 POST accounts/{id}/actions/clear-cooldown",
+      (src.match(/actions\/clear-cooldown/g) || []).length >= 2
+      && src.includes('actions/clear-cooldown`, {method:"POST"}'), true);
+check("设置弹框有 as-unfreeze 入口", /id="as-unfreeze"/.test(html), true);
+check("as-unfreeze 按冷却状态显隐", /\$\("as-unfreeze"\)\.hidden = !\(/.test(src), true);
+
 check("详情弹框只有标题栏一个关闭钮（底部关闭已取消）",
       detailDialog ? (detailDialog[0].match(/<button/g) || []).length : -1, 1);
 
