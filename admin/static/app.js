@@ -1671,10 +1671,15 @@ $("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsag
 /* ---------- 单个密钥的请求记录 ---------- */
 let keyReqId = null, keyReqOffset = 0, keyReqSize = 10, keyReqDay = null;
 function renderKeyRequests(rows) {
+  // 与「请求日志」页同一套呈现（用户 2026-10-17）：后端文字列去掉，账号用
+  // 小图标 + 名称的独立列；模型/状态都行内跟随，不排两排。
+  const accountCell = r => r.account_name
+    ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
+    : "—";
   $("key-requests-body").innerHTML = rows.map(r =>
     `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
-    + `<td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td>`
-    + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td>`
+    + `<td class="mono">${esc(r.model_id || "—")}</td><td>${accountCell(r)}</td>`
+    + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td>`
     + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
     || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';
 }
