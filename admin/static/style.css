@@ -208,3 +208,7 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .scope-pill{cursor:pointer;border:0;font:inherit}
 .scope-all{background:none;border:0;padding:0;color:var(--muted);text-decoration:underline dotted transparent}
 .scope-all:hover{color:var(--deep);text-decoration-color:currentColor}
+
+/* 用量历史里可点的请求数：无边框纯文本，hover 显示下划线提示可进明细。 */
+.linklike{background:none;border:0;padding:0;font:inherit;color:var(--deep);cursor:pointer;text-decoration:underline dotted transparent}
+.linklike:hover{text-decoration-color:currentColor}

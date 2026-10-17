@@ -1631,7 +1631,7 @@ $("usage-account").addEventListener("change", () => loadUsage(0));
 $("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsage(0); });
 
 /* ---------- 单个密钥的请求记录 ---------- */
-let keyReqId = null, keyReqOffset = 0, keyReqSize = 10;
+let keyReqId = null, keyReqOffset = 0, keyReqSize = 10, keyReqDay = null;
 function renderKeyRequests(rows) {
   $("key-requests-body").innerHTML = rows.map(r =>
     `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
@@ -1646,9 +1646,13 @@ async function loadKeyRequests(offset) {
   // 记下这次请求属于哪个密钥/哪一页：快速在密钥间点击时，先发的迟到响应
   // 会覆盖后发的列表，导致「显示的记录不属于当前密钥」。
   const requestedId = keyReqId, requestedOffset = keyReqOffset;
+  const day = keyReqDay;
   $("key-requests-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
   try {
-    const data = await api(`logs?limit=${keyReqSize}&offset=${keyReqOffset}&key_id=${encodeURIComponent(keyReqId)}`);
+    // 从用量历史点进来时带 since/until，只显示选中那天；从「请求」按钮进来
+    // 不带时间条件，显示最近的记录。
+    const window = day ? `&since=${day[0]}&until=${day[1]}` : "";
+    const data = await api(`logs?limit=${keyReqSize}&offset=${keyReqOffset}&key_id=${encodeURIComponent(keyReqId)}${window}`);
     if (requestedId !== keyReqId || requestedOffset !== keyReqOffset) return;  // 已被更新的请求取代
     renderKeyRequests(data.rows);
     const pages = Math.max(1, Math.ceil(data.total / keyReqSize));
@@ -1669,6 +1673,7 @@ $("keys-body").addEventListener("click", async e => {
   const reqCell = e.target.closest("[data-requests]");
   if (reqCell) {
     keyReqId = reqCell.dataset.requests;
+    keyReqDay = null;
     const k = overview.keys.find(x => x.id === keyReqId);
     $("key-requests-name").textContent = `密钥「${k ? k.name : keyReqId}」`;
     $("key-requests-dialog").showModal();
@@ -1688,13 +1693,29 @@ $("keys-body").addEventListener("click", async e => {
     const series = mine ? mine.series : [];
     const sum = series.reduce((acc, d) => ({count: acc.count + d.count, tokens: acc.tokens + d.tokens}), {count: 0, tokens: 0});
     $("usage-history-body").innerHTML = series.map(d =>
-      `<tr><td class="mono muted">${esc(d.day)}</td><td class="align-right mono">${d.count}</td>`
+      `<tr><td class="mono muted">${esc(d.day)}</td><td class="align-right mono"><button class="linklike" data-usage-day="${esc(d.day)}" data-usage-kid="${esc(kid)}" title="查看这一天的请求明细">${d.count}</button></td>`
       + `<td class="align-right mono">${fmtTokens(d.tokens)}</td></tr>`).join("")
       || '<tr><td colspan="3" class="history-empty">近 30 天还没有记录。</td></tr>';
     $("usage-history-total").textContent = series.length
       ? `区间合计：${sum.count.toLocaleString("zh-CN")} 次 · ${fmtTokens(sum.tokens)} tokens（共 ${series.length} 天有记录）`
       : "";
   } catch (err) { $("usage-history-body").innerHTML = `<tr><td colspan="3" class="history-empty">${esc(err.message)}</td></tr>`; }
+});
+
+/* 用量历史弹框里点某天的请求数 → 打开该密钥当天的请求明细。 */
+$("usage-history-body").addEventListener("click", async e => {
+  const cell = e.target.closest("[data-usage-day]");
+  if (!cell) return;
+  const day = cell.dataset.usageDay, kid = cell.dataset.usageKid;
+  const k = overview.keys.find(x => x.id === kid);
+  // 当天 00:00（本地时区）起算；截止取次日 00:00 之前，让最后一秒的请求也在内。
+  const from = new Date(`${day}T00:00:00`).getTime() / 1000 | 0;
+  const to = from + 86400;
+  keyReqId = kid;
+  $("key-requests-name").textContent = `密钥「${k ? k.name : kid}」 ${day} 的请求明细`;
+  $("key-requests-dialog").showModal();
+  keyReqDay = [from, to];
+  await loadKeyRequests(0);
 });
 
 (async () => { loadVersion(); try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();
