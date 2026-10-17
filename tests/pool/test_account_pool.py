@@ -252,18 +252,23 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         status['checkin_slot'] = '上午'
         status['checkin_when'] = '00:00'
         status['checkin_offset_date'] = '2026-10-14'
+        # b 两天都不能签到，否则会污染计数器：第一天锚 checkin_date；第二天
+        # checkin_date 过期，改锚 auto_attempt（刚尝试过，节流 1800 秒内不重复）。
         bstatus = self.store.data['account_status'].setdefault(self.b, {})
-        bstatus['checkin_date'] = '2026-10-15'
+        bstatus['checkin_date'] = '2026-10-14'
         self.now = datetime(2026, 10, 14, 10, 0, tzinfo=CN).timestamp()
         await self.pool.tick()
         self.assertEqual(self.checkin_posts, 0)  # 当天仍触顶
         # 跨天：熔断自动解除，重新参与签到。
         status['checkin_date'] = ''
         status['auto_attempt'] = 0
-        # offset_date 钉成今天：checkin_offset 见「今天已抽过」就直接返回已钉的
-        # 00:00，不再走随机抽取（否则可能抽到晚于 10:00 的时段，测试变 flaky）。
+        # 随机时段也要锚到新一天：checkin_offset 发现 offset_date 过期会重抽
+        # 时刻，抽到 10:00 之后账号这轮就「未到点」——重抽该由时段随机性
+        # 自己的测试覆盖，本例只断言熔断解除（不锚会让它时通时断）。
         status['checkin_offset_date'] = '2026-10-15'
+        bstatus['checkin_date'] = ''
         self.now = datetime(2026, 10, 15, 10, 0, tzinfo=CN).timestamp()
+        bstatus['auto_attempt'] = self.now
         await self.pool.tick()
         self.assertEqual(self.checkin_posts, 1)
 
