@@ -155,15 +155,15 @@ function render() {
     // /「N 个账号」直接打开该密钥的设置弹框，与「设置」按钮殊途同归。
     // 「全部」也可点（用户拍板）：点击同样进设置弹框 —— 想从「全部」改成
     // 指定范围是同一类操作，没有理由只有非空范围才可点。
-    const scope = (list, noun, kid) => (Array.isArray(list) && list.length)
-      ? `<button class="pill amber scope-pill" data-bind="${esc(kid)}" title="点击编辑可用${noun}（与「设置」相同）">${list.length} 个${noun}</button>`
-      : `<button class="scope-pill scope-all" data-bind="${esc(kid)}" title="当前不限制，点击设置可用${noun}">全部</button>`;
+    const scope = (list, noun, kid, kind) => (Array.isArray(list) && list.length)
+      ? `<button class="pill amber scope-pill" data-scope="${esc(kind)}" data-scope-kid="${esc(kid)}" title="点击勾选可用${noun}">${list.length} 个${noun}</button>`
+      : `<button class="scope-pill scope-all" data-scope="${esc(kind)}" data-scope-kid="${esc(kid)}" title="当前不限制，点击勾选可用${noun}">全部</button>`;
     // 操作收敛（用户 2026-10-16）：停用/撤销/限额都进「设置」弹框 —— 撤销与
     // 停用语义上不同（撤销不可逆、停用可恢复），但都是低频操作，占表格按钮位
     // 冗余；表格只留「设置」「请求」两个高频入口。
     const actions = `<td class="align-right"><div class="actions">${revoked ? `<button data-requests="${k.id}">请求</button>`
       : `<button data-bind="${k.id}" title="可用模型、可用账号、分配策略、限额与有效期">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button>`}</div></td>`;
-    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code><small class="cell-note">最后使用：${k.last_used_at ? esc(stamp(k.last_used_at * 1000)) : "从未"}</small></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型", k.id)}</td><td>${scope(k.accounts, "账号", k.id)}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}${routing ? "" : `<span class="muted">（${esc(routingShort(overview.pool?.default_routing || "round_robin"))}）</span>`}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td>${actions}</tr>`;
+    return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code><small class="cell-note">最后使用：${k.last_used_at ? esc(stamp(k.last_used_at * 1000)) : "从未"}</small></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型", k.id, "models")}</td><td>${scope(k.accounts, "账号", k.id, "accounts")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}${routing ? "" : `<span class="muted">（${esc(routingShort(overview.pool?.default_routing || "round_robin"))}）</span>`}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td>${actions}</tr>`;
   }).join("");
   paintKeysSort();
   const shown = keys.length, total = (overview.keys || []).length;
@@ -1132,24 +1132,42 @@ $("keys-filter-mode").addEventListener("change", render);
 $("keys-body").addEventListener("click", e => {
   // 分配策略做成「图标 + 短名」的 chip，点击进设置弹框统一编辑（与「设置」按钮同一个弹框）。
   const chip = e.target.closest("[data-routing-edit]");
-  if (chip) { openKeyBind(overview.keys.find(x => x.id === chip.dataset.routingEdit)); return; }
+  if (chip) { openKeyBind(overview.keys.find(x => x.id === chip.dataset.routingEdit), "all"); return; }
+  // 「可用模型」/「可用账号」列：只开对应的勾选（用户 2026-10-17：别再甩整个
+  // 设置弹框——点模型就选模型，点账号就选账号，要改别的去点「设置」）。
+  const sc = e.target.closest("[data-scope]");
+  if (sc) { openKeyBind(overview.keys.find(x => x.id === sc.dataset.scopeKid), sc.dataset.scope); return; }
   const bind = e.target.closest("[data-bind]");
-  if (bind) { openKeyBind(overview.keys.find(x => x.id === bind.dataset.bind)); return; }
+  if (bind) { openKeyBind(overview.keys.find(x => x.id === bind.dataset.bind), "all"); return; }
   // 限额 / 停用 / 撤销的表格按钮已收敛进「设置」弹框（用户 2026-10-16），
   // 对应的 data-limit / data-toggle / data-revoke 入口随之删除。
 });
 $("add-key").addEventListener("click", () => { $("key-form").hidden = false; $("created-key").hidden = true; $("key-dialog").showModal(); });
-function openKeyBind(k) {
+function openKeyBind(k, mode = "all") {
   if (!k) return;
+  // mode: "all"=设置弹框（全部区块）/ "models"=只勾选模型 / "accounts"=只勾选账号。
+  const onlyModels = mode === "models", onlyAccounts = mode === "accounts";
   $("key-bind-name").textContent = `密钥「${k.name}」· ${k.hint}`;
   $("key-bind-error").textContent = "";
+  // 单区块模式下：标题、说明与无关区块一起换，避免「点模型却看见账号」。
+  $("key-bind-title").textContent = onlyModels ? "可用模型" : onlyAccounts ? "可用账号" : "配置密钥权限";
+  $("key-bind-sub").textContent = onlyModels
+    ? "不勾选 = 全部可用。按上游分页签，保存只改模型范围。"
+    : onlyAccounts ? "不勾选 = 全部可用。保存只改账号范围。" : "";
+  // 区块显隐：label 与内容成对收/放（models 行含页签）。
+  $("key-bind-models-block").hidden = onlyAccounts;
+  $("key-bind-accounts-block").hidden = onlyModels;
+  $("key-bind-routing-block").hidden = mode !== "all";
+  $("key-bind-limit-block").hidden = mode !== "all";
+  $("key-bind-expires-block").hidden = mode !== "all";
+  $("key-bind-toggle").hidden = mode !== "all";
+  $("key-bind-reset").hidden = mode !== "all";
+  $("key-bind-revoke").hidden = mode !== "all";
   // 限额与有效期（用户 2026-10-16：都收进设置弹框）。
   $("key-bind-limit").value = k.daily_limit ?? "";
   $("key-bind-expires").value = k.expires_at ? toLocalInput(k.expires_at) : "";
   const toggle = $("key-bind-toggle");
   toggle.textContent = k.enabled ? "停用密钥" : "恢复密钥";
-  toggle.hidden = false;
-  $("key-bind-revoke").hidden = false;
   const list = (host, items, selected, render) => {
     host.replaceChildren(...items.map(item => {
       const label = document.createElement("label");
@@ -1253,6 +1271,7 @@ function openKeyBind(k) {
   $("key-bind-reset").disabled = !!k.revoked_at;
   $("key-bind-reset").title = k.revoked_at ? "已撤销的密钥不能重置，请直接新建" : "";
   $("key-bind-dialog").dataset.kid = k.id;
+  $("key-bind-dialog").dataset.mode = mode;
   $("key-bind-dialog").showModal();
 }
 // 独立 icon 元素（列表项用）：与 backendIconSvg 同源，颜色来自注册表声明。
@@ -1268,13 +1287,19 @@ const checkedValues = host => [...host.querySelectorAll("input:checked")].map(b 
 $("key-bind-form").addEventListener("submit", async e => {
   e.preventDefault(); e.submitter.disabled = true; $("key-bind-error").textContent = "";
   const kid = $("key-bind-dialog").dataset.kid;
+  const mode = $("key-bind-dialog").dataset.mode || "all";
   try {
-    await api("keys/" + kid, {method:"PATCH", body:{
-      models: checkedValues($("key-bind-models")),
-      accounts: checkedValues($("key-bind-accounts")),
-      routing: $("key-bind-routing").value || null,
-      daily_limit: $("key-bind-limit").value === "" ? null : Number($("key-bind-limit").value),
-      expires_at: $("key-bind-expires").value ? fromLocalInput($("key-bind-expires").value) : null}});
+    // 单区块模式只提交可见的那一组：未显示的字段不带上，避免把没编辑的
+    // 范围清空（后端 PATCH 是「带了键就覆盖」语义）。
+    const body = mode === "models" ? {models: checkedValues($("key-bind-models"))}
+      : mode === "accounts" ? {accounts: checkedValues($("key-bind-accounts"))}
+      : {
+        models: checkedValues($("key-bind-models")),
+        accounts: checkedValues($("key-bind-accounts")),
+        routing: $("key-bind-routing").value || null,
+        daily_limit: $("key-bind-limit").value === "" ? null : Number($("key-bind-limit").value),
+        expires_at: $("key-bind-expires").value ? fromLocalInput($("key-bind-expires").value) : null};
+    await api("keys/" + kid, {method:"PATCH", body});
     $("key-bind-dialog").close(); await refresh(); toast("密钥权限已保存");
   } catch (err) { $("key-bind-error").textContent = err.message; }
   finally { e.submitter.disabled = false; }
