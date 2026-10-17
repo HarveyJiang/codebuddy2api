@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(join(here, "..", "..", "admin", "static", "app.js"), "utf8");
+const css = readFileSync(join(here, "..", "..", "admin", "static", "style.css"), "utf8");
 
 let bad = 0;
 function check(label, got, want) {
@@ -100,6 +101,54 @@ const detailDialog = /<dialog id="account-detail-dialog">[\s\S]*?<\/dialog>/.exe
 check("详情弹框存在且可抽取", detailDialog !== null, true);
 check("详情弹框里没有写操作入口（只有关闭）",
       detailDialog ? (detailDialog[0].match(/<button/g) || []).length : -1, 2);
+
+// ---- 6. 详情弹框重设计为卡片式（用户 2026-10-17：原生 dl 两列太素）----
+// 结构：头部身份区（图标+徽标）→ 三张指标卡 → 四张分组字段卡 → 错误条带。
+check("详情弹框有头部身份区", detailDialog ? /class="detail-hero"/.test(detailDialog[0]) : false, true);
+check("详情弹框有图标容器", detailDialog ? /id="account-detail-avatar"/.test(detailDialog[0]) : false, true);
+check("详情弹框有徽标容器", detailDialog ? /id="account-detail-badges"/.test(detailDialog[0]) : false, true);
+check("详情弹框有三张指标卡容器", detailDialog ? /id="account-detail-metrics"/.test(detailDialog[0]) : false, true);
+check("详情弹框有分组卡片容器", detailDialog ? /id="account-detail-body"/.test(detailDialog[0]) : false, true);
+check("详情弹框有错误条带容器", detailDialog ? /id="account-detail-error"/.test(detailDialog[0]) : false, true);
+// 旧的原生 dl 直接挂在弹框下已移除：字段现在都在 .detail-section 里。
+check("详情弹框不再直接挂裸 detail-grid", detailDialog ? /<\/div><dl class="detail-grid">/.test(detailDialog[0]) : true, false);
+check("JS 渲染了指标卡", /account-detail-metrics.*detail-metric-value/.test(src) || /detail-metric-value/.test(src), true);
+check("JS 渲染了分组卡", /const section = \(title, rows\)/.test(src), true);
+check("JS 头部徽标含状态 pill", /account-detail-badges/.test(src) && /poolLabel\[0\]/.test(src), true);
+check("CSS 有 detail-hero 样式", /\.detail-hero\{/.test(css), true);
+check("CSS 有 detail-metrics 样式", /\.detail-metrics\{/.test(css), true);
+check("CSS 有 detail-section 样式", /\.detail-section\{/.test(css), true);
+check("CSS 有 detail-error 样式", /\.detail-error\{/.test(css), true);
+check("CSS 指标卡窄屏单列", /\.detail-metrics\{grid-template-columns:1fr\}/.test(css), true);
+
+// ---- 7. 弹框公共外壳（用户 2026-10-17：关闭按钮随内容滚动跑掉）----
+// 所有弹框共用同一套结构：.dialog-heading（固定标题栏 + 关闭钮）
+//   → .dialog-body（唯一滚动区）→ .dialog-footer（固定底部操作栏）。
+// 旧的「整框 padding + 负边距 sticky」方案在移动端（padding 变 22px）会算错
+// 偏移，按钮跟着滚——所以 dialog 本体 padding 归零，内边距由三段各自承担。
+const dialogs = [...html.matchAll(/<dialog id="([a-z-]+)">/g)].map(m => m[1]);
+check("共 11 个弹框", dialogs.length, 11);
+for (const d of dialogs) {
+  const seg = new RegExp(`<dialog id="${d}">[\\s\\S]*?</dialog>`).exec(html)[0];
+  check(`${d} 有公共标题栏`, /class="dialog-heading"/.test(seg), true);
+  check(`${d} 标题栏有关闭按钮`, /close-dialog" aria-label="关闭"/.test(seg), true);
+  check(`${d} 有滚动主体`, /class="dialog-body"/.test(seg), true);
+  check(`${d} 有固定底部栏`, /class="dialog-footer/.test(seg), true);
+  check(`${d} 不再用旧 dialog-actions`, /class="dialog-actions/.test(seg), false);
+  check(`${d} form 标签配对`, seg.split("<form").length - 1, seg.split("</form>").length - 1);
+}
+// CSS：dialog 本体零内边距 + flex column，三段各自 padding。
+check("CSS dialog 本体零内边距", /dialog\{[^}]*padding:0/.test(css), true);
+check("CSS dialog 是 flex column", /dialog\{[^}]*flex-direction:column/.test(css), true);
+check("CSS 标题栏固定不滚（flex:0 0 auto）", /dialog \.dialog-heading\{[^}]*flex:0 0 auto/.test(css), true);
+check("CSS 标题栏不再用 sticky", /dialog \.dialog-heading\{[^}]*position:sticky/.test(css), false);
+check("CSS 底部栏固定（flex:0 0 auto）", /dialog>\.dialog-footer\{[^}]*flex:0 0 auto/.test(css), true);
+check("CSS 主体是唯一滚动区", /dialog>:not\(\.dialog-heading\):not\(\.dialog-footer\)\{[^}]*overflow-y:auto/.test(css), true);
+check("CSS 旧 max-height:92vh 已移除", /max-height:92vh/.test(css), false);
+check("CSS 旧负边距技巧已移除", /[^{}\n]*margin:-29px/.test(css.replace(/\/\*[\s\S]*?\*\//g, "")), false);
+// key-dialog 是双面板（表单 / 明文展示），footer 也要跟着切，否则两组按钮同屏。
+check("key-dialog 有独立 footer", /id="created-key-footer"/.test(html), true);
+check("JS 切面板时同步 footer", /\$\("created-key-footer"\)\.hidden = false/.test(src) && /\$\("created-key-footer"\)\.hidden = true/.test(src), true);
 
 console.log(bad ? `\n${bad} 项不符` : "\n=== 概览内联账号表（需求 6）全部通过 ===");
 process.exit(bad ? 1 : 0);

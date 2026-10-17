@@ -607,34 +607,60 @@ $("account-page-size").addEventListener("change", e => { accountPageSize = Numbe
 // 账号详情弹框（需求 6）：点账号行打开。**只读** —— 行内的操作按钮仍承担写操作，
 // 这里不重复一份，避免两条写路径各自漂移。
 async function openAccountDetail(a) {
-  if (!a) return;  const yes = v => v === true ? "是" : v === false ? "否" : "—";
+  if (!a) return;
+  const yes = v => v === true ? "是" : v === false ? "否" : "—";
   const stampOr = v => v ? stamp(v * 1000) : "—";
-  const rows = [
-    ["账号类型", `${backendIcon(a.backend)} ${backendName(a.backend)}`],
-    ["UID", a.uid || "—"],
-    ["昵称", a.nickname || "—"],
-    ["状态", labels[a.pool_state]?.[0] || a.pool_state || "—"],
-    ["剩余积分", a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)],
-    ["积分更新时间", stampOr(a.credits_updated)],
-    ["7 天内到期", a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon)],
-    ["最早一批过期", stampOr(a.earliest_expiry)],
-    ["最早一批过期积分", a.earliest_expiry_remaining === null || a.earliest_expiry_remaining === undefined ? "—" : creditsFmt(a.earliest_expiry_remaining)],
-    ["今日已签到", yes(a.today_checked_in)],
-    ["签到时段", a.checkin_slot ? `${a.checkin_slot} ${a.checkin_when || ""}` : "—"],
-    ["冷却至", a.cooldown_until > Date.now()/1000 ? stamp(a.cooldown_until*1000) : "—"],
-    ["排队让位至", a.queued_until > Date.now()/1000 ? stamp(a.queued_until*1000) : "—"],
-    ["凭据有效期", stamp(a.expires_at) + (a.expired ? "（已到期）" : "")],
-    ["调度权重", String(a.weight || 0)],
-    ["是否启用", yes(a.enabled)],
-    ["最近错误", a.last_error || "—"],
-  ];
+  const numOr = v => v === null || v === undefined ? "—" : creditsFmt(v);
+  const poolLabel = {available:["可用","green"],cooling:["冷却中","amber"],paused:["已暂停",""],exhausted:["积分耗尽","amber"],invalid:["凭据异常","red"]}[a.pool_state] || ["待查询",""];
   $("account-detail-title").textContent = a.name || "账号详情";
   $("account-detail-sub").textContent = `${backendName(a.backend)} 账号 · ${a.id}`;
-  // 每对 dt+dd 直接铺进 grid（auto 1fr）→ dt 属性在左列、dd 值在右列。
-  // 不能再包 <div>：包一层就变成「一个键值对占一格」，dt/dd 在格内上下堆叠
-  // （用户 2026-10-16 报告「表格上下显示数据」的真因）。
-  $("account-detail-body").innerHTML = rows.map(([k, v]) =>
-    `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+  // 头部：后端图标 + 状态/启用徽标（一眼看到「这个账号现在什么状态」）。
+  $("account-detail-avatar").innerHTML =
+    `<span class="account-icon-backend" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${backendIconSvg(a.backend)}</span>`;
+  $("account-detail-badges").innerHTML =
+    `<span class="pill ${poolLabel[1]}">${esc(poolLabel[0])}</span>`
+    + `<span class="pill ${a.enabled ? "green" : ""}">${a.enabled ? "已启用" : "已暂停"}</span>`
+    + (a.expired ? `<span class="pill red">凭据已到期</span>` : "");
+  // 三张关键指标：剩余积分 / 今日签到 / 7 天内到期。
+  const checkinValue = a.today_checked_in ? "已签到" : "未签到";
+  $("account-detail-metrics").innerHTML = [
+    [a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining), "剩余积分", a.remaining === null || a.remaining === undefined ? "以最近一次查询为准" : `更新于 ${stampOr(a.credits_updated)}`, ""],
+    [checkinValue, "今日签到", a.checkin_slot ? `${a.checkin_slot} ${a.checkin_when || ""}` : "自动签到按设置时段执行", a.today_checked_in ? "ok" : "warn"],
+    [numOr(a.expiring_soon), "7 天内到期", a.earliest_expiry ? `最早一批 ${stampOr(a.earliest_expiry)}` : "近期没有将过期的积分", a.expiring_soon ? "warn" : ""],
+  ].map(([v, label, note, tone]) =>
+    `<article><span class="detail-metric-label">${esc(label)}</span><strong class="detail-metric-value${tone ? " " + tone : ""}">${esc(v)}</strong><small>${esc(note)}</small></article>`).join("");
+  // 分组字段卡：基本信息 / 积分与过期 / 签到 / 调度。两列 grid，窄屏自动单列。
+  const section = (title, rows) =>
+    `<article class="detail-section"><h3>${esc(title)}</h3><dl class="detail-grid">`
+    + rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("") + `</dl></article>`;
+  $("account-detail-body").innerHTML = [
+    section("基本信息", [
+      ["账号类型", `${backendIcon(a.backend)} ${backendName(a.backend)}`],
+      ["UID", a.uid || "—"],
+      ["昵称", a.nickname || "—"],
+      ["凭据有效期", stamp(a.expires_at) + (a.expired ? "（已到期）" : "")],
+    ]),
+    section("积分与过期", [
+      ["积分更新时间", stampOr(a.credits_updated)],
+      ["最早一批过期", stampOr(a.earliest_expiry)],
+      ["最早一批过期积分", numOr(a.earliest_expiry_remaining)],
+    ]),
+    section("签到", [
+      ["今日已签到", yes(a.today_checked_in)],
+      ["签到时段", a.checkin_slot ? `${a.checkin_slot} ${a.checkin_when || ""}` : "—"],
+    ]),
+    section("调度", [
+      ["状态", poolLabel[0]],
+      ["调度权重", String(a.weight || 0)],
+      ["冷却至", a.cooldown_until > Date.now()/1000 ? stamp(a.cooldown_until*1000) : "—"],
+      ["排队让位至", a.queued_until > Date.now()/1000 ? stamp(a.queued_until*1000) : "—"],
+      ["是否启用", yes(a.enabled)],
+    ]),
+  ].join("");
+  // 最近错误只在真有时才出现，没错误时不留一块空白（用户 2026-10-16：弹框别堆空字段）。
+  const err = a.last_error;
+  if (err) { $("account-detail-error").hidden = false; $("account-detail-error").innerHTML = `<strong>最近错误</strong><p>${esc(err)}</p>`; }
+  else $("account-detail-error").hidden = true;
   // 「最近请求」从详情弹框撤掉（用户 2026-10-17：详情页信息太多，且请求记录
   // 已有专门的「请求日志」页与各弹框可看，这里不再重复）。原来拉日志的
   // /admin/api/logs 请求、account-detail-logs 表格与显示开关一并移除。
@@ -1183,7 +1209,10 @@ $("keys-body").addEventListener("click", e => {
   // 限额 / 停用 / 撤销的表格按钮已收敛进「设置」弹框（用户 2026-10-16），
   // 对应的 data-limit / data-toggle / data-revoke 入口随之删除。
 });
-$("add-key").addEventListener("click", () => { $("key-form").hidden = false; $("created-key").hidden = true; $("key-dialog").showModal(); });
+// 打开「创建密钥」时回到表单面板：两个 body 都要复位，footer 也要切回
+// 表单的那一个（created-key-footer 保持 hidden，否则会看到两组按钮）。
+$("add-key").addEventListener("click", () => { $("key-form").hidden = false; $("created-key").hidden = true; $("created-key-footer").hidden = true; $("key-dialog").showModal(); });
+
 function openKeyBind(k, mode = "all") {
   if (!k) return;
   // mode: "all"=设置弹框（全部区块）/ "models"=只勾选模型 / "accounts"=只勾选账号。
@@ -1385,6 +1414,9 @@ $("key-bind-reset").addEventListener("click", e => {
     });
 });
 // 新密钥明文展示（新建与重置共用）：明文只出现这一次，关闭即不可见。
+// 注意 key-dialog 的公共结构：表单面板与 created-key 面板各自带 body，
+// 但 footer 只有一个（created-key-footer）——切面板时同步切 footer，
+// 否则会同时看到「创建密钥」和「复制密钥」两组按钮。
 function showNewKey(value, eyebrow, title) {
   const dlg = $("key-dialog");
   $("created-key").querySelector(".eyebrow").textContent = eyebrow;
@@ -1392,6 +1424,7 @@ function showNewKey(value, eyebrow, title) {
   $("new-key-value").textContent = value;
   $("key-form").hidden = true;
   $("created-key").hidden = false;
+  $("created-key-footer").hidden = false;
   dlg.showModal();
 }
 $("key-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { const d = await api("keys", {method:"POST",body:{name:$("key-name").value}}); showNewKey(d.key, "KEY CREATED", "保存你的新密钥"); await refresh(); } catch (err) { $("key-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
