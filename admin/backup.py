@@ -283,9 +283,13 @@ def next_check_delay(settings, now=None, tick=TICK_SECONDS):
 
 
 def human_size(size):
+    # size 在循环里已被缩放到当前单位，format 时**不能再除 1024**——
+    # 曾经的 bug：判的是缩放后的值、format 又除一次，所有非 B 档都变成
+    # 「0.0 KB / 0.0 MB」（用户 2026-10-17 发现的「备份怎么都是 0M」）。
+    size = int(size or 0)
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size / 1024:.1f} {unit}"
+            return f"{size} B" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
 
 

@@ -40,6 +40,19 @@ class BackupModuleTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_human_size_scales_by_unit(self):
+        # 回归：曾经的 bug 是「判的是缩放后的值、format 又除一次 1024」，
+        # 所有非 B 档都显示成 0.0 KB / 0.0 MB（用户 2026-10-17 报「备份
+        # 怎么都是 0M」）。这里钉住每一档的首值与中间值。
+        self.assertEqual(backup.human_size(0), "0 B")
+        self.assertEqual(backup.human_size(512), "512 B")
+        self.assertEqual(backup.human_size(1024), "1.0 KB")
+        self.assertEqual(backup.human_size(1536), "1.5 KB")
+        self.assertEqual(backup.human_size(1048576), "1.0 MB")
+        self.assertEqual(backup.human_size(5242880), "5.0 MB")
+        self.assertEqual(backup.human_size(1073741824), "1.0 GB")
+        self.assertEqual(backup.human_size(16106127360), "15.0 GB")
+
     def test_create_and_verify(self):
         name = backup.create(self.root, self.db, keep=5, minimal_size=100)
         self.assertTrue(backup.NAME_RE.fullmatch(name))

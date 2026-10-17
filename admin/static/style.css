@@ -198,9 +198,12 @@ tr:hover .model-name-cell .model-del{opacity:1}
    宽度固定，两个图标列的数值因此左对齐成一竖列。 */
 .model-id-line svg{width:1em;height:1em}
 
-.pager{display:flex;align-items:center;gap:14px;padding:16px 0 0;border-top:1px solid #edf0eb;margin-top:16px;font-size:11px}
-.pager .secondary{padding:7px 14px;font-size:11px}
-.pager span{flex:1;text-align:center}
+/* 分页控件（用户 2026-10-17：原来的「上一页/下一页 + 孤立下拉」太丑，
+   美化成账号详情页的卡片语言）。整条做成一张浅色卡片：白底细边、
+   两端胶囊按钮、中间页码信息，每页条数收进右侧胶囊下拉。 */
+.pager{display:flex;align-items:center;gap:10px;padding:11px 13px;border:1px solid var(--line);border-radius:var(--radius);margin-top:16px;font-size:11px;background:#fff}
+.pager .secondary{padding:6px 13px;font-size:11px;gap:5px;border-radius:999px}
+.pager span{flex:1;text-align:center;color:var(--muted);font-size:11px}
 .pager-size{display:flex;align-items:center;gap:7px;margin:0;font-weight:600;color:var(--muted)}
 .pager-size select{width:auto;padding:6px 30px 6px 12px;font-size:11px;border-radius:999px;background-position:right 11px center}
 .check-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px;max-height:210px;overflow-y:auto;padding:12px;border:1px solid var(--line);border-radius:9px;background:#fafcfa}
@@ -211,6 +214,12 @@ tr:hover .model-name-cell .model-del{opacity:1}
 
 .usage-filter{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0 16px;align-items:end;padding:16px 20px;margin-bottom:20px;background:var(--white);border:1px solid var(--line);border-radius:var(--radius)}
 .usage-filter label{margin-top:0}
+/* API 密钥的筛选栏只有「标签 + 下拉 + 提示」三项，套 usage-filter 的
+   grid auto-fit 会把每列拉到 1fr，标签与下拉被撕开老远（用户 2026-10-17
+   反馈「筛选文本离得太开」）。这里改 flex 紧凑排，间距交给 gap。 */
+#keys-filter{display:flex;align-items:center;gap:12px;padding:12px 16px}
+#keys-filter label{margin:0;white-space:nowrap}
+#keys-filter .muted{margin:0}
 .usage-summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;padding:18px 20px;margin-bottom:20px;background:var(--white);border:1px solid var(--line);border-radius:var(--radius)}
 .usage-summary strong{font-size:22px;margin:6px 0}
 .usage-groups-wrap{margin-bottom:20px}
@@ -231,19 +240,38 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .settings-caption{font-size:11px;letter-spacing:1.5px;color:#6d8478;margin:0 0 10px}
 /* 卡片标题旁的小问号（用户 2026-10-16 拍板）：说明文字收进悬停提示，
    卡片不再渲染整段 <p>，空间立刻省出来。h3 改 inline-flex，问号**贴着
-   标题文字**排（不占独立行，用户反馈）；原生 title 即可，无需 JS。 */
+   标题文字**排（不占独立行，用户反馈）。
+   2026-10-17：原生 title 弹窗又小又跟系统主题走，用户反馈「太原始生硬，
+   毫无美感」→ 改自建 CSS 气泡（data-tip + ::after/::before，禁原生 title）。
+   气泡白底细边圆角投影，向上弹出；问号本身 hover 加深底色做 affordance。 */
 .settings-card h3{display:inline-flex;align-items:center;gap:6px;margin-right:6px}
 .q-help{width:16px;height:16px;border-radius:50%;background:#e7efe4;color:#5b7f68;
   font-size:10px;font-weight:700;line-height:1;display:inline-flex;align-items:center;
   justify-content:center;cursor:help;flex-shrink:0;padding:0;vertical-align:middle;
-  transform:translateY(-1px)}
+  position:relative;transform:translateY(-1px)}
 .q-help:hover{background:#d5e4d0}
+/* 自建气泡：向上弹出、白底细边圆角投影、max-width 防长文拉爆屏。
+   content 取 data-tip；visibility 过渡避免鼠标划过时闪烁。 */
+.q-help[data-tip]:hover::after,.q-help[data-tip]:focus-visible::after{
+  content:attr(data-tip);position:absolute;bottom:calc(100% + 9px);left:50%;
+  transform:translateX(-50%);width:max-content;max-width:280px;padding:10px 13px;
+  background:#fff;border:1px solid #d5ddd5;border-radius:10px;box-shadow:0 12px 32px #0e302126;
+  font:11px/1.75 "Segoe UI","Microsoft YaHei",sans-serif;font-weight:400;color:#3c4c42;
+  white-space:normal;text-align:left;z-index:30;cursor:help;visibility:visible}
+/* 小三角箭头：与气泡同色，尖角朝下贴在气泡底边。 */
+.q-help[data-tip]:hover::before,.q-help[data-tip]:focus-visible::before{
+  content:"";position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);
+  border:5px solid transparent;border-top-color:#fff;z-index:31;filter:drop-shadow(0 1px 0 #d5ddd5)}
 /* 设置页分组：**上下整行排满**（用户 2026-10-16 拍板：不要左右分栏，卡片
-   内字段一行排满）—— 两栏布局在卡片文字长短不一时留下大片空白。 */
+   内字段一行排满）—— 两栏布局在卡片文字长短不一时留下大片空白。
+   2026-10-17：用户反馈「整个设置页没有美感，只是功能按钮堆砌」→ 标题改
+   账号详情页同款绿竖条 + 13px/650 规格（.detail-section h3 的视觉语言），
+   卡片标题行与控件之间拉开呼吸感。 */
 .settings-groups{display:grid;grid-template-columns:1fr;gap:14px;align-items:start}
 .pool-settings .settings-groups{margin-bottom:20px}
 .settings-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px 24px;margin:0}
-.settings-card h3{font-size:16px;color:#416c54;margin:0 0 9px}
+.settings-card h3{font-size:13px;font-weight:650;color:#2c4a3d;margin:0 0 14px;display:flex;align-items:center;gap:8px;letter-spacing:.2px}
+.settings-card h3:before{content:"";width:4px;height:13px;background:var(--green);border-radius:2px;flex-shrink:0}
 .settings-card>p{font-size:11px;color:#809789;line-height:1.9;margin:0 0 16px}
 .settings-card .pool-controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0 18px}
 .settings-card .pool-controls label{min-width:0;width:auto;margin:0 0 13px}
