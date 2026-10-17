@@ -586,7 +586,7 @@ function renderAccounts() {
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
-    const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 签到 / 暂停 / 删除">⚙ 设置</button></td>`;
+    const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 签到 / 请求日志 / 暂停 / 删除">⚙ 设置</button></td>`;
     return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
@@ -1095,6 +1095,37 @@ $("as-refresh").addEventListener("click", async e => {
   try { const r = await api(`accounts/${a.id}/actions/refresh`, {method:"POST"}); toast(r.message); await refresh(); }
   catch (err) { toast(err.message); } finally { e.target.disabled = false; }
 });
+// 「请求日志」快捷方式（用户 2026-10-17）：与侧边栏「请求日志」页同一套呈现，
+// 只是按当前账号预筛，取最近 50 条（账号详情原来的小表格撤掉后的替代入口）。
+$("as-logs").addEventListener("click", () => {
+  const a = settingsAccount(); if (!a) return;
+  openAccountLogs(a);
+});
+// 账号请求日志弹框：复用请求日志页的列与样式（account-cell-log / cell-note.inline），
+// 但没有「密钥」列以外的差异——这里不显示账号列（整个弹框就按这个账号筛的）。
+let accountLogsId = null;
+async function openAccountLogs(a) {
+  if (!a) return;
+  accountLogsId = a.id;
+  $("account-logs-title").textContent = a.name || "账号请求日志";
+  $("account-logs-sub").textContent = `${backendName(a.backend)} 账号 · 最近 50 条请求`;
+  $("account-logs-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
+  $("account-logs-dialog").showModal();
+  try {
+    const data = await api(`logs?account_id=${encodeURIComponent(a.id)}&limit=50`);
+    if (accountLogsId !== a.id) return;  // 已切到别的账号
+    $("account-logs-body").innerHTML = data.rows.map(r =>
+      `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
+      + `<td>${esc(keyLabel(r))}</td>`
+      + `<td class="mono">${esc(r.model_id || "—")}</td>`
+      + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td>`
+      + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
+      || '<tr><td colspan="5" class="history-empty">这个账号还没有请求记录。</td></tr>';
+  } catch (err) {
+    if (accountLogsId !== a.id) return;
+    $("account-logs-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(err.message)}</td></tr>`;
+  }
+}
 $("as-toggle").addEventListener("click", e => {
   e.preventDefault();
   const a = settingsAccount(); if (!a) return;
