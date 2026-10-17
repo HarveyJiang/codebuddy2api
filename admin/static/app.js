@@ -1721,8 +1721,9 @@ $("keys-body").addEventListener("click", async e => {
       `<tr><td class="mono muted">${esc(d.day)}</td><td class="align-right mono"><button class="linklike" data-usage-day="${esc(d.day)}" data-usage-kid="${esc(kid)}" title="查看这一天的请求明细">${d.count}</button></td>`
       + `<td class="align-right mono">${fmtTokens(d.tokens)}</td></tr>`).join("")
       || '<tr><td colspan="3" class="history-empty">近 30 天还没有记录。</td></tr>';
-    $("usage-history-total").textContent = series.length
+    $("usage-history-total").innerHTML = series.length
       ? `区间合计：${sum.count.toLocaleString("zh-CN")} 次 · ${fmtTokens(sum.tokens)} tokens（共 ${series.length} 天有记录）`
+      + ` · <button class="linklike" data-usage-all="${esc(kid)}" title="查看该密钥最近的请求记录（不限日期）">查看全部请求</button>`
       : "";
   } catch (err) { $("usage-history-body").innerHTML = `<tr><td colspan="3" class="history-empty">${esc(err.message)}</td></tr>`; }
 });
@@ -1740,6 +1741,19 @@ $("usage-history-body").addEventListener("click", async e => {
   $("key-requests-name").textContent = `密钥「${k ? k.name : kid}」 ${day} 的请求明细`;
   $("key-requests-dialog").showModal();
   keyReqDay = [from, to];
+  await loadKeyRequests(0);
+});
+
+/* 「查看全部请求」：该密钥不限日期的最近请求（分页）。 */
+$("usage-history-total").addEventListener("click", async e => {
+  const btn = e.target.closest("[data-usage-all]");
+  if (!btn) return;
+  const kid = btn.dataset.usageAll;
+  const k = overview.keys.find(x => x.id === kid);
+  keyReqId = kid;
+  keyReqDay = null;
+  $("key-requests-name").textContent = `密钥「${k ? k.name : kid}」的最近请求`;
+  $("key-requests-dialog").showModal();
   await loadKeyRequests(0);
 });
 
