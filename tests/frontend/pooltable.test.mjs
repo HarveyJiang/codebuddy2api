@@ -95,6 +95,16 @@ check("设置按钮 → 开设置弹框", dispatchAction("settings"), "settings"
 check("账号池行模板渲染日志按钮且带 data-action=logs",
       src.includes('data-action="logs"') && src.includes('=== "logs") { openAccountLogs(a)'), true);
 check("设置弹框里 as-logs 已撤掉（入口挪到操作列）", /id="as-logs"/.test(html), false);
+// 账号日志弹框带分页（用户 2026-10-17：最近 7 天 + 每页 100 条 + 翻页）
+check("账号日志弹框有分页控件", /id="account-logs-prev"/.test(html) && /id="account-logs-next"/.test(html), true);
+check("账号日志默认最近 7 天 + 每页 100 条", /since=\$\{since\}/.test(src) && /ACCOUNT_LOGS_SIZE = 100/.test(src), true);
+check("账号日志分页有迟到的响应守卫", /requestedOffset !== accountLogsOffset/.test(src), true);
+// 详情弹框不再露上游昵称（用户需求：全站统一显示备注名，昵称只读不可改）
+check("详情弹框已无「上游昵称」行", /\["上游昵称"/.test(src), false);
+// 弹框底部间距（用户 2026-10-17：内容不再贴底）
+check("弹框主体有上下内边距（不再贴底）", /dialog>form>:not\(\.dialog-heading\):not\(\.dialog-footer\)\{[^}]*padding:22px 29px/.test(css), true);
+check("带 footer 的弹框主体底部收到 4px", /dialog>form>\.dialog-body\{padding-bottom:4px\}/.test(css), true);
+check("只读弹框主体底部留 22px", /dialog>\.dialog-body\{padding-bottom:22px\}/.test(css), true);
 // 设置弹框里重复入口已撤掉：签到/暂停只该出现在账号池行内。
 check("设置弹框已无 as-checkin", /id="as-checkin"/.test(html), false);
 check("设置弹框已无 as-toggle", /id="as-toggle"/.test(html), false);

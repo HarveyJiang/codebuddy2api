@@ -654,8 +654,6 @@ async function openAccountDetail(a) {
       // UID 是上游 uuid（36 位），对人类不可读：只显前 8 位，完整值悬停可见
       // （用户 2026-10-17：「uuid 不用显示，没有人类不可读」）。
       ["UID", a.uid ? `<span class="short-id" title="${esc(a.uid)}">${esc(a.uid.slice(0, 8))}</span>` : "—"],
-      // 上游昵称只读（资料字段，本地改不了），标注出来避免去设置弹框里找它。
-      ["上游昵称", (a.nickname || "—") + `<small class="cell-note">来自上游资料，只读；要改显示名请改备注</small>`],
       ["凭据有效期", stamp(a.expires_at) + (a.expired ? "（已到期）" : "")],
     ]),
     section("积分与过期", [
@@ -1163,29 +1161,48 @@ $("as-refresh").addEventListener("click", async e => {
 });
 // 账号请求日志弹框：复用请求日志页的列与样式（account-cell-log / cell-note.inline），
 // 但没有「密钥」列以外的差异——这里不显示账号列（整个弹框就按这个账号筛的）。
-let accountLogsId = null;
+// 用户 2026-10-17：操作列「日志」按钮的落点。每页 100 条 + 默认只看最近 7 天
+// （更早的记录去「请求日志」页翻），带分页控件。
+let accountLogsId = null, accountLogsOffset = 0;
+const ACCOUNT_LOGS_SIZE = 100;
 async function openAccountLogs(a) {
   if (!a) return;
   accountLogsId = a.id;
-  $("account-logs-title").textContent = accountLabel(a);
-  $("account-logs-sub").textContent = `${backendName(a.backend)} 账号 · 最近 50 条请求`;
-  $("account-logs-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
+  accountLogsOffset = 0;
+  await loadAccountLogs();
   $("account-logs-dialog").showModal();
+}
+async function loadAccountLogs() {
+  if (!accountLogsId) return;
+  const a = overview.accounts.find(x => x.id === accountLogsId);
+  if (!a) return;
+  $("account-logs-title").textContent = accountLabel(a);
+  $("account-logs-sub").textContent = `${backendName(a.backend)} 账号 · 最近 7 天，每页 ${ACCOUNT_LOGS_SIZE} 条`;
+  $("account-logs-body").innerHTML = '<tr><td colspan="5" class="history-empty">加载中…</td></tr>';
+  const requestedId = accountLogsId, requestedOffset = accountLogsOffset;
+  const since = Math.floor((Date.now() - 7 * 86400000) / 1000);
   try {
-    const data = await api(`logs?account_id=${encodeURIComponent(a.id)}&limit=50`);
-    if (accountLogsId !== a.id) return;  // 已切到别的账号
+    const data = await api(`logs?account_id=${encodeURIComponent(accountLogsId)}&limit=${ACCOUNT_LOGS_SIZE}&offset=${accountLogsOffset}&since=${since}`);
+    if (requestedId !== accountLogsId || requestedOffset !== accountLogsOffset) return;  // 已切账号/翻页
     $("account-logs-body").innerHTML = data.rows.map(r =>
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td>${esc(keyLabel(r))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}</td>`
       + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
-      || '<tr><td colspan="5" class="history-empty">这个账号还没有请求记录。</td></tr>';
+      || '<tr><td colspan="5" class="history-empty">这个账号最近 7 天没有请求记录。</td></tr>';
+    const pages = Math.max(1, Math.ceil(data.total / ACCOUNT_LOGS_SIZE));
+    const current = Math.floor(data.offset / ACCOUNT_LOGS_SIZE) + 1;
+    $("account-logs-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
+    $("account-logs-prev").disabled = data.offset <= 0;
+    $("account-logs-next").disabled = data.offset + ACCOUNT_LOGS_SIZE >= data.total;
   } catch (err) {
-    if (accountLogsId !== a.id) return;
+    if (requestedId !== accountLogsId) return;
     $("account-logs-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }
+$("account-logs-prev").addEventListener("click", () => { accountLogsOffset = Math.max(0, accountLogsOffset - ACCOUNT_LOGS_SIZE); loadAccountLogs(); });
+$("account-logs-next").addEventListener("click", () => { accountLogsOffset += ACCOUNT_LOGS_SIZE; loadAccountLogs(); });
 // 行内「停用/恢复」与「签到」已上线（用户 2026-10-17），设置弹框里那两个
 // 重复入口（as-checkin / as-toggle）随之撤掉，这里只留删除。
 $("as-delete").addEventListener("click", e => {
