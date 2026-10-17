@@ -583,11 +583,19 @@ function renderAccounts() {
     // 行首小 icon + 账号名，就这两样（用户 2026-10-16：icon/后端徽标/昵称
     // 全是冗余 —— 归属一列已有「账号类型」语义，后端名在详情弹框里看）。
     const kindIcon = `<span class="account-icon-backend account-icon-inline" style="color:${esc(backendMeta(a.backend)?.color || "#888")}" title="${esc(backendName(a.backend))} 账号">${backendIconSvg(a.backend)}</span>`;
+    // 状态列即开关（用户 2026-10-17）：和模型页同款，点 pill 直接停用/恢复，
+    // 不必再进设置弹框。文字仍是当前状态，颜色照旧按状态走；停用时置灰。
+    const stateToggle = `<button class="pill account-state-toggle${a.enabled ? " " + status[1] : ""}" data-action="toggle" data-id="${esc(a.id)}" data-enabled="${a.enabled ? "1" : "0"}" title="点击${a.enabled ? "暂停" : "恢复"}「${esc(a.name)}」">${a.enabled ? status[0] : "已暂停"}</button>`;
+    // 行内签到（用户 2026-10-17）：今天没签到才给按钮；已签到只留一行文字。
+    // 暂停的账号也能签到 —— pool.operate 对 checkin/status 不拦停用。
+    const checkinCell = a.today_checked_in
+      ? `<small class="cell-note">今日已签到${a.checkin_when ? `（${esc(a.checkin_slot || "")} ${esc(a.checkin_when)}）` : ""}</small>`
+      : `<button class="linklike" data-action="checkin" data-id="${esc(a.id)}" title="立即签到（每日一次，已签到会提示无需重复）">签到</button>`;
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
-    const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 签到 / 请求日志 / 暂停 / 删除">⚙ 设置</button></td>`;
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : a.checkin_when ? `今日 ${esc(a.checkin_slot || "")} ${esc(a.checkin_when)} 签到` : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
+    const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 请求日志 / 删除">⚙ 设置</button></td>`;
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -1052,6 +1060,21 @@ $("accounts-body").addEventListener("click", async e => {
   }
   const a = overview.accounts.find(x => x.id === b.dataset.id); if (!a) return;
   if (b.dataset.action === "settings") { openAccountSettings(a); return; }
+  if (b.dataset.action === "checkin") {
+    // 行内签到（用户 2026-10-17）：不在账号池行与设置弹框之间来回跳。
+    b.disabled = true;
+    try { const r = await api(`accounts/${a.id}/actions/checkin`, {method:"POST"}); toast(r.message); await refresh(); }
+    catch (err) { toast(err.message); } finally { b.disabled = false; }
+    return;
+  }
+  if (b.dataset.action === "toggle") {
+    // 行内停用/恢复（用户 2026-10-17）：仿模型页状态列，点一下即切。
+    // 停用会让账号退出轮转与自动签到，先确认一次，避免误点把账号踢下线。
+    const enabling = b.dataset.enabled !== "1";
+    confirmAction(enabling ? "恢复这个账号？" : "暂停这个账号？",
+      "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。",
+      async () => { await api("accounts/" + a.id, {method:"PATCH", body:{enabled:enabling}}); });
+  }
 });
 // -- 账号设置弹框 ----------------------------------------------------------
 // 操作列收成一个「设置」按钮（用户 2026-10-16）：备注/权重在这里改，
@@ -1066,9 +1089,6 @@ function openAccountSettings(a) {
   $("as-name").value = a.name || "";
   $("as-weight").value = a.weight || 0;
   $("account-settings-error").textContent = "";
-  const toggle = $("as-toggle");
-  toggle.textContent = a.enabled ? "暂停账号" : "恢复账号";
-  toggle.classList.toggle("danger", !!a.enabled);
   $("account-settings-dialog").showModal();
 }
 
@@ -1079,13 +1099,6 @@ $("as-status").addEventListener("click", async e => {
   const a = settingsAccount(); if (!a) return;
   e.target.disabled = true;
   try { const r = await api(`accounts/${a.id}/actions/status`, {method:"POST"}); toast(r.message); await refresh(); }
-  catch (err) { toast(err.message); } finally { e.target.disabled = false; }
-});
-$("as-checkin").addEventListener("click", async e => {
-  e.preventDefault();
-  const a = settingsAccount(); if (!a) return;
-  e.target.disabled = true;
-  try { const r = await api(`accounts/${a.id}/actions/checkin`, {method:"POST"}); toast(r.message); await refresh(); }
   catch (err) { toast(err.message); } finally { e.target.disabled = false; }
 });
 $("as-refresh").addEventListener("click", async e => {
@@ -1126,13 +1139,8 @@ async function openAccountLogs(a) {
     $("account-logs-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }
-$("as-toggle").addEventListener("click", e => {
-  e.preventDefault();
-  const a = settingsAccount(); if (!a) return;
-  confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？",
-    "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。",
-    async () => { await api("accounts/" + a.id, {method:"PATCH", body:{enabled:!a.enabled}}); $("account-settings-dialog").close(); });
-});
+// 行内「停用/恢复」与「签到」已上线（用户 2026-10-17），设置弹框里那两个
+// 重复入口（as-checkin / as-toggle）随之撤掉，这里只留删除。
 $("as-delete").addEventListener("click", e => {
   e.preventDefault();
   const a = settingsAccount(); if (!a) return;

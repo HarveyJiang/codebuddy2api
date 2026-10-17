@@ -123,6 +123,13 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .model-state-toggle:hover:not(:disabled){filter:brightness(.95);background:#e4ebe4}
 .model-state-toggle.green:hover:not(:disabled){background:#e2f0e6}
 .model-state-toggle.amber:hover:not(:disabled){background:#f4ebd9}
+/* 账号池行内停用/恢复（用户 2026-10-17）：与模型页状态列同一套 —— pill 样
+   式复用，但它是 <button>，补指针/悬停；停用时无彩色，靠 hover 给反馈。 */
+.account-state-toggle{margin:0;border:0;cursor:pointer;max-width:100%;white-space:nowrap}
+.account-state-toggle:hover:not(:disabled){filter:brightness(.95);background:#e4ebe4}
+.account-state-toggle.green:hover:not(:disabled){background:#e2f0e6}
+.account-state-toggle.amber:hover:not(:disabled){background:#f4ebd9}
+.account-state-toggle.red:hover:not(:disabled){background:#f9e4e0}
 /* 倍率/上下文列前的图标：与模型名前的 .model-id-line 同款（贴住基线、不与数值抢位）。
    宽度固定，两个图标列的数值因此左对齐成一竖列。 */
 .model-id-line svg{width:1em;height:1em}

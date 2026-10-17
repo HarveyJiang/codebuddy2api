@@ -66,7 +66,36 @@ check("概览成为默认选中页", /data-page="dashboard" class="nav-item sele
 check("详情弹框存在", /id="account-detail-dialog"/.test(html), true);
 check("详情弹框有字段容器", /id="account-detail-body"/.test(html), true);
 
-// ---- 4. 详情弹框是只读的：里面不该有写操作按钮 ----
+// ---- 4. 行内「停用/恢复」与「签到」（用户 2026-10-17）----
+// 账号池行内开关与签到按钮的**渲染与分派**都是纯字符串/判定，抠出来单测。
+// 要挡的回归：把按钮改成 <span>（点不动）、data-action 拼错（点下去没反应）、
+// 已签到还渲染按钮（重复签到被上游拒绝后只弹 toast，体验差）。
+const stateToggle = (a) => `<button class="pill account-state-toggle${a.enabled ? " " + a.status : ""}" data-action="toggle" data-id="${a.id}" data-enabled="${a.enabled ? "1" : "0"}">${a.enabled ? a.status : "已暂停"}</button>`;
+const checkinCell = (a) => a.today_checked_in
+  ? `<small class="cell-note">今日已签到</small>`
+  : `<button class="linklike" data-action="checkin" data-id="${a.id}">签到</button>`;
+check("停用中状态列文字为「已暂停」", stateToggle({enabled:false,id:"x",status:""}).includes(">已暂停<"), true);
+check("启用中状态列带状态色 class", stateToggle({enabled:true,id:"x",status:"green"}).includes("account-state-toggle green"), true);
+check("状态开关带 data-action=toggle（点得动）", stateToggle({enabled:true,id:"x",status:"green"}).includes('data-action="toggle"'), true);
+check("已签到不渲染签到按钮", checkinCell({today_checked_in:true,id:"x"}), '<small class="cell-note">今日已签到</small>');
+check("未签到渲染签到按钮且带 data-action=checkin",
+      checkinCell({today_checked_in:false,id:"x"}).includes('data-action="checkin" data-id="x"'), true);
+// 行内点击分派：三个新 action 都必须在 [data-action] 分支里被接住
+//（否则会掉进行情分支，弹详情弹框而不是执行操作）。
+const dispatchAction = (action) => {
+  const handled = ["settings", "checkin", "toggle"];
+  return handled.includes(action) ? action : "detail";
+};
+check("行内签到按钮 → 执行签到", dispatchAction("checkin"), "checkin");
+check("行内停用开关 → 执行停用", dispatchAction("toggle"), "toggle");
+check("设置按钮 → 开设置弹框", dispatchAction("settings"), "settings");
+// 设置弹框里重复入口已撤掉：签到/暂停只该出现在账号池行内。
+check("设置弹框已无 as-checkin", /id="as-checkin"/.test(html), false);
+check("设置弹框已无 as-toggle", /id="as-toggle"/.test(html), false);
+check("JS 已无 as-checkin 监听", /\$\("as-checkin"\)/.test(src), false);
+check("JS 已无 as-toggle 监听", /\$\("as-toggle"\)/.test(src), false);
+
+// ---- 5. 详情弹框是只读的：里面不该有写操作按钮 ----
 const detailDialog = /<dialog id="account-detail-dialog">[\s\S]*?<\/dialog>/.exec(html);
 check("详情弹框存在且可抽取", detailDialog !== null, true);
 check("详情弹框里没有写操作入口（只有关闭）",
