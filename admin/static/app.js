@@ -517,8 +517,7 @@ function renderLogRows(rows) {
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
   $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}</td><td>${accountCell(r)}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
-}
-async function loadLogs(offset) {
+}async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
   const size = Number($("dash-page-size").value) || 10;
   try {
@@ -1670,19 +1669,6 @@ $("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsag
 
 /* ---------- 单个密钥的请求记录 ---------- */
 let keyReqId = null, keyReqOffset = 0, keyReqSize = 10, keyReqDay = null;
-function renderKeyRequests(rows) {
-  // 与「请求日志」页同一套呈现（用户 2026-10-17）：后端文字列去掉，账号用
-  // 小图标 + 名称的独立列；模型/状态都行内跟随，不排两排。
-  const accountCell = r => r.account_name
-    ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
-    : "—";
-  $("key-requests-body").innerHTML = rows.map(r =>
-    `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
-    + `<td class="mono">${esc(r.model_id || "—")}</td><td>${accountCell(r)}</td>`
-    + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td>`
-    + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
-    || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';
-}
 async function loadKeyRequests(offset) {
   if (!keyReqId) return;
   keyReqOffset = Math.max(0, offset);
@@ -1697,7 +1683,15 @@ async function loadKeyRequests(offset) {
     const window = day ? `&since=${day[0]}&until=${day[1]}` : "";
     const data = await api(`logs?limit=${keyReqSize}&offset=${keyReqOffset}&key_id=${encodeURIComponent(keyReqId)}${window}`);
     if (requestedId !== keyReqId || requestedOffset !== keyReqOffset) return;  // 已被更新的请求取代
-    renderKeyRequests(data.rows);
+    // 复用「请求日志」页的表格组件（用户 2026-10-17：直接用同一套，别再抄一份）。
+    // 行结构与 key-requests-dialog 的表头一致：时间/模型/账号/状态/耗时（无密钥列）。
+    $("key-requests-body").innerHTML = data.rows.map(r =>
+      `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
+      + `<td class="mono">${esc(r.model_id || "—")}</td>`
+      + `<td>${r.account_name ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>` : "—"}</td>`
+      + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note inline">${outcomes[r.outcome] || '请求失败'}</small></td>`
+      + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
+      || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';
     const pages = Math.max(1, Math.ceil(data.total / keyReqSize));
     const current = Math.floor(data.offset / keyReqSize) + 1;
     $("key-requests-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
