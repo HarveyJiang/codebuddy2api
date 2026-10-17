@@ -548,6 +548,9 @@ function renderLogRows(rows) {
 $("dash-prev").addEventListener("click", () => loadLogs(Math.max(0, logOffset - Number($("dash-page-size").value))));
 $("dash-next").addEventListener("click", () => loadLogs(logOffset + Number($("dash-page-size").value)));
 $("dash-page-size").addEventListener("change", () => loadLogs(0));
+// 请求日志页的「刷新」按钮（用户 2026-10-17：与用量明细页对齐，该页原来只有
+// 翻页、没有主动刷新入口）—— 重新拉当前页。
+$("logs-refresh").addEventListener("click", () => loadLogs(logOffset));
 document.querySelectorAll("[data-dashboard-page]").forEach(b=>b.addEventListener("click",()=>goPage(b.dataset.dashboardPage)));
 $("dash-add").addEventListener("click",()=>openAccount());
 $("dash-base").textContent=location.origin+"/v1";

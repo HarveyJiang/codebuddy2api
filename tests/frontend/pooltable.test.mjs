@@ -140,6 +140,14 @@ check("复选框规则清掉了 select 的 chevron 背景图",
 check("settings-card h3 用 inline-flex（问号贴标题不被挤走）",
       /\.settings-card h3\{[^}]*display:inline-flex/.test(css), true);
 
+// ---- 6.10 请求日志页与用量明细页语言对齐（用户 2026-10-17：不要筛选，只整理）----
+check("请求日志页有 banner 说明条", /id="page-logs"[\s\S]{0,200}class="banner"/.test(html), true);
+check("请求日志页有刷新按钮", /id="logs-refresh"/.test(html), true);
+check("JS 接了 logs-refresh 点击", /\$\("logs-refresh"\)\.addEventListener/.test(src), true);
+check("日志页没有多余筛选下拉（用户明确不要）",
+      /id="logs-filter"|id="logs-key"|id="logs-backend"|id="logs-outcome"/.test(html), false);
+check("日志页分页条与表格拉开间距", /#page-logs \.pager\{margin-top:18px\}/.test(css), true);
+
 // ---- 6.9 用量明细页按后端 tab（用户 2026-10-17）----
 check("用量页有 tab 容器（JS 填充）", /id="usage-tabs"/.test(html), true);
 check("usageBackend 全局且默认空（=全部后端）",

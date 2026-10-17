@@ -255,6 +255,11 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .usage-groups-wrap h3{font-size:15px;margin-bottom:8px}
 .usage-cell{cursor:pointer}
 .usage-cell:hover{background:#f8fbfa}
+/* 请求日志页（用户 2026-10-17：与用量明细页同一套语言）。分页条已经是
+   白底细边卡片，只需与表格拉开间距（原来 margin-top:16px 贴得太紧），
+   并把页码信息压成弱化色，让「上一页/下一页」成为视觉主角。
+   只作用于 #page-logs，不碰概览页的最近请求表格。 */
+#page-logs .pager{margin-top:18px}
 
 /* 模型管理：工具栏双按钮、行内删除、添加弹窗的勾选项 */
 .toolbar-actions{display:flex;gap:10px;align-items:center}
