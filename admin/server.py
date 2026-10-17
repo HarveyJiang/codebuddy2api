@@ -2113,6 +2113,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 new["enabled"] = body["enabled"]
             store.data["accounts"][aid] = new
             store.save()
+            # 备注名变了就把历史请求日志里的 account_name 一起刷成新名：
+            # 那一列是写时快照，不同步的话同一账号在日志里会有新旧两个名字
+            # （用户 2026-10-17：请求日志的账号和账号池对不上）。
+            if new.get("name") != item.get("name"):
+                await asyncio.to_thread(store.db.rename_account_logs, aid, new["name"])
             store.sync_any_enabled()
         return {"ok": True}
 

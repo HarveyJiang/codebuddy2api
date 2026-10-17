@@ -438,7 +438,35 @@ def _v16_to_v17(db):
         db._write.execute("ALTER TABLE accounts ADD COLUMN checkin_fails_date TEXT")
 
 
-SCHEMA_VERSION = 17
+def _v17_to_v18(db):
+    """v17 → v18：request_logs.account_name 按 account_id 对齐 accounts.name。
+
+    ## 为什么
+
+    `account_name` 是**写时快照**：请求发生时把当时的备注名一起写进日志
+    （pool.py 切号处现取 `data["accounts"][aid]["name"]`）。改备注名只动
+    accounts 表，不回溯历史行 —— 于是同一账号在请求日志里会出现新旧两个
+    名字（用户 2026-10-17 实测：「和外面的 name 没有对齐了」）。
+
+    ## 做法
+
+    一次性 UPDATE 存量行：account_id 还能在 accounts 表里找到的，全部刷成
+    当前备注名。已删除账号的行**不动**（account_id 已不在 accounts 里），
+    保留它们最后已知的名字——账本记事实，那些请求确实是用那个号打的。
+
+    ## 幂等
+
+    `SET account_name=(SELECT name ...)` 每次都从 accounts 现取，重复执行
+    结果相同。新写入的日志由 PATCH /admin/api/accounts/{aid} 的
+    rename_account_logs() 实时同步，不需要再刷。
+    """
+    db._write.execute(
+        "UPDATE request_logs SET account_name="
+        "(SELECT name FROM accounts WHERE accounts.id=request_logs.account_id) "
+        "WHERE account_id IN (SELECT id FROM accounts)")
+
+
+SCHEMA_VERSION = 18
 
 
 MICRO = 1_000_000
@@ -835,7 +863,7 @@ class Database:
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
-                  (16, _v15_to_v16), (17, _v16_to_v17))
+                  (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -1138,6 +1166,18 @@ class Database:
             f"SELECT {', '.join(LOG_COLUMNS)} FROM request_logs ORDER BY id DESC LIMIT ?",
             (limit,))
         return [{column: row[column] for column in LOG_COLUMNS} for row in rows]
+
+    def rename_account_logs(self, aid, new_name):
+        """改备注名后把历史日志里的 account_name 一起刷成新名（用户 2026-10-17）。
+
+        `account_name` 是写时快照，只改 accounts 表会让同一账号在日志里出现
+        新旧两个名字。改名时同步 UPDATE，日志与账号池永远对齐；v18 迁移负责
+        刷存量数据，这里负责以后的每一次改名。
+        """
+        with self.transaction():
+            self._write.execute(
+                "UPDATE request_logs SET account_name=? WHERE account_id=?",
+                (new_name, aid))
 
     def page_request_logs(self, limit=50, offset=0, since=None, until=None,
                           source=None, outcome=None, key_id=None, account_id=None):

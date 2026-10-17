@@ -380,6 +380,49 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(recent[0]["path"], "/v1/messages")
         db.close()
 
+    def test_rename_account_logs_updates_snapshots(self):
+        # 改备注名后，历史日志里的 account_name 要跟着变成新名（用户 2026-10-17：
+        # 请求日志的账号和账号池对不上）。只刷这个账号，别的账号不动。
+        db = Database(self.root / "t.db")
+        db.save_accounts({"a1": {"name": "旧名", "file": "a.info", "enabled": True, "created": 100},
+                          "a2": {"name": "乙", "file": "b.info", "enabled": True, "created": 100}},
+                         {})
+        db.append_request_logs([
+            {"time": NOW, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1,
+             "account_id": "a1", "account_name": "旧名"},
+            {"time": NOW + 1, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1,
+             "account_id": "a2", "account_name": "乙"},
+        ])
+        db.rename_account_logs("a1", "新名")
+        rows = {r["account_id"]: r["account_name"] for r in db.recent_request_logs(10)}
+        self.assertEqual(rows["a1"], "新名")
+        self.assertEqual(rows["a2"], "乙")
+        db.close()
+
+    def test_v17_migration_aligns_log_account_names(self):
+        # v18 迁移：存量日志按 account_id 对齐当前备注名；账号已删的行保留最后已知名。
+        path = self.root / "legacy.db"
+        legacy = Database(path)
+        legacy._write.execute(
+            "UPDATE schema_meta SET value='17' WHERE key='version'")
+        legacy.save_accounts({"a1": {"name": "现在叫这个", "file": "a.info", "enabled": True, "created": 100}}, {})
+        legacy.append_request_logs([
+            {"time": NOW, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1,
+             "account_id": "a1", "account_name": "老名字"},
+            # account_id 不在 accounts 里（账号已删）——迁移不碰它。
+            {"time": NOW + 1, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1,
+             "account_id": "gone", "account_name": "已删除账号"},
+        ])
+        legacy.close()
+        # 重开库触发迁移。
+        db = Database(path)
+        rows = {r["account_id"]: r["account_name"] for r in db.recent_request_logs(10)}
+        self.assertEqual(rows["a1"], "现在叫这个")
+        self.assertEqual(rows["gone"], "已删除账号")
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                         str(SCHEMA_VERSION))
+        db.close()
+
     def test_request_log_stats_total_and_grouping(self):
         db = Database(self.root / "t.db")
         day = 86400
