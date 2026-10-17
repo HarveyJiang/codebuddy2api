@@ -605,7 +605,7 @@ async function openAccountDetail(a) {
     ["账号类型", `${backendIcon(a.backend)} ${backendName(a.backend)}`],
     ["UID", a.uid || "—"],
     ["昵称", a.nickname || "—"],
-    ["状态", a.pool_state || "—"],
+    ["状态", labels[a.pool_state]?.[0] || a.pool_state || "—"],
     ["剩余积分", a.remaining === null || a.remaining === undefined ? "待查询" : creditsFmt(a.remaining)],
     ["积分更新时间", stampOr(a.credits_updated)],
     ["7 天内到期", a.expiring_soon === null || a.expiring_soon === undefined ? "—" : creditsFmt(a.expiring_soon)],
@@ -627,19 +627,9 @@ async function openAccountDetail(a) {
   // （用户 2026-10-16 报告「表格上下显示数据」的真因）。
   $("account-detail-body").innerHTML = rows.map(([k, v]) =>
     `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
-  // 最近请求（用户拍板：冷却中想看「之前发生了什么」）—— 复用 /admin/api/logs
-  // 的 account_id 过滤，最多 10 条，覆盖 cooldown 的典型窗口（2h 内基本都在）。
-  try {
-    const logs = await api(`logs?account_id=${encodeURIComponent(a.id)}&limit=10`);
-    const body = $("account-detail-logs");
-    body.innerHTML = (logs.rows || []).map(r =>
-      `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
-      + `<td><span class="pill ${r.ok ? "green" : "red"}">${esc(r.status ?? "—")}</span></td>`
-      + `<td class="mono">${esc(r.model_id || "—")}</td>`
-      + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`)
-      .join("") || '<tr><td colspan="4" class="muted">近期没有请求记录。</td></tr>';
-    $("account-detail-logs-box").hidden = false;
-  } catch { /* 日志拉取失败不打断详情弹框 */ }
+  // 「最近请求」从详情弹框撤掉（用户 2026-10-17：详情页信息太多，且请求记录
+  // 已有专门的「请求日志」页与各弹框可看，这里不再重复）。原来拉日志的
+  // /admin/api/logs 请求、account-detail-logs 表格与显示开关一并移除。
   $("account-detail-dialog").showModal();
 }
 async function refresh(loadCredits) {
