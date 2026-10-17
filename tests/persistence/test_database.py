@@ -691,6 +691,26 @@ class DatabaseTests(unittest.TestCase):
         (kid,) = store.data["keys"]
         self.assertEqual(store.data["keys"][kid]["hash"], hashlib.sha256(initial.encode()).hexdigest())
 
+    def test_stale_transaction_does_not_orphan_log_rows(self):
+        """回归：with 入口抛异常（残留未决事务/库已关）时 save() 的 except 也
+        不能炸出 UnboundLocalError——日志行要原样留在缓冲里等下次重试。"""
+        store = Store(self.root, self.auth, "", ADMIN)
+        store.add_key("K")
+        store.save()
+        store.queue_request_log({"time": int(time.time()), "source": "api", "path": "/v1/models",
+                                 "status": 200, "outcome": "success", "duration_ms": 1})
+        # 在连接上留一个未决事务，让 db.transaction() 一进入就抛。
+        store.db._write.execute("BEGIN IMMEDIATE")
+        with self.assertRaises(RuntimeError):
+            store.save()
+        # 行没丢：仍在缓冲里（残局已被 db.transaction() 入口强制回滚清掉），
+        # 下一次 save 应能带上它落库。
+        self.assertEqual(len(store.log_buffer), 1)
+        store.save()
+        self.assertEqual(store.log_buffer, [])
+        reloaded = Store(self.root, self.auth, "", ADMIN)
+        self.assertEqual(reloaded.db.page_request_logs(limit=10)["total"], 1)
+
     def test_save_is_fast_enough_for_request_path(self):
         store = Store(self.root, self.auth, "", ADMIN)
         store.add_key("压测")

@@ -486,10 +486,16 @@ class Store:
         约 20KB，每请求重写会明显拖慢请求路径）。脏标记存深拷贝快照——若直接存引用，
         原地修改会同时改到快照，导致永远判定为「未变化」而漏写。
         """
-        rows = self.log_buffer
-        self.log_buffer = []
+        # rows 先在锁外取默认值：with 入口自身抛异常（残留未决事务/库已关）时
+        # except 也要能引用它。正常路径下锁内重新赋值。
+        # swapped 记录「log_buffer 是否已被换成新 list」——没换时 log_buffer 与
+        # rows 是同一个对象，直接 [:0]=rows 会自我拼接使行数翻倍。
+        rows, swapped = self.log_buffer, False
         try:
             with self.lock, self.db.transaction():
+                rows = self.log_buffer
+                self.log_buffer = []
+                swapped = True
                 self.db.save_accounts(self.data["accounts"], self.data["account_status"])
                 self.db.save_keys(self.data["keys"])
                 # 当日用量快照随 keys 一起写（覆盖语义，见 db.save_key_usage_daily）。
@@ -507,7 +513,10 @@ class Store:
         except BaseException:
             # 提交失败（磁盘满/IO 错误）时事务已回滚，把这批日志放回缓冲，
             # 下次 flush 重试。否则它们会永久消失且没有任何提示。
-            self.log_buffer[:0] = rows
+            # swapped=False（异常发生在交换之前）时 log_buffer 就是 rows 本身，
+            # 行还在原地，不能再插一次。
+            if swapped:
+                self.log_buffer[:0] = rows
             raise
 
     def queue_request_log(self, row):
@@ -905,14 +914,20 @@ class AdminMiddleware:
         self.store = store
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope["path"].startswith("/admin"):
+        if scope["type"] != "http":
             return await self.app(scope, receive, send)
         # 恢复期间库已关闭、进程即将退出。这里直接 503，避免请求撞在已关闭的
         # sqlite 连接上抛 ProgrammingError（表现为 500 + 一屏堆栈）。
-        if self.store is not None and self.store.restoring:
+        # /admin 与 /v1 都拦：/v1 的 flush→save→db.transaction 同样会撞库已关，
+        # 而恢复流程自己就是 /admin 端点，restoring 是在关库前置位的，
+        # 这个请求本身持着 store.lock 之外的路径进来，不会被自己挡住。
+        if self.store is not None and self.store.restoring \
+                and scope["path"].startswith(("/admin", "/v1")):
             response = JSONResponse(
                 {"detail": "数据库正在恢复，服务即将重启，请稍候刷新"}, 503)
             return await response(scope, receive, send)
+        if not scope["path"].startswith("/admin"):
+            return await self.app(scope, receive, send)
         messages, size = [], 0
         while True:
             message = await receive()
@@ -1128,7 +1143,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     try:
                         model_registry.refresh_catalog(_name)
                     except Exception:
-                        pass
+                        # 不能静默：目录刷新失败会让该后端悄悄停在静态兜底，
+                        # 而 overview 看起来一切正常。日志是唯一线索。
+                        logger.exception("启动时刷新 %s 的模型目录失败（保留静态兜底）", _name)
                 model_registry.persist(store.db)
         models_task = asyncio.create_task(models_worker())
         try:
@@ -1344,11 +1361,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.get("/admin/api/overview")
     async def overview(req: Request):
         store.require_admin(req)
-        # recent 直接读 request_logs（跨重启保留、含账号/密钥/模型维度）。
-        recent = _log_rows(store.db.recent_request_logs(100))
-        # 仪表盘累计口径同样来自 request_logs：内存 metrics 每次重启清零，
-        # 这里用库内统计覆盖计数类字段，只保留 in_flight 这种进程内的实时值。
-        summary = store.db.request_log_summary()
+        # 账号行要逐账号读 auth 文件（阻塞 I/O），模型快照要序列化 20KB 目录，
+        # 与两个库查询一起丢线程池：overview 是管理页 3 秒轮询的热路径，
+        # 全留在事件循环上会把 /v1 请求一起卡住。
+        recent, summary, rows, models_snap = await asyncio.gather(
+            asyncio.to_thread(_log_rows, store.db.recent_request_logs(100)),
+            asyncio.to_thread(store.db.request_log_summary),
+            asyncio.to_thread(lambda: pool.rows(store.account_rows())),
+            asyncio.to_thread(model_registry.snapshot),
+        )
         with store.lock:
             keys = [{"id": kid, "usage": item.get("usage") or {}, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
             live = metrics.snapshot()
@@ -1360,7 +1381,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                       "cost_ledger": pool.cost_ledger.stats(),
                       # WAF IP 级拦截状态。激活期间轮转会提前收手，不放大风控。
                       "waf_gate": pool.waf_gate.snapshot()}
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "pool_groups": {k: list(v) for k, v in AccountPool.SETTING_GROUPS.items()}, "metrics": merged, "keys": keys, "models": model_registry.snapshot(), "uptime": int(time.time() - store.started), "version": app_version.snapshot(), "events": list(store.events)}
+            return {"accounts": rows, "pool": dict(store.data["pool"]), "pool_groups": {k: list(v) for k, v in AccountPool.SETTING_GROUPS.items()}, "metrics": merged, "keys": keys, "models": models_snap, "uptime": int(time.time() - store.started), "version": app_version.snapshot(), "events": list(store.events)}
 
     @app.get("/admin/api/logs")
     async def logs(req: Request):
@@ -1376,13 +1397,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 return int(raw)
             except ValueError:
                 raise HTTPException(400, f"{name} 需为整数")
-        result = store.db.page_request_logs(
+        result = await asyncio.to_thread(
+            store.db.page_request_logs,
             limit=as_int("limit", 50), offset=as_int("offset", 0),
             since=as_int("since"), until=as_int("until"),
             source=params.get("source") or None, outcome=params.get("outcome") or None,
             key_id=params.get("key_id") or None,
             account_id=params.get("account_id") or None)
-        return {**result, "rows": _log_rows(result["rows"])}
+        return {**result, "rows": await asyncio.to_thread(_log_rows, result["rows"])}
 
     @app.get("/admin/api/logs/stats")
     async def log_stats(req: Request):
@@ -1399,8 +1421,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 raise HTTPException(400, f"{name} 需为整数时间戳")
         group_by = params.get("group_by") or None
         try:
-            return store.db.request_log_stats(since=as_int("since"), until=as_int("until"),
-                                              group_by=group_by, limit=500)
+            return await asyncio.to_thread(
+                store.db.request_log_stats,
+                since=as_int("since"), until=as_int("until"),
+                group_by=group_by, limit=500)
         except ValueError as e:
             raise HTTPException(400, str(e))
 
@@ -1417,14 +1441,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         days = _query_int(params, "days", 30)
         if days is not None and not 1 <= days <= 365:
             raise HTTPException(400, "days 需在 1-365 之间")
-        return store.db.key_usage_series(days=days or 30)
+        return await asyncio.to_thread(store.db.key_usage_series, days=days or 30)
 
     @app.get("/admin/api/usage")
     async def usage(req: Request):
         """分页读上游用量明细：只查本地库，不打上游。"""
         store.require_admin(req)
         params = req.query_params
-        result = store.db.page_upstream_usage(
+        result = await asyncio.to_thread(
+            store.db.page_upstream_usage,
             limit=_query_int(params, "limit", 100), offset=_query_int(params, "offset", 0),
             since=_query_time(params.get("start"), "start"),
             until=_query_time(params.get("end"), "end"),
@@ -1439,7 +1464,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         group_by = params.get("group_by") or "day"
         if group_by not in UPSTREAM_GROUPS:
             raise HTTPException(400, f"不支持的分组维度：{group_by}")
-        return store.db.upstream_usage_report(
+        return await asyncio.to_thread(
+            store.db.upstream_usage_report,
             since=_query_time(params.get("start"), "start"),
             until=_query_time(params.get("end"), "end"),
             account_id=params.get("account_id") or None, group_by=group_by)
@@ -1736,7 +1762,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         try:
             result = await asyncio.to_thread(store.backup_now, "manual")
         except (OSError, RuntimeError) as exc:
-            raise HTTPException(500, f"备份失败：{exc}")
+            # 不把 exc 原文回给客户端：里面可能带绝对路径与 errno，属于内部信息。
+            # 细节进日志（堆栈完整），对外的错误保持固定文案。
+            logging.getLogger("admin.backup").exception("手动备份失败")
+            raise HTTPException(500, "备份失败，请检查服务端日志与磁盘空间")
         return {"ok": True, **result, **store.backup_list()}
 
     @app.get("/admin/api/backups/{name}/download")
@@ -1776,16 +1805,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         try:
             safety = await asyncio.to_thread(store.backup_now, "pre-restore")
         except (OSError, RuntimeError) as exc:
-            raise HTTPException(500, f"恢复前自动备份失败，已中止：{exc}")
+            # 同手动备份：exc 原文（路径/errno）只进日志，对外固定文案。
+            logging.getLogger("admin.backup").exception("恢复前的自动备份失败，已中止")
+            raise HTTPException(500, "恢复前自动备份失败，已中止；请检查服务端日志与磁盘空间")
         with store.lock:
+            # restoring 必须在关库**之前**置位：关库后到进程退出之间有真实窗口
+            # （begin/finish_restore 都是文件操作），这期间 /v1 请求会走到
+            # pool.flush→save→db.transaction 撞上「数据库已关闭」而 500。
+            store.restoring = True
             # 关库：WAL 先合并，再断开连接，之后替换文件才不会丢已提交数据。
             store.db.close()
             await asyncio.to_thread(db_backup.begin_restore, store.root, path, store.path)
             await asyncio.to_thread(db_backup.finish_restore, store.root)
-        # 置位必须在关库**之前**才严谨，但那样会让恢复请求本身撞上 503；这里在
-        # 关库后立刻置位，把「库已关、进程未退」这个窗口缩到最小。窗口内到达的
-        # 请求由 AdminMiddleware 统一转成 503，不再抛 sqlite3.ProgrammingError。
-        store.restoring = True
         logging.getLogger("admin.backup").warning(
             "已从 %s 恢复数据库（恢复前已备份为 %s），即将重启进程", name, safety["name"])
         asyncio.get_running_loop().call_later(0.5, lambda: os._exit(0))

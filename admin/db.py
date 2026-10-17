@@ -659,6 +659,8 @@ class Database:
             PRIMARY KEY (account_id, day, model))""",
         """CREATE INDEX IF NOT EXISTS idx_bindings_expires
             ON session_bindings(expires)""",
+        """CREATE INDEX IF NOT EXISTS idx_logs_time
+            ON request_logs(time)""",
         """CREATE INDEX IF NOT EXISTS idx_logs_key_time
             ON request_logs(key_id, time)""",
         """CREATE INDEX IF NOT EXISTS idx_logs_account_time

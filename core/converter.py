@@ -269,10 +269,14 @@ class CredentialManager:
         if is_encrypted_field(auth.get("accessToken")):
             new_auth["accessToken"] = encrypt_auth_field(decrypt_auth_field(new_auth["accessToken"]))
             new_auth["refreshToken"] = encrypt_auth_field(decrypt_auth_field(new_auth["refreshToken"]))
-        # 原子写回
+        # 原子写回。chmod 0600 不可省：os.replace 保留 tmp 权限，普通 open 在
+        # umask 022 下会落成 0644——里面是 accessToken/refreshToken，全局可读。
+        # 同 core/backends/trae.py 的 _save_atomic（登录时写 0600，之后每次刷新
+        # 都走这里，不补 chmod 会被悄悄降级）。
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(s, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
         self._cached = s
         self._mtime = self.path.stat().st_mtime

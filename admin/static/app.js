@@ -503,7 +503,7 @@ const routingShort = r => r === "" || r == null ? ROUTING_SHORT[""] : (ROUTING_S
 const routingIcon = r => r === "" || r == null ? ROUTING_ICON[""] : (ROUTING_ICON[r] || "•");
 let logOffset = 0, logTotal = 0;
 function renderLogRows(rows) {
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td><td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="5" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }
 async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
@@ -622,7 +622,7 @@ async function openAccountDetail(a) {
     const body = $("account-detail-logs");
     body.innerHTML = (logs.rows || []).map(r =>
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
-      + `<td><span class="pill ${r.ok ? "green" : "red"}">${r.status ?? "—"}</span></td>`
+      + `<td><span class="pill ${r.ok ? "green" : "red"}">${esc(r.status ?? "—")}</span></td>`
       + `<td class="mono">${esc(r.model_id || "—")}</td>`
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`)
       .join("") || '<tr><td colspan="4" class="muted">近期没有请求记录。</td></tr>';
@@ -1608,7 +1608,7 @@ function renderKeyRequests(rows) {
   $("key-requests-body").innerHTML = rows.map(r =>
     `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
     + `<td>${backendBadge(r.backend)}</td><td class="mono">${esc(r.model_id || "—")}${r.account_name ? `<small class="cell-note">${esc(r.account_name)}</small>` : ""}</td>`
-    + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td>`
+    + `<td><span class="pill ${r.ok ? 'green' : 'red'}">${esc(r.status ?? "—")}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td>`
     + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
     || '<tr><td colspan="5" class="history-empty">该密钥还没有请求记录。</td></tr>';
 }

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -78,4 +79,42 @@ def test_build_headers_from_encrypted_auth(tmp_path, monkeypatch):
 # 请在该用例上单独加 @pytest.mark.<域>，或在下面改用更准确的一档。
 # ---------------------------------------------------------------------------
 pytestmark = [pytest.mark.core]
+
+
+def test_refresh_persists_with_0600_permissions(tmp_path):
+    """回归：token 刷新写回 auth 文件后权限必须是 0600。
+
+    历史缺陷：converter 的 CredentialManager 写回路径没有 chmod，os.replace 保留
+    tmp 权限（umask 022 下 0644），而文件里是 accessToken/refreshToken——
+    trae 登录时写的 0600 会被之后每次刷新悄悄降级成全局可读。
+    """
+    import httpx
+    from core import converter as mod
+
+    session = {
+        "auth": {
+            "accessToken": "old-access", "refreshToken": "old-refresh",
+            "domain": "www.workbuddy.cn", "expiresAt": 1,
+        },
+        "account": {"uid": "u1", "enterpriseId": "e1"},
+    }
+    f = tmp_path / "workbuddy-desktop.info"
+    f.write_text(json.dumps(session), encoding="utf-8")
+    os.chmod(f, 0o600)
+
+    def handler(req):
+        return httpx.Response(200, json={"code": 0, "data": {
+            "accessToken": "NEW-ACCESS", "refreshToken": "NEW-REFRESH",
+            "expiresIn": 3600}})
+
+    orig = mod.httpx.Client
+    mod.httpx.Client = lambda **kw: orig(transport=httpx.MockTransport(handler), **kw)
+    try:
+        cm = mod.CredentialManager(f)
+        cm._refresh()
+    finally:
+        mod.httpx.Client = orig
+
+    mode = stat.S_IMODE(f.stat().st_mode)
+    assert mode == 0o600, f"刷新后 auth 文件权限是 {oct(mode)}，凭据全局可读"
 

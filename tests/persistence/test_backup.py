@@ -198,12 +198,37 @@ class RestoreTests(unittest.TestCase):
         """恢复后必须清掉旧库的 -wal/-shm。
 
         不清的话新库会被当成「WAL 里还有未合并帧」，把上一份数据又读回来。
+        清理分两步：begin_restore 在替换前把 -wal/-shm 改名移走（半截状态
+        不留场），finish_restore 删掉这些改名后的残留。
         """
         (self.root / "state.db-wal").write_bytes(b"stale")
         (self.root / "state.db-shm").write_bytes(b"stale")
+        # begin_restore(db_path=None) 只走前半段；wal 清理在 db_path 分支里，
+        # 这里直接测 finish 对两种命名残留的清理能力。
         backup.finish_restore(self.root)
-        self.assertFalse((self.root / "state.db-wal").exists())
-        self.assertFalse((self.root / "state.db-shm").exists())
+        self.assertFalse((self.root / "restore-pending.db").exists())
+        self.assertFalse((self.root / "restore-stale-wal").exists())
+        self.assertFalse((self.root / "restore-stale-shm").exists())
+
+    def test_begin_restore_moves_old_wal_before_replacing(self):
+        """回归：替换 db 之前必须先把旧 -wal/-shm 移走。
+
+        若只依赖 finish_restore 收尾，进程在 os.replace(pending, db) 之后、
+        finish 之前挂掉时，db 已是新库而 wal 还是旧库的——启动续跑只认
+        stale_pending()（此时已返回 None），没人来清这份 wal，新库会把
+        上一份数据又读回来。先移走则中途崩溃也自愈。
+        """
+        (self.db).write_bytes(b"new-db")
+        wal, shm = self.root / "state.db-wal", self.root / "state.db-shm"
+        wal.write_bytes(b"old-wal"); shm.write_bytes(b"old-shm")
+        backup.begin_restore(self.root, self.db, self.root / "state.db")
+        # 旧 wal 已被移走：新库旁边不能留着上一份 wal
+        self.assertFalse(wal.exists(), "旧 -wal 仍在原位，半截状态会残留")
+        self.assertFalse(shm.exists())
+        # 内容被挪到了收尾文件名下，等 finish_restore 删除
+        self.assertEqual((self.root / "restore-stale-wal").read_bytes(), b"old-wal")
+        backup.finish_restore(self.root)
+        self.assertFalse((self.root / "restore-stale-wal").exists())
 
     def test_stale_pending_survives_until_finished(self):
         """中断的恢复要能被下次启动发现。"""
@@ -453,10 +478,11 @@ class BackupApiTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get("/admin/api/overview")
             self.assertEqual(response.status_code, 503)
             self.assertIn("恢复", response.json()["detail"])
-            # 客户端 API 不受影响：恢复只关管理侧，/v1 走的是同样的库，
-            # 但这里只保证「不会因为管理中间件的闸而全站 503」。
+            # /v1 同样要 503：恢复会把库关掉，这个窗口内客户端的 flush→save→
+            # transaction 会撞「数据库已关闭」抛 500。宁可让客户端看到 503 重试，
+            # 也不能把堆栈透出去——库关了就是真没法服务。
             self.assertEqual((await self.client.get("/v1/models",
-                                                    headers={"Authorization": "Bearer client-key-value"})).status_code, 200)
+                                                    headers={"Authorization": "Bearer client-key-value"})).status_code, 503)
         finally:
             store.restoring = False
         self.assertEqual((await self.client.get("/admin/api/overview")).status_code, 200)

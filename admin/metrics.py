@@ -141,7 +141,16 @@ class MetricsMiddleware:
         落库走 Store 的批量缓冲，不每请求写一次库。
         """
         context = scope.get(REQUEST_LOG_CONTEXT) or {}
-        effective = context.get("error_code") or status
+        # error_code 来自上游 SSE 扫描，可能是字符串（如 WAF 的 "11128"）；
+        # request_logs.status 是 INTEGER 列，SQLite 动态类型会把文本原样存回来，
+        # 之后每次 AVG/比较都脏。这里统一归一成 int，失败回落 HTTP 状态码。
+        effective = status
+        code = context.get("error_code")
+        if code is not None:
+            try:
+                effective = int(code)
+            except (TypeError, ValueError):
+                effective = status
         self.store.queue_request_log({
             "time": int(time.time()), "source": self.source, "path": path,
             "status": effective, "outcome": outcome, "duration_ms": round(duration),

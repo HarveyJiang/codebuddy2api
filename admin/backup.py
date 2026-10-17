@@ -222,6 +222,13 @@ def begin_restore(root, source, db_path):
 
     调用方必须先关掉数据库连接：Windows 与部分文件系统上替换被占用的文件会
     失败，且即便成功，旧连接持有的页缓存也会在之后写回、把刚恢复的内容覆盖掉。
+
+    旧库的 -wal/-shm 在**替换前**就改名移走：留着的风险是半截状态——
+    os.replace(pending, db_path) 之后、finish_restore 之前若进程挂掉，
+    db 已是新库而 wal 还是旧库的，启动续跑只认 stale_pending()（那时已返回
+    None），不会有人来清这份 wal，新库会被当成「wal 里还有未合并帧」而读出
+    上一份数据。改成先移走，finish_restore 就只剩删除已不存在的文件这一步，
+    中途崩溃也不再留半截状态。
     """
     root = Path(root)
     pending = root / "restore-pending.db"
@@ -229,19 +236,21 @@ def begin_restore(root, source, db_path):
     shutil.copyfile(source, tmp)
     os.replace(tmp, pending)
     if db_path is not None:
+        for suffix in ("-wal", "-shm"):
+            stale = Path(str(db_path) + suffix)
+            if stale.exists():
+                os.replace(stale, root / f"restore-stale{suffix}")
         os.replace(pending, db_path)
     return pending
 
 
 def finish_restore(root):
-    """确认恢复完成，清掉可能残留的中转文件与 WAL。"""
+    """确认恢复完成，清掉可能残留的中转文件与旧 WAL。"""
     root = Path(root)
     (root / "restore-pending.db").unlink(missing_ok=True)
     (root / "restore-pending.db.tmp").unlink(missing_ok=True)
-    # 旧库的 -wal/-shm 属于被替换掉的那个库，必须清掉，否则新库会被当成
-    # 「WAL 里还有未合并帧」而读出上一份数据。
-    for suffix in ("-wal", "-shm"):
-        Path(str(root / "state.db") + suffix).unlink(missing_ok=True)
+    (root / "restore-stale-wal").unlink(missing_ok=True)
+    (root / "restore-stale-shm").unlink(missing_ok=True)
 
 
 def due(settings, now=None):
