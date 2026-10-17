@@ -166,6 +166,36 @@ def _credits_of(usage):
     return 0.0
 
 
+def _hint_summary(text, limit=60):
+    """把上游错误文案压成一行可读摘要；没有可用的内容时返回 None。
+
+    用户 2026-10-18 反馈要「冷却原因写具体」——上游原话
+    「当前您在 Step-5-Preview 模型的使用量已超出频率限制，可在
+    2026-10-18 14:23:36 重置后使用。您可先切换至其他模型。」
+    信息量最大的是**第一句**（说清了是什么限制、哪个模型、什么时候好），
+    后面的「请切换其他模型」是废话。所以：压平换行与多余空白，
+    取第一个句号（含式点句号）前的部分，仍超长就截到 limit 并补省略号。
+    """
+    if not text:
+        return None
+    # 上游文案可能是 SSE 分片拼起来的，先压成一行。
+    line = " ".join(str(text).split())
+    if not line:
+        return None
+    # 第一句通常就是结论；切完再判断长度，短句原样保留。
+    cut = len(line)
+    for mark in ("。", "！", "？", ";"):
+        pos = line.find(mark)
+        if 0 < pos < cut:
+            cut = pos + 1
+    summary = line[:cut].strip()
+    if not summary:
+        return None
+    if len(summary) > limit:
+        summary = summary[:limit].rstrip() + "…"
+    return summary
+
+
 class AccountPool:
     # 池设置默认值。Store._load 用它们补齐旧数据缺失的字段，
     # 这里保留 setdefault 兼容直接构造 Store 的老用法。
@@ -647,6 +677,43 @@ class AccountPool:
                 tokens = prompt + completion
         self.cost_ledger.observe(aid, model, credits, tokens)
 
+    @staticmethod
+    def _cooldown_reason(*, status, minutes=None, label=None, model=None,
+                         hint_text=None, source=None, until=None):
+        """把冷却原因写成人能据此行动的一句话。
+
+        用户 2026-10-18 反馈：账号行只显示「上游额度或频率限制，已冷却 N 分钟」，
+        而上游实际说的是「当前您在 Step-5-Preview 模型的使用量已超出频率限制，
+        可在 2026-10-18 14:23:36 重置后使用」——**哪个模型受限、几点能恢复**
+        全丢了，看的人不知道该切什么、要等多久。
+
+        因此这里固定带上三样信息：
+        1. 模型名（``model``）——模型级频率限制是常态，写出来才知道该切哪个；
+        2. 恢复时刻（``until``）——本地时区的绝对时刻，比「已冷却 N 分钟」直观；
+        3. 上游原文摘要（``hint_text``）——截断到一句，保留「为什么」的细节。
+
+        拿不到的信息就不写，不猜：没有 model 时不编模型名，没有 hint 时
+        不附摘要，上游没给时刻时不写时刻（只有本地退避的分钟数）。
+        """
+        head = f"{label}（{status}）" if label else f"模型不可用（{status}）"
+        parts = []
+        if model:
+            parts.append(f"模型 {model}")
+        if minutes:
+            parts.append(f"冷却 {minutes} 分钟")
+        if until:
+            # 绝对时刻用本地时区（容器 TZ 已是北京时间）；分钟数只作补充，
+            # 避免「已冷却 N 分钟」把真正有用的时刻挤出可见区域。
+            stamp = datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
+            parts.append(f"恢复于 {stamp}")
+        if source:
+            parts.append(f"（{source}）")
+        text = head + "，" + "，".join(parts) if parts else head
+        summary = _hint_summary(hint_text)
+        if summary:
+            text += f"：{summary}"
+        return text
+
     def record(self, aid, status=200, *, hint_text=None, hint_headers=None, usage=None, model=None):
         """记录一次请求结果，并在失败时施加冷却。
 
@@ -656,6 +723,8 @@ class AccountPool:
 
         ``usage`` / ``model`` 用于实测成本账本（admin/cost_ledger.py）：只有响应里
         真的带回了可解析的 credit 才会记录，否则账本保持为空、选号行为不变。
+        ``model`` 另外还用于把冷却原因写具体（用户 2026-10-18 反馈：只写
+        「上游额度或频率限制」看不出是哪个模型、什么时候能好）。
         """
         if usage and model and aid:
             self._observe_cost(aid, model, usage)
@@ -674,8 +743,14 @@ class AccountPool:
                 # 只做有界冷却，不计入连续失败（否则会把好账号升级到 2h 硬冷却）。
                 # 具体冷却时长由后端自己声明（见 BackendSpec.soft_cooldown）。
                 minutes = max(1, int(soft) // 60)
+                # 冷却原因写具体（用户 2026-10-18）：哪个模型、上游原文摘要、
+                # 什么时候恢复。模型级频率限制（如「Step-5-Preview 使用量已超出
+                # 频率限制，14:23:36 重置」）原来只显示成一句笼统文案，看不出
+                # 该切哪个模型、要等到几点。
                 data.update(cooldown_until=self.clock() + soft,
-                            last_error=f"模型不可用（{status}），已软冷却 {minutes} 分钟")
+                            last_error=self._cooldown_reason(
+                                status=status, minutes=minutes, model=model,
+                                hint_text=hint_text, source=None, until=None))
             elif status in (401, 403, 402, 429):
                 # 指数退避：连续失败翻倍冷却时长，上限 2 小时；成功请求重置计数。
                 fails = data.get("consecutive_fails", 0) + 1
@@ -698,7 +773,9 @@ class AccountPool:
                         source = "上游明示"
                 label = "上游认证或访问被拒绝" if status in (401, 403) else "上游额度或频率限制"
                 data.update(cooldown_until=until,
-                            last_error=f"{label}，已冷却 {max(1, (until - self.clock()) // 60)} 分钟（{source}）")
+                            last_error=self._cooldown_reason(
+                                status=status, label=label, model=model,
+                                hint_text=hint_text, source=source, until=until))
                 cooldown = until - self.clock()
                 if status == 402:
                     data["credits_updated"] = 0  # 触发下个周期立即重新查询积分

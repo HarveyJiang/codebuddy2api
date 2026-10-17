@@ -390,6 +390,52 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(until - self.now, 1800)
         self.assertIn('本地退避', self.store.data['account_status'][self.a]['last_error'])
 
+    def test_cooldown_reason_carries_model_and_reset_time(self):
+        """冷却原因必须写具体：哪个模型、什么时候恢复、上游原文第一句。
+
+        用户 2026-10-18 报：账号行只写「上游额度或频率限制，已冷却 N 分钟」，
+        但上游原文是「当前您在Step-5-Preview模型的使用量已超出频率限制，可在
+        2026-10-18 14:23:36重置后使用」——不知道切哪个模型、不知道要等多久，
+        这条 last_error 就是废的。
+        """
+        from datetime import datetime, timezone, timedelta
+        CN = timezone(timedelta(hours=8))
+        when = datetime.fromtimestamp(self.now + 7200, CN).strftime('%Y-%m-%d %H:%M:%S')
+        hint = (f"当前您在Step-5-Preview模型的使用量已超出频率限制，可在 {when} 重置后使用。"
+                "您可先切换至其他模型。")
+        self.pool.record(self.a, 429, hint_text=hint, model="step-5-preview")
+        err = self.store.data['account_status'][self.a]['last_error']
+        # 1) 模型名：用户要的第一件事——该切哪个模型
+        self.assertIn('step-5-preview', err)
+        # 2) 恢复时刻：等多久
+        self.assertIn('恢复于', err)
+        self.assertIn(datetime.fromtimestamp(self.now + 7200).strftime('%m-%d %H:%M'), err)
+        # 3) 原文第一句（结论）；后面的「请切换其他模型」是废话，不该占地方
+        self.assertIn('超出频率限制', err)
+        self.assertNotIn('切换至其他模型', err)
+
+    def test_cooldown_reason_omits_missing_pieces(self):
+        """拿不到的信息不猜：没有 model 不写模型、没有上游文案不附摘要。"""
+        self.pool.record(self.a, 429)
+        err = self.store.data['account_status'][self.a]['last_error']
+        self.assertNotIn('None', err)
+        self.assertNotIn('模型  ', err)
+        self.assertNotIn('：', err)
+        self.assertIn('本地退避', err)
+
+    def test_soft_cooldown_reason_carries_model(self):
+        """软冷却（模型不可用）同样带上模型名，与硬冷却同一套格式。
+
+        只有 Trae 声明了软冷却（{404: 600}，config_name 不存在），WorkBuddy 的
+        404/503 都按硬失败处理。所以这里显式把账号挂到 Trae 再打 404。
+        """
+        self.store.data['accounts'][self.a]['backend'] = 'trae'
+        self.pool.record(self.a, 404, model="step-5-preview")
+        err = self.store.data['account_status'][self.a]['last_error']
+        self.assertIn('step-5-preview', err)
+        self.assertIn('模型不可用（404）', err)
+        self.assertIn('冷却 10 分钟', err)   # Trae 声明 404 → 600s
+
     def test_guards_are_inert_when_disabled(self):
         """护栏全关（默认）时选号行为与没这功能时一致，且不查库。"""
         calls = []
