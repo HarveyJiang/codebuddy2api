@@ -21,7 +21,11 @@ from admin.db import Database, SCHEMA_VERSION
 from admin.models import ModelRegistry
 from core.backends.registry import backend_name_for, spec_for
 
-from tests.admin.test_model_registry import FakeManager, upstream_payload
+# 裸模块名导入（同 test_browser_login.py 的 import test_server）：tests/ 下没有
+# __init__.py，pytest prepend 模式把 tests/admin/ 插进 sys.path。
+# 不写 from tests.admin... —— 某些环境 site-packages 里存在同名 tests 包
+# （如 Theano 遗留），命名空间包会被它遮蔽，导入直接失败。
+from test_model_registry import FakeManager, upstream_payload
 
 
 class PinnedModelsTests(unittest.TestCase):

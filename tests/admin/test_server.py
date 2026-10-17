@@ -371,6 +371,21 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["synced"], 0)
         self.assertTrue(any("刚拉取过" in (x.get("reason") or "") for x in again["skipped"]))
 
+        # Trae 账号不进同步队列：用量对账接口只认默认后端凭据（它的 token 打过去
+        # 必然 401）。生产上曾因无差别入队，Trae 账号每天留一条永远清不掉的
+        # usage_sync_error 留痕（usage_synced_at 从未成功过）。
+        store.data["accounts"]["t1"] = {
+            "name": "Trae号", "file": "session.info", "enabled": True,
+            "created": now, "backend": "trae"}
+        called.clear()
+        result = await self.client.post("/admin/api/usage/sync", json={
+            "start": now - 7200, "end": now})
+        self.assertNotIn("t1", called)
+        # 显式指定 Trae 账号：给出明确原因，而不是「没有可拉取的账号」让人以为选错人。
+        picked = (await self.client.post("/admin/api/usage/sync", json={
+            "start": now - 7200, "end": now, "account_id": "t1"})).json()
+        self.assertEqual(picked["message"], "该后端没有上游用量对账接口")
+
     async def test_key_usage_history_endpoint(self):
         """密钥按日用量历史：换天留新行，接口能按 key 取到序列。"""
         await self.login()

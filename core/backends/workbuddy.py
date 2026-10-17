@@ -47,6 +47,10 @@ class WorkBuddyBackend(BackendSpec):
 
     # 积分/签到走 pool 的默认实现（billing 接口），故不声明 account_ops_backend。
     #
+    # 上游用量明细（pool.USAGE_BILLING 的 get-user-request-usage）只认本后端
+    # 凭据，对账功能仅默认后端可用——声明出来，让 pool 据此过滤同步队列。
+    supports_upstream_usage = True
+    #
     # 模型目录来自 /v3/config（见 admin/models.py:fetch）。它只认**本后端**账号的
     # 凭据，所以拉目录时必须挑一个默认后端的账号 —— 由本声明告诉 admin，
     # 而不是在 admin 里写死「用 workbuddy 账号」。

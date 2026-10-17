@@ -1155,6 +1155,10 @@ class AccountPool:
                 # 总闸关掉的后端不打上游（与 tick 同一口径）。
                 if not item["enabled"] or not is_backend_enabled(item.get("backend", default_backend())):
                     continue
+                # 用量对账接口只认默认后端凭据（见 BackendSpec.supports_upstream_usage）：
+                # 不支持的账号进队列就是每天一次必然的 401 + 一条永远清不掉的留痕。
+                if not spec_for(item.get("backend", default_backend())).supports_upstream_usage:
+                    continue
                 status = self.store.data["account_status"].get(aid, {})
                 # usage_synced_at 语义是「最后同步成功时间」，失败时不改它；
                 # 靠 usage_sync_error 里的日期前缀兼作「当天已尝试」标记，不新增列。
@@ -1198,8 +1202,15 @@ class AccountPool:
         with self.store.lock:
             targets = [aid for aid, item in self.store.data["accounts"].items()
                        if item["enabled"] and is_backend_enabled(item.get("backend", default_backend()))
+                       and spec_for(item.get("backend", default_backend())).supports_upstream_usage
                        and (not account_id or aid == account_id)]
         if not targets:
+            if account_id:
+                # 指定了账号却拉不到：说清是「这个账号拉不了」，别让用户以为选错了人。
+                item = self.store.data["accounts"].get(account_id)
+                if item and not spec_for(item.get("backend", default_backend())).supports_upstream_usage:
+                    return {"synced": 0, "failed": 0, "skipped": [],
+                            "message": "该后端没有上游用量对账接口"}
             return {"synced": 0, "failed": 0, "skipped": [], "message": "没有可拉取的账号"}
         if self.jobs.locked():
             return {"synced": 0, "failed": 0, "skipped": targets,

@@ -17,6 +17,7 @@ OpenAI 形状，因此本模块把：
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,10 @@ FUNCTION = "solo_work_lite"
 # 因此请求时按模型自适应（先 work_lite，4001 再换 agent_remote，结果缓存）。
 FUNCTION_FALLBACK = "solo_agent_remote"
 CLIENT_UA = f"Trae/{IDE_VERSION}"
+# ug 接口（签到/积分/模型目录）由 VSCode 插件进程发起，UA 与 chat 的 IDE 主进程不同。
+# 用 IDE 的 UA 会被上游判为设备形态不符——claim 恒 9074，而 status 却完全正常，
+# 极易被误判成"限流"或"账号被封"。
+UG_UA = "VSCode 1.107.1 (TRAE SOLO CN)"
 
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
 EP_MODELS = "/api/ide/v1/get_detail_param"
@@ -867,14 +872,37 @@ class TraeCredentialManager:
                 self._refresh()
             return self._solo_headers(stream=stream)
 
+    def _numeric_device_id(self) -> str:
+        """ug 接口的设备号：16 位纯数字（真实客户端形态，实测值如 1711320556112436）。
+
+        为什么不能直接用 auth.deviceId：登录流程用 token_hex(16) 生成 32 位 hex，
+        上游风控只认数字设备号——hex/UUID 形态下 claim 恒返回 9074，而 status 接口
+        却完全正常（enable/credits 照常返回），极易被误判成"限流"或"账号被封"。
+
+        迁移安全性：签到判重维度是**账号**不是设备，换设备号不会造成重复签到
+        （checked_in 仍是账号维度的读数，换号只会短暂读到缓存的 false）。
+        """
+        current = str(self._auth().get("deviceId") or "")
+        if current.isdigit() and len(current) == 16:
+            return current
+        uid = str(self._account().get("uid") or "")
+        if uid.isdigit():
+            return uid.ljust(16, "0")[:16]
+        seed = current or uid or "trae"
+        digits = re.sub(r"\D", "", str(int(hashlib.md5(seed.encode()).hexdigest(), 16)))
+        return digits.ljust(16, "0")[:16]
+
     # -- ug API（动态模型表 / 签到 / 积分） --
 
     def ug_headers(self) -> dict:
         """签到/积分（api.trae.cn）头：确保 token 新鲜后构造（对应 Go UgHeaders）。
 
-        生产实测（对照官方客户端与开源签到实现）：ug 接口除 Cloud-IDE-JWT 外还校验
-        设备三头（x-device-id/x-device-brand/x-device-type）与 x-app-version；
-        缺 x-device-id 上游返回 9004（设备形态不被识别），签到必失败。
+        生产实测（对照官方客户端与开源签到实现），claim 要过必须四要素齐备：
+        1. UA 是 VSCode 插件进程形态（VSCode 1.107.1 (TRAE SOLO CN)），
+           不是 chat 链路的 IDE 主进程 UA；
+        2. 设备号是 16 位纯数字（见 _numeric_device_id），hex32 恒 9074；
+        3. 带 x-app-type: trae 与 Origin/Referer: https://www.trae.cn；
+        4. 请求体带 req_source（CHECKIN_BODY），空 body 同样 9074。
         """
         with self._lock:
             if self._is_expired():
@@ -884,12 +912,15 @@ class TraeCredentialManager:
             h = {
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": CLIENT_UA,
+                "User-Agent": UG_UA,
                 "Authorization": f"Cloud-IDE-JWT {token}",
                 "X-User-Region": "CN",
                 "x-app-version": "1.0.0",
+                "x-app-type": "trae",
+                "Origin": CONSOLE_HOST,
+                "Referer": CONSOLE_HOST + "/",
             }
-            device_id = str(auth.get("deviceId") or "")
+            device_id = self._numeric_device_id()
             if device_id:
                 h["X-Device-Id"] = device_id
                 h["x-device-brand"] = "PC"
