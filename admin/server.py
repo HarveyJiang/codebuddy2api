@@ -734,6 +734,26 @@ class Store:
         self.keys_dirty = True
         return kid, value
 
+    def reset_key(self, kid):
+        """轮换密钥值：生成新 key，旧值立即失效；其余（限额/白名单/路由/
+        有效期/usage 历史/last_used_at/停用态）全部保留，kid 不变。
+
+        与「撤销+新建」的区别：那会丢配置与历史、且要两步。场景是密钥
+        疑似泄露时要换值。已撤销的密钥不可重置——撤销不可逆，重置一个
+        已死密钥没有意义，直接新建。
+        """
+        with self.lock:
+            item = self.data["keys"].get(kid)
+            if not item:
+                raise HTTPException(404, "密钥不存在")
+            if item.get("revoked_at"):
+                raise HTTPException(400, "已撤销的密钥不能重置，请直接新建")
+            value = "sk-wb-" + secrets.token_urlsafe(32)
+            item["hash"] = digest(value)
+            item["hint"] = value[:5] + "…" + value[-4:]
+            self.keys_dirty = True
+        return kid, value
+
     def key_bindings(self, kid):
         """返回该密钥的 (允许的模型集合或 None, 允许的账号集合或 None)。"""
         item = self.data["keys"].get(kid) or {}
@@ -2203,6 +2223,15 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             store.keys_dirty = True
             store.save()
         return {"ok": True}
+
+    @app.post("/admin/api/keys/{kid}/reset")
+    async def reset_key(kid: str, req: Request):
+        """轮换密钥值：旧值立即失效，配置与用量历史保留，新明文只此一次返回。"""
+        store.require_admin(req)
+        with store.lock:
+            _, value = store.reset_key(kid)
+            store.save()
+        return {"id": kid, "key": value}
 
     @app.get("/admin/api/debug/models")
     async def debug_models_endpoint(req: Request):

@@ -1249,6 +1249,9 @@ function openKeyBind(k) {
   // 下次打开就是新值。
   $("key-bind-routing-hint").textContent = k.routing
     ? "" : `当前默认：${routingShort(overview.pool?.default_routing || "round_robin")}`;
+  // 撤销不可逆：重置一个已死密钥没有意义（后端也会 400），按钮直接禁掉并说明。
+  $("key-bind-reset").disabled = !!k.revoked_at;
+  $("key-bind-reset").title = k.revoked_at ? "已撤销的密钥不能重置，请直接新建" : "";
   $("key-bind-dialog").dataset.kid = k.id;
   $("key-bind-dialog").showModal();
 }
@@ -1300,7 +1303,32 @@ $("key-bind-revoke").addEventListener("click", e => {
   confirmAction("撤销客户端密钥？", `使用「${k.name}」的客户端将无法发起新请求。此操作不可撤销。`,
     async () => { await api("keys/" + k.id, {method:"DELETE"}); $("key-bind-dialog").close(); });
 });
-$("key-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { const d = await api("keys", {method:"POST",body:{name:$("key-name").value}}); $("key-form").hidden = true; $("created-key").hidden = false; $("new-key-value").textContent = d.key; await refresh(); } catch (err) { $("key-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
+// 重置密钥：轮换 key 值（旧值立即失效），配置与用量历史全保留。与撤销的区别是
+// 可继续用同一枚（kid 不变）——场景是密钥疑似泄露。停用态重置后仍停用。
+$("key-bind-reset").addEventListener("click", e => {
+  e.preventDefault();
+  const k = overview.keys.find(x => x.id === $("key-bind-dialog").dataset.kid); if (!k) return;
+  const paused = !k.enabled ? "\n当前为停用状态，重置后仍为停用，需手动恢复。" : "";
+  confirmAction(`重置「${k.name}」的密钥？`,
+    `将生成新的密钥值，旧值立即失效；限额、权限、用量历史全部保留。新密钥只显示一次，请及时保存。${paused}`,
+    async () => {
+      const d = await api("keys/" + k.id + "/reset", {method:"POST"});
+      $("key-bind-dialog").close();
+      showNewKey(d.key, "KEY RESET", "密钥已重置");
+      await refresh();
+    });
+});
+// 新密钥明文展示（新建与重置共用）：明文只出现这一次，关闭即不可见。
+function showNewKey(value, eyebrow, title) {
+  const dlg = $("key-dialog");
+  $("created-key").querySelector(".eyebrow").textContent = eyebrow;
+  $("created-key").querySelector("h2").textContent = title;
+  $("new-key-value").textContent = value;
+  $("key-form").hidden = true;
+  $("created-key").hidden = false;
+  dlg.showModal();
+}
+$("key-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; try { const d = await api("keys", {method:"POST",body:{name:$("key-name").value}}); showNewKey(d.key, "KEY CREATED", "保存你的新密钥"); await refresh(); } catch (err) { $("key-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 async function copy(value) { try { await navigator.clipboard.writeText(value); toast("已复制"); } catch { toast("无法自动复制，请手动选择文本复制"); } }
 $("copy-key").addEventListener("click", () => copy($("new-key-value").textContent));
 document.querySelectorAll("[data-copy]").forEach(b => b.addEventListener("click", () => copy(b.dataset.copy)));

@@ -162,6 +162,92 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"expires_at": None})).status_code, 200)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 200)
 
+    async def test_key_reset_rotates_value_keeps_config(self):
+        """重置密钥：轮换值、旧值立即失效；kid 与全部配置/用量历史保留。"""
+        await self.login()
+        store = self.app.state.store
+        overview = (await self.client.get("/admin/api/overview")).json()
+        account_id = overview["accounts"][0]["id"]
+        models = [m["id"] for m in overview["models"]["models"] if m["enabled"]][:2]
+        created = await self.client.post("/admin/api/keys", json={"name": "重置测试", "daily_limit": 5})
+        self.assertEqual(created.status_code, 200)
+        kid, value = created.json()["id"], created.json()["key"]
+        # 配置全套：限额/路由/有效期/模型与账号白名单。
+        expires = int(time.time()) + 86400
+        result = await self.client.patch("/admin/api/keys/" + kid, json={
+            "routing": "expiry_first", "expires_at": expires,
+            "models": models, "accounts": [account_id]})
+        self.assertEqual(result.status_code, 200, result.text)
+        # 留用量历史（直接记一次）与 last_used_at（打一个真实请求）。
+        store.record_key_usage(kid, tokens=42)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 200)
+
+        async def snapshot():
+            return next(k for k in (await self.client.get("/admin/api/overview")).json()["keys"] if k["id"] == kid)
+
+        before = await snapshot()
+        self.assertEqual(before["daily_limit"], 5)
+        self.assertEqual(before["routing"], "expiry_first")
+        self.assertEqual(before["expires_at"], expires)
+        self.assertEqual(before["models"], models)
+        self.assertEqual(before["accounts"], [account_id])
+        self.assertEqual(before["usage"]["count"], 1)
+        self.assertEqual(before["usage"]["tokens"], 42)
+        self.assertIsNotNone(before["last_used_at"])
+
+        # 重置：旧值立即失效、新值可用、kid 不变。
+        reset = await self.client.post("/admin/api/keys/" + kid + "/reset")
+        self.assertEqual(reset.status_code, 200, reset.text)
+        newkey = reset.json()["key"]
+        self.assertEqual(reset.json()["id"], kid)
+        self.assertNotEqual(newkey, value)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value})).status_code, 401)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + newkey})).status_code, 200)
+
+        # 除值本身外一切保留；hint 跟着换（前端靠它认「哪一枚」）。
+        after = await snapshot()
+        for field in ("daily_limit", "routing", "expires_at", "models", "accounts", "usage", "last_used_at"):
+            self.assertEqual(after[field], before[field], f"{field} 应在重置后保留")
+        self.assertNotEqual(after["hint"], before["hint"])
+        self.assertEqual(after["hint"], newkey[:5] + "…" + newkey[-4:])
+
+        # 停用态保留：重置后仍停用（新值也 401），手动启用才恢复。
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"enabled": False})).status_code, 200)
+        reset2 = await self.client.post("/admin/api/keys/" + kid + "/reset")
+        self.assertEqual(reset2.status_code, 200)
+        newkey2 = reset2.json()["key"]
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + newkey2})).status_code, 401)
+        self.assertEqual((await self.client.patch("/admin/api/keys/" + kid, json={"enabled": True})).status_code, 200)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + newkey2})).status_code, 200)
+
+        # 已撤销的密钥不可重置（撤销不可逆）；不存在的 kid 报 404。
+        self.assertEqual((await self.client.delete("/admin/api/keys/" + kid)).status_code, 200)
+        denied = await self.client.post("/admin/api/keys/" + kid + "/reset")
+        self.assertEqual(denied.status_code, 400)
+        self.assertIn("撤销", denied.json()["detail"])
+        self.assertEqual((await self.client.post("/admin/api/keys/deadbeef/reset")).status_code, 404)
+
+        # 完整密钥明文不得出现在持久层中。主库和 -wal 都要查：
+        # WAL 模式下未 checkpoint 的帧只在 -wal 里。
+        # 重启保留另取一枚未撤销的密钥（上面那枚已撤销，重启后必然 401）。
+        created2 = await self.client.post("/admin/api/keys", json={"name": "重启保留"})
+        self.assertEqual(created2.status_code, 200)
+        value3 = created2.json()["key"]
+        reset3 = await self.client.post("/admin/api/keys/" + created2.json()["id"] + "/reset")
+        newkey3 = reset3.json()["key"]
+        path = store.db.path
+        for suffix in ("", "-wal"):
+            blob = path.with_name(path.name + suffix).read_bytes()
+            for leak in (newkey, newkey2, newkey3):
+                self.assertNotIn(leak.encode(), blob, f"明文密钥泄漏到 {suffix or '主库'}")
+
+        # 重置结果跨重启保留（路由内已同步 save）；撤销态同样跨重启保留。
+        await self.client.aclose()
+        self.make_app()
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + newkey3})).status_code, 200)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + value3})).status_code, 401)
+        self.assertEqual((await self.client.get("/v1/models", headers={"Authorization": "Bearer " + newkey2})).status_code, 401)
+
     async def test_key_scope_models_and_accounts(self):
         """密钥的模型/账号白名单：可写入、可读回、空白名单表示不限制。"""
         await self.login()
