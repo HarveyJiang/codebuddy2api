@@ -97,10 +97,12 @@ check("JS 已无 as-checkin 监听", /\$\("as-checkin"\)/.test(src), false);
 check("JS 已无 as-toggle 监听", /\$\("as-toggle"\)/.test(src), false);
 
 // ---- 5. 详情弹框是只读的：里面不该有写操作按钮 ----
+// 底部「关闭」已取消（用户 2026-10-17：标题栏的 × 是钉住的，不随滚动跑，
+// 底部再放一个纯关闭按钮是冗余）—— 现在整个弹框只剩标题栏一个关闭钮。
 const detailDialog = /<dialog id="account-detail-dialog">[\s\S]*?<\/dialog>/.exec(html);
 check("详情弹框存在且可抽取", detailDialog !== null, true);
-check("详情弹框里没有写操作入口（只有关闭）",
-      detailDialog ? (detailDialog[0].match(/<button/g) || []).length : -1, 2);
+check("详情弹框只有标题栏一个关闭钮（底部关闭已取消）",
+      detailDialog ? (detailDialog[0].match(/<button/g) || []).length : -1, 1);
 
 // ---- 6. 详情弹框重设计为卡片式（用户 2026-10-17：原生 dl 两列太素）----
 // 结构：头部身份区（图标+徽标）→ 三张指标卡 → 四张分组字段卡 → 错误条带。
@@ -124,8 +126,11 @@ check("CSS 指标卡窄屏单列", /\.detail-metrics\{grid-template-columns:1fr\
 // ---- 7. 弹框公共外壳（用户 2026-10-17：关闭按钮随内容滚动跑掉）----
 // 所有弹框共用同一套结构：.dialog-heading（固定标题栏 + 关闭钮）
 //   → .dialog-body（唯一滚动区）→ .dialog-footer（固定底部操作栏）。
-// 旧的「整框 padding + 负边距 sticky」方案在移动端（padding 变 22px）会算错
-// 偏移，按钮跟着滚——所以 dialog 本体 padding 归零，内边距由三段各自承担。
+// 只读弹框例外（用户 2026-10-17 拍板）：底部栏如果只剩一个「关闭」就是
+// 冗余 —— 标题栏的 × 已经钉住不随滚动跑，所以这 5 个弹框直接不要 footer。
+// 其余 6 个有真正操作（保存/创建/确认/撤销/删除）的照旧三段齐全。
+const READONLY_DIALOGS = new Set(["model-debug-dialog", "key-requests-dialog",
+  "account-detail-dialog", "usage-history-dialog", "account-logs-dialog"]);
 const dialogs = [...html.matchAll(/<dialog id="([a-z-]+)">/g)].map(m => m[1]);
 check("共 11 个弹框", dialogs.length, 11);
 for (const d of dialogs) {
@@ -133,9 +138,15 @@ for (const d of dialogs) {
   check(`${d} 有公共标题栏`, /class="dialog-heading"/.test(seg), true);
   check(`${d} 标题栏有关闭按钮`, /close-dialog" aria-label="关闭"/.test(seg), true);
   check(`${d} 有滚动主体`, /class="dialog-body"/.test(seg), true);
-  check(`${d} 有固定底部栏`, /class="dialog-footer/.test(seg), true);
   check(`${d} 不再用旧 dialog-actions`, /class="dialog-actions/.test(seg), false);
   check(`${d} form 标签配对`, seg.split("<form").length - 1, seg.split("</form>").length - 1);
+  if (READONLY_DIALOGS.has(d)) {
+    // 只读弹框：底部整栏取消，且底部不该再有任何 close-dialog 按钮。
+    check(`${d} 只读弹框已取消底部栏`, /class="dialog-footer/.test(seg), false);
+    check(`${d} 底部不再有关闭按钮`, /dialog-footer[\s\S]*close-dialog/.test(seg), false);
+  } else {
+    check(`${d} 有固定底部操作栏`, /class="dialog-footer/.test(seg), true);
+  }
 }
 // CSS：dialog 本体零内边距 + flex column，三段各自 padding。
 check("CSS dialog 本体零内边距", /dialog\{[^}]*padding:0/.test(css), true);
@@ -149,6 +160,29 @@ check("CSS 旧负边距技巧已移除", /[^{}\n]*margin:-29px/.test(css.replace
 // key-dialog 是双面板（表单 / 明文展示），footer 也要跟着切，否则两组按钮同屏。
 check("key-dialog 有独立 footer", /id="created-key-footer"/.test(html), true);
 check("JS 切面板时同步 footer", /\$\("created-key-footer"\)\.hidden = false/.test(src) && /\$\("created-key-footer"\)\.hidden = true/.test(src), true);
+
+// ---- 7b. 全站按钮风格统一（用户 2026-10-17：撤销像纯文本、一处裸文字一处带样式）----
+// 三件事：.danger 收敛为一个红字白底细边定义；表格行尾/备份行共用小号规格
+// .btn-ghost；底部纯「关闭」按钮全取消（只读弹框连 footer 一起删）。
+check("CSS .danger 只有一处定义（白底细边红字）",
+      (css.match(/(?:^|[,{}\n])\s*\.danger\s*\{/g) || []).length, 1);
+check("CSS .danger 是白底细边红字",
+      /\.danger\{[^}]*color:#a46762[^}]*background:#fff[^}]*border:1px solid #e6cfcb/.test(css), true);
+check("CSS .danger 不再有 background:none 的裸文字版",
+      /\.danger\{[^}]*background:none/.test(css), false);
+check("CSS 行尾特例已删（models/backup/settings-footer）",
+      /#models-body \.danger|#backup-body \.danger|\.account-settings-footer button\.danger/.test(css), false);
+check("CSS 有统一小号按钮规格 .btn-ghost", /\.btn-ghost\{/.test(css), true);
+check("CSS .btn-ghost 是白底细边", /\.btn-ghost\{[^}]*background:#fff[^}]*border:1px solid var\(--line\)/.test(css), true);
+check("CSS 旧的 .actions button 裸文字规格已删", /\.actions button\{/.test(css), false);
+check("密钥表行尾按钮用 .btn-ghost",
+      /class="btn-ghost" data-bind=/.test(src) && /class="btn-ghost" data-requests=/.test(src), true);
+check("账号池设置按钮用 .btn-ghost", /class="btn-ghost" data-action="settings"/.test(src), true);
+check("备份行按钮用 .btn-ghost", /class="btn-ghost" data-backup-download=/.test(src) && /class="btn-ghost danger" data-backup-delete=/.test(src), true);
+check("模型删除按钮用 .btn-ghost danger", /class="btn-ghost danger model-del"/.test(src), true);
+check("弹框 footer 里已无裸「取消」按钮（标题栏 × 即取消）",
+      /close-dialog">取消</.test(html), false);
+check("弹框 footer 里已无裸「关闭」按钮", /close-dialog">关闭</.test(html), false);
 
 console.log(bad ? `\n${bad} 项不符` : "\n=== 概览内联账号表（需求 6）全部通过 ===");
 process.exit(bad ? 1 : 0);

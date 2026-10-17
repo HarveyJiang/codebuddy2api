@@ -160,11 +160,13 @@ function render() {
     const scope = (list, noun, kid, kind) => (Array.isArray(list) && list.length)
       ? `<button class="pill amber scope-pill" data-scope="${esc(kind)}" data-scope-kid="${esc(kid)}" title="点击勾选可用${noun}">${list.length} 个${noun}</button>`
       : `<button class="scope-pill scope-all" data-scope="${esc(kind)}" data-scope-kid="${esc(kid)}" title="当前不限制，点击勾选可用${noun}">全部</button>`;
+    // 行尾操作统一小号按钮规格 .btn-ghost（用户 2026-10-17：全站按钮风格统一，
+    // 表格行尾、账号池、备份行共用一套小号白底细边按钮）。
     // 操作收敛（用户 2026-10-16）：停用/撤销/限额都进「设置」弹框 —— 撤销与
     // 停用语义上不同（撤销不可逆、停用可恢复），但都是低频操作，占表格按钮位
     // 冗余；表格只留「设置」「请求」两个高频入口。
-    const actions = `<td class="align-right"><div class="actions">${revoked ? `<button data-requests="${k.id}">请求</button>`
-      : `<button data-bind="${k.id}" title="可用模型、可用账号、分配策略、限额与有效期">设置</button><button data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button>`}</div></td>`;
+    const actions = `<td class="align-right"><div class="actions">${revoked ? `<button class="btn-ghost" data-requests="${k.id}">请求</button>`
+      : `<button class="btn-ghost" data-bind="${k.id}" title="可用模型、可用账号、分配策略、限额与有效期">设置</button><button class="btn-ghost" data-requests="${k.id}" title="查看该密钥最近的请求记录">请求</button>`}</div></td>`;
     return `<tr><td><strong>${esc(k.name)}</strong>${k.expires_at ? `<small class="cell-note">${expired ? "已于" : "至"} ${esc(stamp(k.expires_at * 1000))} ${esc(expired ? "过期" : "到期")}</small>` : ""}</td><td><code>${esc(k.hint)}</code><small class="cell-note">最后使用：${k.last_used_at ? esc(stamp(k.last_used_at * 1000)) : "从未"}</small></td><td class="usage-cell" data-usage="${k.id}" title="点击查看近 30 天趋势"><span class="pill ${warn}">${u.count || 0}${limited ? ` / ${k.daily_limit}` : ""}</span>${warn ? `<small class="cell-note">${ratio >= 1 ? "已达上限，新请求返回 429" : "接近每日上限"}</small>` : `<small class="cell-note">${u.tokens ? fmtTokens(u.tokens) + " tokens · " : ""}${esc(u.date || "")}</small>`}</td><td>${scope(k.models, "模型", k.id, "models")}</td><td>${scope(k.accounts, "账号", k.id, "accounts")}</td><td>${revoked ? "—" : `<button class="routing-chip" data-routing-edit="${k.id}" title="该密钥的账号分配策略，点击修改">${routingIcon(routing)} ${routingShort(routing)}${routing ? "" : `<span class="muted">（${esc(routingShort(overview.pool?.default_routing || "round_robin"))}）</span>`}</button>`}</td><td><span class="pill ${state[1]}">${state[0]}</span></td>${actions}</tr>`;
   }).join("");
   paintKeysSort();
@@ -449,7 +451,7 @@ function renderModelRow(m) {
   // 只有自定义模型有。非自定义的行不渲染按钮（不是隐藏）—— 操作列不存在了，
   // 「没有按钮」与「不能删」是同一件事。
   const del = m.custom
-    ? `<button class="danger model-del" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"`
+    ? `<button class="btn-ghost danger model-del" data-model-delete="${esc(m.id)}" data-model-backend="${esc(m.backend || "")}"`
       + ` title="删除自定义模型「${esc(m.id)}」">删除</button>`
     : "";
   // 复选框（用户 2026-10-16 拍板）：批量操作改为只作用于**勾选的行**，
@@ -594,7 +596,7 @@ function renderAccounts() {
     // data-account + 可点击样式：点行开详情（需求 6），点行内按钮不弹框。
     // 操作列（用户 2026-10-16：按钮太多看着乱）→ 一个「设置」按钮。
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
-    const actions = `<td><button class="secondary account-settings-btn" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 请求日志 / 删除">⚙ 设置</button></td>`;
+    const actions = `<td><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 请求日志 / 删除">⚙ 设置</button></td>`;
     return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(a.name)}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
@@ -755,7 +757,7 @@ async function loadBackups() {
   $("backup-badge").textContent = data.count;
   $("backup-dir-note").textContent = `保存在服务器 ${data.dir}，可按需下载到本地。`;
   $("backup-empty").hidden = data.count > 0;
-  $("backup-body").innerHTML = data.items.map(b => `<tr><td><code>${esc(b.name)}</code>${b.is_last ? ' <span class="pill green">最近一次</span>' : ""}</td><td class="mono muted">${esc(b.created_text)}</td><td class="muted">${esc(b.age_text)}</td><td class="align-right mono">${esc(b.size_text)}</td><td class="align-right"><button class="secondary" data-backup-download="${esc(b.name)}">下载</button> <button class="secondary" data-backup-restore="${esc(b.name)}">恢复</button> <button class="danger" data-backup-delete="${esc(b.name)}">删除</button></td></tr>`).join("");
+  $("backup-body").innerHTML = data.items.map(b => `<tr><td><code>${esc(b.name)}</code>${b.is_last ? ' <span class="pill green">最近一次</span>' : ""}</td><td class="mono muted">${esc(b.created_text)}</td><td class="muted">${esc(b.age_text)}</td><td class="align-right mono">${esc(b.size_text)}</td><td class="align-right"><button class="btn-ghost" data-backup-download="${esc(b.name)}">下载</button> <button class="btn-ghost" data-backup-restore="${esc(b.name)}">恢复</button> <button class="btn-ghost danger" data-backup-delete="${esc(b.name)}">删除</button></td></tr>`).join("");
 }
 function backupGuard(button, fn) {
   return async () => {
