@@ -83,6 +83,43 @@ class MetricsTests(unittest.IsolatedAsyncioTestCase):
         await MetricsMiddleware(app,metrics)({'type':'http','method':'POST','path':'/v1/messages'},receive,send)
         s=metrics.snapshot();self.assertEqual(s['failed'],1);self.assertEqual(finished[0],'interrupted')
 
+    async def test_token_detail_lands_in_request_log(self):
+        # 用户 2026-10-19：请求日志要带 token 明细。PoolMiddleware 把归一化后的
+        # tokens_detail 挂在 scope 上，metrics 层原样透传进 queue_request_log。
+        from admin.pool import REQUEST_LOG_CONTEXT
+        queued=[]
+        class FakeStore:
+            def queue_request_log(self, row): queued.append(row)
+        metrics=RequestMetrics()
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'{}','more_body':False})
+        async def receive():return {'type':'http.request','body':b''}
+        async def send(m):pass
+        scope={'type':'http','method':'POST','path':'/v1/messages',
+               REQUEST_LOG_CONTEXT:{'tokens_detail':{'in':100,'out':20,'cache_read':5,'cache_creation':1}}}
+        await MetricsMiddleware(app,metrics,'api',store=FakeStore())(scope,receive,send)
+        self.assertEqual((queued[0]['tokens_in'],queued[0]['tokens_out'],
+                          queued[0]['tokens_cache_read'],queued[0]['tokens_cache_creation']),
+                         (100,20,5,1))
+
+    async def test_missing_token_detail_is_none(self):
+        # 不经过池的路径（管理页测试等）没有 tokens_detail：四项落 None，不猜 0。
+        from admin.pool import REQUEST_LOG_CONTEXT
+        queued=[]
+        class FakeStore:
+            def queue_request_log(self, row): queued.append(row)
+        metrics=RequestMetrics()
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'{}','more_body':False})
+        async def receive():return {'type':'http.request','body':b''}
+        async def send(m):pass
+        scope={'type':'http','method':'POST','path':'/v1/messages',REQUEST_LOG_CONTEXT:{}}
+        await MetricsMiddleware(app,metrics,'api',store=FakeStore())(scope,receive,send)
+        for k in ('tokens_in','tokens_out','tokens_cache_read','tokens_cache_creation'):
+            self.assertIsNone(queued[0][k])
+
 
 if __name__=='__main__':unittest.main()
 

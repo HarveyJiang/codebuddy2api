@@ -463,6 +463,35 @@ class DatabaseTests(unittest.TestCase):
                          str(SCHEMA_VERSION))
         db.close()
 
+    def test_v18_migration_adds_token_columns(self):
+        # v19 迁移：request_logs 补 4 个 token 列；存量行为 NULL，新行可写入读回。
+        path = self.root / "legacy.db"
+        legacy = Database(path)
+        legacy._write.execute("UPDATE schema_meta SET value='18' WHERE key='version'")
+        legacy.append_request_logs([
+            {"time": NOW, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1},
+        ])
+        legacy.close()
+        db = Database(path)  # 重开触发迁移
+        cols = {r[1] for r in db.query("PRAGMA table_info(request_logs)")}
+        for c in ("tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_creation"):
+            self.assertIn(c, cols)
+        # 迁移只加列不回填：存量行四项都是 NULL。
+        self.assertIsNone(db.recent_request_logs(1)[0]["tokens_in"])
+        # 新行带 token 明细：写入并读回。
+        db.append_request_logs([
+            {"time": NOW + 1, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1,
+             "tokens_in": 1200, "tokens_out": 340,
+             "tokens_cache_read": 8000, "tokens_cache_creation": 200},
+        ])
+        row = db.recent_request_logs(1)[0]
+        self.assertEqual((row["tokens_in"], row["tokens_out"],
+                          row["tokens_cache_read"], row["tokens_cache_creation"]),
+                         (1200, 340, 8000, 200))
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                         str(SCHEMA_VERSION))
+        db.close()
+
     def test_request_log_stats_total_and_grouping(self):
         db = Database(self.root / "t.db")
         day = 86400

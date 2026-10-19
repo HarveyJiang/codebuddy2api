@@ -438,6 +438,29 @@ def _v16_to_v17(db):
         db._write.execute("ALTER TABLE accounts ADD COLUMN checkin_fails_date TEXT")
 
 
+def _v18_to_v19(db):
+    """v18 → v19：request_logs 补四项 token 用量（输入/输出/缓存读/缓存写）。
+
+    ## 为什么
+
+    用户 2026-10-19 要求请求日志能看每次请求的 token 明细。上游每次响应都带
+    usage 对象（OpenAI 风格 prompt_tokens/completion_tokens + cache_*；Anthropic
+    风格 input_tokens/output_tokens + 同 cache 字段），系统已在转发时抓到
+    （pool.py `_track_usage`），只是没落库。
+
+    ## 做法
+
+    四个 INTEGER 列，缺省 NULL（上游不返回 usage 或请求失败后拿不到时就是空）。
+    sqlite 动态类型：列声明 INTEGER，写 NULL 即可；绝不放字符串（参考 error_code
+    被写成字符串的教训）。列名直接进 LOG_COLUMNS，append/recent/page 三个读函数
+    都按 LOG_COLUMNS 取，自动生效。
+    """
+    existing = {row[1] for row in db._write.execute("PRAGMA table_info(request_logs)")}
+    for column in ("tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_creation"):
+        if column not in existing:
+            db._write.execute(f"ALTER TABLE request_logs ADD COLUMN {column} INTEGER")
+
+
 def _v17_to_v18(db):
     """v17 → v18：request_logs.account_name 按 account_id 对齐 accounts.name。
 
@@ -466,7 +489,7 @@ def _v17_to_v18(db):
         "WHERE account_id IN (SELECT id FROM accounts)")
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 MICRO = 1_000_000
@@ -516,6 +539,7 @@ MODEL_COLUMNS = (
 LOG_COLUMNS = (
     "time", "source", "path", "status", "outcome", "duration_ms", "key_id", "account_id",
     "account_name", "model_id", "model_name", "upstream_request_id", "backend",
+    "tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_creation",
 )
 
 REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
@@ -698,7 +722,9 @@ class Database:
             status INTEGER, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL,
             key_id TEXT, account_id TEXT, account_name TEXT,
             model_id TEXT, model_name TEXT, upstream_request_id TEXT,
-            backend TEXT)""",
+            backend TEXT,
+            tokens_in INTEGER, tokens_out INTEGER,
+            tokens_cache_read INTEGER, tokens_cache_creation INTEGER)""",
         """CREATE TABLE IF NOT EXISTS upstream_request_usage (
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
@@ -863,7 +889,8 @@ class Database:
     MIGRATIONS = ((3, _v2_to_v3), (4, _v3_to_v4), (5, _v4_to_v5), (6, _v5_to_v6), (7, _v6_to_v7),
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
-                  (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18))
+                  (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
+                  (19, _v18_to_v19))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")

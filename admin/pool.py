@@ -166,6 +166,34 @@ def _credits_of(usage):
     return 0.0
 
 
+def _tokens_of(usage):
+    """从 usage 里归一化出四项 token 用量；取不到的项返回 None。
+
+    上游字段名两套：OpenAI 风 prompt_tokens/completion_tokens；Anthropic 风
+    input_tokens/output_tokens；缓存两者都叫 cache_read_input_tokens /
+    cache_creation_input_tokens。各取一个、试不到则 None——没拿到的项就是空，
+    不猜 0（0 和「没返回」语义不同）。
+    """
+    if not isinstance(usage, dict):
+        return {"in": None, "out": None, "cache_read": None, "cache_creation": None}
+
+    def first(*names):
+        for n in names:
+            if n in usage:
+                try:
+                    v = int(usage[n])
+                    return v if v >= 0 else None
+                except (TypeError, ValueError):
+                    return None
+        return None
+    return {
+        "in": first("prompt_tokens", "input_tokens"),
+        "out": first("completion_tokens", "output_tokens"),
+        "cache_read": first("cache_read_input_tokens"),
+        "cache_creation": first("cache_creation_input_tokens"),
+    }
+
+
 def _hint_summary(text, limit=60):
     """把上游错误文案压成一行可读摘要；没有可用的内容时返回 None。
 
@@ -1562,7 +1590,8 @@ class PoolMiddleware:
                        # 记实际发生的事实才能用于事后排查。
                        "backend": self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend()),
                        "model_id": model_name, "model_name": model_name,
-                       "error_code": None}
+                       "error_code": None,
+                       "tokens_detail": None}
         # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
         scope[REQUEST_LOG_CONTEXT] = log_context
         pool_cfg = self.pool.store.data.get("pool", {})
@@ -1626,10 +1655,12 @@ class PoolMiddleware:
                 log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
                 log_context["model_id"] = attempt_model
                 log_context["model_name"] = attempt_model
+                log_context["tokens_detail"] = outcome.get("tokens_detail")
             # 每次尝试都要用新的 receive 闭包与新的 attempt_body（换模型时 body 变了）。
             attempt_receive = _replay_receive(attempt_body, receive)
             outcome = await self._attempt(scope, attempt_receive, send, manager)
             if outcome["kind"] == "done":
+                log_context["tokens_detail"] = outcome.get("tokens_detail")
                 # 已放行并完整结束：记录本次生效的账号与用量，收工。
                 self.pool.record(aid, outcome["status"],
                                  hint_text=outcome.get("error_text"),
@@ -1847,8 +1878,10 @@ class PoolMiddleware:
         # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
         # 采信上游明示的恢复时刻（见 admin/reset_at.py）。error_code 供 WAF
         # 判定（见 admin/rotation.py）。
+        detail = _tokens_of(state.get("usage"))
         return {"kind": "done", "status": state["status"], "tokens": state["tokens"],
                 "usage": state.get("usage"),
+                "tokens_detail": detail,
                 "error_text": " ".join(err_texts) or None,
                 "error_code": state.get("error_code"),
                 "error_headers": state["headers"]}
@@ -1950,6 +1983,9 @@ class PoolMiddleware:
             await self.app(scope, receive, observe)
         finally:
             REQUEST_CREDENTIAL.reset(token)
+            # token 明细（用户 2026-10-19）：原路径也用最后一次完整 usage 归一化，
+            # 让关闭排队切换时请求日志同样有输入/输出/缓存 token。
+            log_context["tokens_detail"] = _tokens_of(nonlocal_last_usage[0])
             self.pool.record(aid, status,
                              hint_text=" ".join(err_texts) or None,
                              hint_headers=resp_headers,

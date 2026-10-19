@@ -160,4 +160,11 @@ class MetricsMiddleware:
             # 走哪条链路（trae / workbuddy）。context 由 PoolMiddleware 填；
             # 管理页测试等不经过池的路径没有该键，留 NULL 由前端显示「—」。
             "backend": context.get("backend"),
+            # token 明细（用户 2026-10-19 要求）：从 PoolMiddleware 透传的 tokens_detail
+            # 拿归一化后的四项；拿不到（上游不返回 usage / 请求失败）则为 None，
+            # 落 INTEGER 列即 NULL。不在 metrics 层猜 0。
+            "tokens_in": (context.get("tokens_detail") or {}).get("in"),
+            "tokens_out": (context.get("tokens_detail") or {}).get("out"),
+            "tokens_cache_read": (context.get("tokens_detail") or {}).get("cache_read"),
+            "tokens_cache_creation": (context.get("tokens_detail") or {}).get("cache_creation"),
         })

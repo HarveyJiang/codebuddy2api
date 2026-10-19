@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from core import converter
 from admin.db import Database
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, _replay_receive, summarize_packages, request_affinity, CN
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, _replay_receive, summarize_packages, request_affinity, CN, _tokens_of
 from conftest import credential  # 跨模块共用 helper，见 tests/conftest.py
 from conftest import recorded_no_sleep as _recorded_no_sleep
 
@@ -898,6 +898,37 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], 429)
         self.assertEqual(row["outcome"], "stream_error")
 
+    async def test_request_log_records_token_detail(self):
+        """用户 2026-10-19：请求日志要带输入/输出/缓存 token。
+
+        默认路径（queue_failover 关）走 _serve_once，它自己解析 SSE 里的 usage；
+        这里跑全链路，确认归一化后的四项 token 真的落进 request_logs。
+        """
+        from admin.metrics import MetricsMiddleware, RequestMetrics
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body',
+                        'body': (b'event: response.completed\ndata: {"type":"response.completed",'
+                                 b'"response":{"status":"completed","usage":{"input_tokens":1200,'
+                                 b'"output_tokens":340,"cache_read_input_tokens":8000,'
+                                 b'"cache_creation_input_tokens":200}}}\n\n'),
+                        'more_body': False})
+
+        inner = PoolMiddleware(app, self.pool)
+        stack = MetricsMiddleware(inner, RequestMetrics(), source="api", store=self.store)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack), base_url='http://test') as client:
+            await client.post('/v1/responses', json={'input': 'x'},
+                              headers={'Authorization': 'Bearer api-test'})
+        self.store.save()
+        row = self.store.db.recent_request_logs(1)[0]
+        self.assertEqual(row["tokens_in"], 1200)
+        self.assertEqual(row["tokens_out"], 340)
+        self.assertEqual(row["tokens_cache_read"], 8000)
+        self.assertEqual(row["tokens_cache_creation"], 200)
+
     def test_request_log_survives_failed_commit(self):
         """回归：提交失败时缓冲不能丢——否则这批日志永久消失且无提示。"""
         self.store.queue_request_log({"time": int(time.time()), "source": "api",
@@ -1449,5 +1480,43 @@ import pytest  # noqa: E402  (标记需要)
 # 若某条用例其实不属于本文件默认域（例如纯形状断言、只测常量的），
 # 请在该用例上单独加 @pytest.mark.<域>，或在下面改用更准确的一档。
 # ---------------------------------------------------------------------------
+class TokenDetailTests(unittest.TestCase):
+    """`_tokens_of`：把上游两套 usage 字段名归一化成四项 token 用量。
+
+    用户 2026-10-19 要求请求日志能看输入/输出/缓存 token。上游 OpenAI 风与
+    Anthropic 风字段名不同，这里只做**字段名归一化**；拿不到的项必须是 None
+    （「没返回」与「0」语义不同，不能混）。
+    """
+
+    def test_openai_style(self):
+        self.assertEqual(_tokens_of({
+            "prompt_tokens": 1200, "completion_tokens": 340, "total_tokens": 1540,
+            "cache_read_input_tokens": 8000, "cache_creation_input_tokens": 200}),
+            {"in": 1200, "out": 340, "cache_read": 8000, "cache_creation": 200})
+
+    def test_anthropic_style(self):
+        self.assertEqual(_tokens_of({
+            "input_tokens": 12, "output_tokens": 3,
+            "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50}),
+            {"in": 12, "out": 3, "cache_read": 100, "cache_creation": 50})
+
+    def test_missing_fields_are_none_not_zero(self):
+        # 只有输入输出、没有缓存字段：缓存两项 None；不猜 0。
+        self.assertEqual(_tokens_of({"prompt_tokens": 5, "completion_tokens": 1}),
+                         {"in": 5, "out": 1, "cache_read": None, "cache_creation": None})
+
+    def test_no_usage_at_all(self):
+        for empty in (None, {}, "oops", 0):
+            self.assertEqual(_tokens_of(empty),
+                             {"in": None, "out": None, "cache_read": None, "cache_creation": None})
+
+    def test_non_numeric_and_negative_yield_none(self):
+        # 上游字段值异常时返回 None，不抛、也不吞成 0。
+        self.assertEqual(_tokens_of({"prompt_tokens": "abc"})["in"], None)
+        self.assertEqual(_tokens_of({"prompt_tokens": -1})["in"], None)
+        # 字符串数字能转则取（sqlite 动态类型下别写进非 int）。
+        self.assertEqual(_tokens_of({"prompt_tokens": "42"})["in"], 42)
+
+
 pytestmark = [pytest.mark.core, pytest.mark.e2e]
 
