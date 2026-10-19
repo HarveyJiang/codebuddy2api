@@ -492,6 +492,41 @@ class DatabaseTests(unittest.TestCase):
                          str(SCHEMA_VERSION))
         db.close()
 
+    def test_v20_migration_adds_input_trunc_column(self):
+        # v20 迁移：upstream_request_usage 补 input_trunc（用户 2026-10-19 要求
+        # 明细看请求内容）。存量行 NULL，新同步的行才有摘要。
+        path = self.root / "legacy.db"
+        legacy = Database(path)
+        legacy._write.execute("UPDATE schema_meta SET value='19' WHERE key='version'")
+        legacy.save_upstream_usage([
+            {"request_id": "crb-old", "account_id": "a", "credit": 0, "model": "m",
+             "request_time": NOW},
+        ])
+        legacy.close()
+        db = Database(path)  # 重开触发迁移
+        cols = {r[1] for r in db.query("PRAGMA table_info(upstream_request_usage)")}
+        self.assertIn("input_trunc", cols)
+        # 迁移只加列不回填。
+        old = db.page_upstream_usage()["rows"][0]
+        self.assertIsNone(old["input_trunc"])
+        # 新行带摘要：写入并读回；UPSERT 修正 credit 时不动 input_trunc。
+        db.save_upstream_usage([
+            {"request_id": "crb-new", "account_id": "a", "credit": "3.5", "model": "m",
+             "request_time": NOW + 1, "input_trunc": "帮我写个排序"},
+        ])
+        row = {r["request_id"]: r for r in db.page_upstream_usage()["rows"]}["crb-new"]
+        self.assertEqual(row["input_trunc"], "帮我写个排序")
+        db.save_upstream_usage([
+            {"request_id": "crb-new", "account_id": "a", "credit": "9.5", "model": "m",
+             "request_time": NOW + 1},
+        ])
+        fixed = {r["request_id"]: r for r in db.page_upstream_usage()["rows"]}["crb-new"]
+        self.assertAlmostEqual(fixed["credit"], 9.5, places=4)
+        self.assertEqual(fixed["input_trunc"], "帮我写个排序")
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                         str(SCHEMA_VERSION))
+        db.close()
+
     def test_request_log_stats_total_and_grouping(self):
         db = Database(self.root / "t.db")
         day = 86400

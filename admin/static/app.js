@@ -1797,6 +1797,18 @@ function renderUsageGroups(report) {
     + `<td class="align-right mono muted">${g.free} / ${g.paid}</td></tr>`).join("")
     || '<tr><td colspan="4" class="history-empty">该区间没有记录。</td></tr>';
 }
+// 请求内容列（用户 2026-10-19）：上游的 inputTrunc 摘要 + 小字 requestId。
+// 摘要可能很长，表格整体 nowrap，所以这一列用 max-width + 省略号，
+// 悬停完整内容走原生 title；requestId 用等宽小字压在下面，方便拿去对账。
+// 老行（迁移前同步的）没有 input_trunc，显示「—」不误导成「没有内容」。
+const USAGE_INPUT_MAX = 240;
+function usageContent(r) {
+  const raw = r.input_trunc || "";
+  const text = raw.length > USAGE_INPUT_MAX ? raw.slice(0, USAGE_INPUT_MAX) + "…" : raw;
+  const top = raw ? esc(text) : '<span class="muted">—</span>';
+  const rid = r.request_id ? `<small class="cell-note mono">${esc(r.request_id)}</small>` : "";
+  return `<td class="usage-content"${raw ? ` title="${esc(raw)}"` : ""}>${top}${rid}</td>`;
+}
 async function loadUsage(offset, withReport = true) {
   const size = Number($("usage-page-size").value) || 100;
   try {
@@ -1804,9 +1816,9 @@ async function loadUsage(offset, withReport = true) {
     usageOffset = data.offset; usageTotal = data.total;
     $("usage-body").innerHTML = data.rows.map(r => `<tr><td class="mono muted">${esc(stamp(r.request_time * 1000))}</td>`
       + `<td>${esc(r.account_name || r.account_id || "—")}</td><td class="mono">${esc(r.model || "—")}</td>`
-      + `<td>${esc(r.client || "—")}</td><td class="align-right mono">${creditsFmt(r.credit ?? 0)}</td>`
-      + `<td class="muted">${esc(r.agent_purpose || "")}</td></tr>`).join("")
-      || '<tr><td colspan="6" class="history-empty">该区间没有记录。可点击「拉取上游」同步。</td></tr>';
+      + usageContent(r)
+      + `<td class="align-right mono">${creditsFmt(r.credit ?? 0)}</td></tr>`).join("")
+      || '<tr><td colspan="5" class="history-empty">该区间没有记录。可点击「拉取上游」同步。</td></tr>';
     const pages = Math.max(1, Math.ceil(usageTotal / size));
     $("usage-page-info").textContent = usageTotal ? `第 ${Math.floor(data.offset / size) + 1} / ${pages} 页 · 共 ${usageTotal.toLocaleString("zh-CN")} 条` : "暂无记录";
     $("usage-prev").disabled = data.offset <= 0;
@@ -1827,7 +1839,7 @@ async function loadUsage(offset, withReport = true) {
       paintUsageTabs(counts);
     }
   } catch (e) {
-    $("usage-body").innerHTML = `<tr><td colspan="6" class="history-empty">${esc(e.message)}</td></tr>`;
+    $("usage-body").innerHTML = `<tr><td colspan="5" class="history-empty">${esc(e.message)}</td></tr>`;
     // 失败时把分页按钮恢复到可翻页状态：否则会保留上一次的 disabled，
     // 用户可能卡在既不能前进也不能后退的一页里。
     usageTotal = 0; $("usage-page-info").textContent = "加载失败";

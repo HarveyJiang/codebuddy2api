@@ -438,6 +438,31 @@ def _v16_to_v17(db):
         db._write.execute("ALTER TABLE accounts ADD COLUMN checkin_fails_date TEXT")
 
 
+def _v19_to_v20(db):
+    """v19 → v20：upstream_request_usage 补 input_trunc（上游请求内容摘要）。
+
+    ## 为什么
+
+    用户 2026-10-19 要求用量明细能看每次调用「请求了什么」。上游
+    get-user-request-usage 每行本来就回 `inputTrunc`（请求内容摘要），
+    只是 db-redesign 时出于隐私考虑没落库——用户明确要看，那就存。
+
+    ## 取舍
+
+    - **只存 `inputTrunc`，不存 `input`**：inputTrunc 是上游自己截过的摘要
+      （长度有界），input 是完整正文，隐私面差一个量级。
+    - 可空、存量 NULL：93 天窗口内的历史行没有这个字段，只有下次同步
+      到的行才有。UPSERT 的 DO UPDATE 不动 input_trunc——避免一条 pending/0
+      的旧记录把已有内容覆盖成空。
+    - TEXT 列不设长度上限：截多少是上游的事，本地原样存，展示层再截断。
+
+    与 agent_purpose 同属「可能含提示词片段」的自由文本，只做展示。
+    """
+    existing = {row[1] for row in db._write.execute("PRAGMA table_info(upstream_request_usage)")}
+    if "input_trunc" not in existing:
+        db._write.execute("ALTER TABLE upstream_request_usage ADD COLUMN input_trunc TEXT")
+
+
 def _v18_to_v19(db):
     """v18 → v19：request_logs 补四项 token 用量（输入/输出/缓存读/缓存写）。
 
@@ -489,7 +514,7 @@ def _v17_to_v18(db):
         "WHERE account_id IN (SELECT id FROM accounts)")
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 MICRO = 1_000_000
@@ -728,7 +753,8 @@ class Database:
         """CREATE TABLE IF NOT EXISTS upstream_request_usage (
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
-            request_time INTEGER NOT NULL, agent_purpose TEXT)""",
+            request_time INTEGER NOT NULL, agent_purpose TEXT,
+            input_trunc TEXT)""",
         """CREATE TABLE IF NOT EXISTS key_usage_daily (
             key_id TEXT NOT NULL, day TEXT NOT NULL,
             count INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
@@ -890,7 +916,7 @@ class Database:
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
-                  (19, _v18_to_v19))
+                  (19, _v18_to_v19), (20, _v19_to_v20))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -1500,7 +1526,7 @@ class Database:
         """UPSERT：credit 可能不是终值，用 INSERT OR IGNORE 会把首条 pending/0 永久钉死。"""
         rows = [(str(r.get("request_id")), r.get("account_id"), r.get("account_name"),
                  _to_micro(r.get("credit")) or 0, r.get("model"), r.get("client"),
-                 _to_int(r.get("request_time")), r.get("agent_purpose"))
+                 _to_int(r.get("request_time")), r.get("agent_purpose"), r.get("input_trunc"))
                 for r in records if r.get("request_id")]
         if not rows:
             return 0
@@ -1508,8 +1534,8 @@ class Database:
             self._write.executemany(
                 """INSERT INTO upstream_request_usage
                    (request_id, account_id, account_name, credit_micro, model, client,
-                    request_time, agent_purpose)
-                   VALUES (?,?,?,?,?,?,?,?)
+                    request_time, agent_purpose, input_trunc)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(request_id) DO UPDATE SET
                      credit_micro=excluded.credit_micro,
                      account_name=excluded.account_name""",
@@ -1549,8 +1575,9 @@ class Database:
             f"SELECT COUNT(*) AS n FROM upstream_request_usage{where}", params)[0]["n"]
         rows = self.query(
             "SELECT request_id, account_id, account_name, credit_micro, model, client,"
-            f" request_time, agent_purpose FROM upstream_request_usage{where}"
-            " ORDER BY request_time DESC LIMIT ? OFFSET ?", (*params, limit, offset))
+            " request_time, agent_purpose, input_trunc FROM upstream_request_usage"
+            f"{where} ORDER BY request_time DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset))
         result = []
         for row in rows:
             item = {key: row[key] for key in row.keys()}

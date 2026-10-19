@@ -1249,6 +1249,10 @@ class AccountPool:
                 "credit": number(row.get("credit")), "model": row.get("model"),
                 "client": row.get("client"), "request_time": when,
                 "agent_purpose": row.get("agentPurpose"),
+                # 上游截好的请求内容摘要（用户 2026-10-19 要求展示）。只存摘要、
+                # 不存 input 全文——input 是完整正文，隐私面差一个量级。
+                # 可空：上游不给或为空串时落 NULL，前端显示「—」。
+                "input_trunc": row.get("inputTrunc") or None,
             })
         self.store.db.save_upstream_usage(records)
         return len(records)

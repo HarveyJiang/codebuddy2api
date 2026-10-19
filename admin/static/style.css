@@ -83,7 +83,10 @@ dialog::backdrop{background:#11272065;backdrop-filter:blur(3px)}.dialog-heading{
 .account-cell-log{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
 .account-cell-log .backend-icon-svg,.account-cell-log .backend-icon-text{width:15px;height:15px;flex-shrink:0}
 .cell-note.field-error{color:#aa7160}.credit-number{font:16px Consolas,monospace;color:#4a7561}.credit-number.credit-warn{color:#b07a3c}.credit-link{padding:0;border:0;background:none;cursor:pointer;font:inherit;text-align:left}
-.credit-link:hover,.credit-link:focus-visible{text-decoration:underline dotted var(--deep)}
+/* 用量明细「请求内容」列（用户 2026-10-19）：inputTrunc 摘要 + 小字 requestId。
+   表格整体 nowrap，长摘要必须限宽省略，否则把积分列挤出屏外。 */
+.usage-content{max-width:420px;white-space:normal;overflow-wrap:anywhere;font-size:12px;line-height:1.7;color:#41524a}
+.usage-content .cell-note{margin-top:2px;font-size:10px;color:#96a49c;overflow-wrap:anywhere}.credit-link:hover,.credit-link:focus-visible{text-decoration:underline dotted var(--deep)}
 /* 仪表盘「账号总积分」卡片（用户 2026-10-19：整卡可点，进每日积分弹框）*/
 .credit-card{cursor:pointer;transition:background .15s}
 .credit-card:hover{background:#f4f8f2}

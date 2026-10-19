@@ -762,7 +762,9 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             if body["pageNum"] == 1:
                 rows = [{"requestId": "crb-1", "credit": "0", "model": "step-5-preview",
                          "client": "WorkBuddy", "requestTime": "2026-10-14 09:30:00",
-                         "agentPurpose": "chat"},
+                         "agentPurpose": "chat",
+                         "inputTrunc": "帮我把这个函数改成尾递归",
+                         "input": "完整正文（不该落库）"},
                         {"requestId": "crb-2", "credit": "12.5", "model": "hy3",
                          "client": "WorkBuddy", "requestTime": "2026-10-14 10:00:00"}]
                 total = 3   # 总数 3 > 本页 2，必须继续翻页
@@ -786,6 +788,11 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows["crb-1"]["request_time"], expected)
         self.assertEqual(rows["crb-1"]["model"], "step-5-preview")
         self.assertEqual(rows["crb-1"]["agent_purpose"], "chat")
+        # inputTrunc 摘要落库；input 全文不落（隐私）。
+        self.assertEqual(rows["crb-1"]["input_trunc"], "帮我把这个函数改成尾递归")
+        self.assertNotIn("input", rows["crb-1"])
+        # 上游没给 inputTrunc 时落 NULL，不是空串。
+        self.assertIsNone(rows["crb-2"]["input_trunc"])
         self.assertAlmostEqual(rows["crb-2"]["credit"], 12.5, places=4)
         # 同步成功写 usage_synced_at 并清掉旧的错误留痕。
         self.assertEqual(self.store.data["account_status"][self.a]["usage_synced_at"], int(self.now))
