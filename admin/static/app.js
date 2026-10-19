@@ -636,7 +636,7 @@ function renderAccounts() {
     const cooling = a.cooldown_until > Date.now() / 1000;
     const unfreezeBtn = cooling ? `<button class="btn-ghost" data-action="clear-cooldown" data-id="${a.id}" title="提前解除账号冷却，立即重新参与分配">解除冷却</button>` : "";
     const actions = `<td><div class="actions">${unfreezeBtn}<button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><button type="button" class="credit-number credit-link" data-credits="${esc(a.id)}" title="点击查看该账号每天的积分消费">${credits}</button><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -1130,6 +1130,10 @@ function fmtTokens(n) {
 // 判据用 dialog.open，不引进新标记——回调关掉了就说明它接管了后续流程。
 $("confirm-form").addEventListener("submit", async e => { e.preventDefault(); e.submitter.disabled = true; const dialog = $("confirm-dialog"); try { await pendingConfirm(); if (!dialog.open) return; dialog.close(); await refresh(); toast("操作已保存"); } catch (err) { $("confirm-error").textContent = err.message; } finally { e.submitter.disabled = false; } });
 $("accounts-body").addEventListener("click", async e => {
+  // 积分数字 → 每日积分弹框（用户 2026-10-19）。必须排在 data-action 之前：
+  // 账号行整行点击会开详情弹框，不拦这一下就会连带弹出两个框。
+  const credit = e.target.closest("[data-credits]");
+  if (credit) { openCreditDaily(credit.dataset.credits); return; }
   const b = e.target.closest("[data-action]");
   if (!b) {
     // 点行**空白处**打开详情弹框（需求 6）；点操作按钮仍执行操作，不弹框。
@@ -1871,6 +1875,93 @@ document.addEventListener("click", e => {
   loadUsage(0);
 });
 $("usage-filter").addEventListener("submit", e => { e.preventDefault(); loadUsage(0); });
+
+/* ---------- 每日积分消费弹框（用户 2026-10-19）----------
+ * 两个入口：仪表盘「账号总积分」卡片（全站每日）与账号行的积分数字
+ * （该账号每日）。数据与接口全部复用用量明细页那一套：
+ *   GET /admin/api/usage/report?group_by=day&start=<unix>[&account_id=<aid>]
+ * 数据库零改动 —— upstream_request_usage 里已经有按天的全部数据，
+ * account 维度还命中 idx_upstream_account_time 前导列。
+ */
+let creditAccountId = "", creditDays = 30;
+// start 用 unix 秒：_query_time 认秒也认 'YYYY-MM-DD'，但前端统一走秒更省心。
+const creditStart = () => {
+  if (!creditDays) return null;
+  return Math.floor(Date.now() / 1000) - creditDays * 86400;
+};
+function openCreditDaily(accountId) {
+  creditAccountId = accountId || "";
+  const a = creditAccountId ? (overview.accounts || []).find(x => x.id === creditAccountId) : null;
+  $("credit-daily-title").textContent = a ? `账号「${accountLabel(a)}」的每日积分` : "每日积分消费";
+  $("credit-daily-sub").textContent = "上游账单口径 · 北京时间 · 加载中…";
+  $("credit-daily-body").innerHTML = '<tr><td colspan="4" class="history-empty">加载中…</td></tr>';
+  $("credit-daily-total").textContent = "";
+  paintCreditRange();
+  $("credit-daily-dialog").showModal();
+  loadCreditDaily();
+}
+function paintCreditRange() {
+  document.querySelectorAll("[data-credit-range]").forEach(b => {
+    b.setAttribute("aria-pressed", String((Number(b.dataset.creditRange) || 0) === creditDays));
+  });
+}
+async function loadCreditDaily() {
+  const q = new URLSearchParams({group_by: "day"});
+  const start = creditStart();
+  if (start) q.set("start", start);
+  if (creditAccountId) q.set("account_id", creditAccountId);
+  try {
+    const report = await api("usage/report?" + q.toString());
+    renderCreditDaily(report);
+  } catch (e) {
+    $("credit-daily-body").innerHTML = `<tr><td colspan="4" class="history-empty">${esc(e.message)}</td></tr>`;
+    $("credit-daily-sub").textContent = "上游账单口径 · 北京时间";
+  }
+}
+function renderCreditDaily(report) {
+  const groups = report.groups || [];
+  const total = report.total || {};
+  const days = report.bucket_total ?? groups.length;
+  $("credit-daily-sub").textContent =
+    `上游账单口径 · 北京时间 · 共 ${days} 天有记录`;
+  // 行与「用量明细」页的分组报表一致：日期 / 条数 / 积分 / 免费 / 付费。
+  $("credit-daily-body").innerHTML = groups.map(g =>
+    `<tr><td class="mono">${esc(g.bucket)}</td><td class="align-right mono">${g.count}</td>`
+    + `<td class="align-right mono">${creditsFmt(g.credit ?? 0)}</td>`
+    + `<td class="align-right mono muted">${g.free} / ${g.paid}</td></tr>`).join("")
+    || '<tr><td colspan="4" class="history-empty">这段时间没有账单记录。</td></tr>';
+  // 合计取 report.total（服务端同条件全量聚合，不受 500 组上限影响）。
+  $("credit-daily-total").textContent = total.count
+    ? `合计 ${total.count.toLocaleString("zh-CN")} 条 · ${creditsFmt(total.credit ?? 0)} 积分 · 免费 ${total.free ?? 0} / 付费 ${total.paid ?? 0}`
+    : "";
+}
+// 档位切换：只改 start，重新拉一次。全部 = 不传 start。
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-credit-range]");
+  if (!b) return;
+  creditDays = Number(b.dataset.creditRange) || 0;
+  paintCreditRange();
+  loadCreditDaily();
+});
+// 弹框内补算（用户 2026-10-19 拍板要按钮）：复用用量页的 sync，成功后再刷新表格。
+$("credit-daily-sync").addEventListener("click", async () => {
+  const btn = $("credit-daily-sync");
+  btn.disabled = true; const label = btn.textContent; btn.textContent = "拉取中…";
+  try {
+    const r = await api("usage/sync", {method: "POST", body: {
+      start: creditStart(), account_id: creditAccountId || null}});
+    const skipped = (r.skipped || []).length;
+    toast(skipped ? `已同步 ${r.synced} 个账号，跳过 ${skipped} 个（${r.message || "刚拉取过或任务进行中"}）`
+                  : `已同步 ${r.synced} 个账号`);
+    await loadCreditDaily();
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    btn.textContent = label; btn.disabled = false;
+  }
+});
+// 仪表盘总积分卡片 → 全站每日。
+$("dash-credit-card").addEventListener("click", () => openCreditDaily(""));
 
 /* ---------- 单个密钥的请求记录 ---------- */
 let keyReqId = null, keyReqOffset = 0, keyReqSize = 10, keyReqDay = null;

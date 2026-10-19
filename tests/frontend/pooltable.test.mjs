@@ -227,9 +227,13 @@ check("CSS 指标卡窄屏单列", /\.detail-metrics\{grid-template-columns:1fr\
 // 冗余 —— 标题栏的 × 已经钉住不随滚动跑，所以这 5 个弹框直接不要 footer。
 // 其余 6 个有真正操作（保存/创建/确认/撤销/删除）的照旧三段齐全。
 const READONLY_DIALOGS = new Set(["model-debug-dialog", "key-requests-dialog",
-  "account-detail-dialog", "usage-history-dialog", "account-logs-dialog"]);
+  "account-detail-dialog", "usage-history-dialog", "account-logs-dialog",
+  // 每日积分弹框（用户 2026-10-19）：只读表格 + 档位 + 「拉取上游补算」。
+  // 底部不放「关闭」（标题栏 × 已钉住），footer 整栏取消；「拉取上游」是
+  // 一个动作按钮而非关闭按钮，所以仍归只读类。
+  "credit-daily-dialog"]);
 const dialogs = [...html.matchAll(/<dialog id="([a-z-]+)">/g)].map(m => m[1]);
-check("共 11 个弹框", dialogs.length, 11);
+check("共 12 个弹框", dialogs.length, 12);
 for (const d of dialogs) {
   const seg = new RegExp(`<dialog id="${d}">[\\s\\S]*?</dialog>`).exec(html)[0];
   check(`${d} 有公共标题栏`, /class="dialog-heading"/.test(seg), true);
