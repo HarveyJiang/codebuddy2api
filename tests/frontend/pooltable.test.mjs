@@ -136,6 +136,20 @@ check("checkbox/radio 恢复原生外观（appearance:auto）",
 check("复选框规则清掉了 select 的 chevron 背景图",
       /input\[type=checkbox\][^}]*background-image:none/.test(css), true);
 
+// ---- 6.6.1 chevron 只给 select（用户 2026-10-19：密码框与其他文本框不该有下拉符号）----
+const inputRule = /input,textarea\{([^}]*)\}/.exec(css);
+check("input/textarea 基础规则可抽取", inputRule !== null, true);
+check("input/textarea 规则没有 appearance:none（保留原生外观）",
+      /appearance:(\s*)none/.test(inputRule ? inputRule[1] : ""), false);
+check("input/textarea 规则没有自绘 chevron 背景图",
+      /background-image/.test(inputRule ? inputRule[1] : ""), false);
+check("input/textarea 规则仍有边框/圆角/内边距",
+      inputRule ? /border:1px solid/.test(inputRule[1]) && /border-radius:12px/.test(inputRule[1]) : false, true);
+check("全站只有 select 用自绘 chevron（下拉箭头不外泄到输入框）",
+      (css.match(/background-image:url\("data:image\/svg\+xml/g) || []).length === 1, true);
+check("chevron 背景图挂在 select 规则上",
+      /select\{[^}]*background-image:url\("data:image\/svg\+xml/.test(css), true);
+
 // ---- 6.7 设置页卡片标题 inline-flex：q-help 是 h3 兄弟节点，flex 会把它挤下行 ----
 check("settings-card h3 用 inline-flex（问号贴标题不被挤走）",
       /\.settings-card h3\{[^}]*display:inline-flex/.test(css), true);
