@@ -127,8 +127,11 @@ check("日志状态列不再有行内 cell-note 文字",
       /log-status[\s\S]{0,120}cell-note inline/.test(src), false);
 check("日志状态列带 data-tip 气泡（三处：概览/账号日志/密钥明细）",
       (src.match(/pill log-status/g) || []).length >= 3, true);
-check("日志弹框已加宽到 760px（治横向滚动）",
-      /#account-logs-dialog,#key-requests-dialog\{width:min\(760px/.test(css), true);
+// 用户 2026-10-20 再报：token 三列加进来后 760px 仍出横向滚动条，
+// 已加宽到 980px 并同步收紧这两个弹框内的 th/td padding。详细回归断言
+// 见 tests/frontend/logdialog.test.mjs，这里只保留粗粒度兜底。
+check("日志弹框已加宽到 980px（token 三列后仍治横向滚动）",
+      /#account-logs-dialog,#key-requests-dialog\{width:min\(980px/.test(css), true);
 
 // ---- 6.6 复选框救回：select 美化不能把 checkbox/radio 剥成下拉（用户 2026-10-17 报 bug）----
 check("checkbox/radio 恢复原生外观（appearance:auto）",
