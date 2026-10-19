@@ -936,6 +936,69 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["tokens_cache_read"], 8000)
         self.assertEqual(row["tokens_cache_creation"], 200)
 
+    async def test_request_log_records_upstream_request_id_from_sse(self):
+        """用户 2026-10-19：请求日志要能拿到上游返回的 requestId。
+
+        流式：上游每个 SSE chunk 顶层都带同一个 id（crb- 开头），由 _track_usage /
+        _serve_once 取首个非空的，用来和上游账单里的 requestId 逐条对账。
+        """
+        from admin.metrics import MetricsMiddleware, RequestMetrics
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body',
+                        'body': (b'data: {"id":"crb-e1301a5acb6f11f189f2025e276c2765",'
+                                 b'"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n'
+                                 b'data: {"id":"crb-e1301a5acb6f11f189f2025e276c2765",'
+                                 b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+                                 b'"usage":{"prompt_tokens":5,"completion_tokens":1}}\n\n'
+                                 b'data: [DONE]\n\n'),
+                        'more_body': False})
+
+        inner = PoolMiddleware(app, self.pool)
+        stack = MetricsMiddleware(inner, RequestMetrics(), source="api", store=self.store)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack), base_url='http://test') as client:
+            await client.post('/v1/chat/completions',
+                              json={'model': 'm', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                              headers={'Authorization': 'Bearer api-test'})
+        self.store.save()
+        row = self.store.db.recent_request_logs(1)[0]
+        self.assertEqual(row["upstream_request_id"], "crb-e1301a5acb6f11f189f2025e276c2765")
+
+    async def test_request_log_records_upstream_request_id_from_header(self):
+        """非流式：converter 把上游 id 从聚合结果 pop 出、放响应头
+        X-Upstream-Request-Id，pool 从头里取（响应体不带这个字段）。"""
+        from admin.metrics import MetricsMiddleware, RequestMetrics
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'application/json'),
+                                   (b'x-upstream-request-id', b'crb-header-path')]})
+            await send({'type': 'http.response.body',
+                        'body': b'{"id":"chatcmpl-fake","choices":[]}',
+                        'more_body': False})
+
+        inner = PoolMiddleware(app, self.pool)
+        stack = MetricsMiddleware(inner, RequestMetrics(), source="api", store=self.store)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack), base_url='http://test') as client:
+            await client.post('/v1/chat/completions',
+                              json={'model': 'm', 'messages': [{'role': 'user', 'content': 'hi'}],
+                                    'stream': False},
+                              headers={'Authorization': 'Bearer api-test'})
+        self.store.save()
+        row = self.store.db.recent_request_logs(1)[0]
+        self.assertEqual(row["upstream_request_id"], "crb-header-path")
+
+    def test_header_id_matches_case_insensitively(self):
+        """ASGI 头是原始字节，头名可能大写——必须小写比较，不然白取。"""
+        self.assertEqual(PoolMiddleware._header_id([(b'X-Upstream-Request-Id', b'crb-A')]), "crb-A")
+        self.assertEqual(PoolMiddleware._header_id([(b'x-UPSTREAM-request-id', b'crb-B')]), "crb-B")
+        self.assertIsNone(PoolMiddleware._header_id([(b'x-request-id', b'crb-C')]))
+        self.assertIsNone(PoolMiddleware._header_id([]))
+
     def test_request_log_survives_failed_commit(self):
         """回归：提交失败时缓冲不能丢——否则这批日志永久消失且无提示。"""
         self.store.queue_request_log({"time": int(time.time()), "source": "api",

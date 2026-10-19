@@ -156,7 +156,7 @@ class MetricsMiddleware:
             "status": effective, "outcome": outcome, "duration_ms": round(duration),
             "key_id": context.get("key_id"), "account_id": context.get("account_id"),
             "account_name": context.get("account_name"), "model_id": context.get("model_id"),
-            "model_name": context.get("model_name"), "upstream_request_id": None,
+            "model_name": context.get("model_name"), "upstream_request_id": context.get("upstream_request_id"),
             # 走哪条链路（trae / workbuddy）。context 由 PoolMiddleware 填；
             # 管理页测试等不经过池的路径没有该键，留 NULL 由前端显示「—」。
             "backend": context.get("backend"),

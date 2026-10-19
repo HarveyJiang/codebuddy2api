@@ -110,6 +110,25 @@ def test_collect_stream_aggregates_tool_calls_and_usage():
     asyncio.run(run())
 
 
+def test_collect_stream_captures_upstream_request_id():
+    """上游请求 ID（用户 2026-10-19 要求）：每个 chunk 顶层都带同一个 id，
+    取首个非空塞进聚合结果的 upstream_request_id，调用方 pop 走后放响应头。
+    """
+    async def run():
+        result = await converter._collect_stream(converter._aiter_str_lines(SSE_FIXTURE))
+        assert result["upstream_request_id"] == "c1"
+        # 有 id 但都为空串时保持 None（不猜）
+        blank = (
+            b'data: {"id":"","choices":[{"delta":{"content":"hi"}}]}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        assert (await converter._collect_stream(converter._aiter_str_lines(blank)))["upstream_request_id"] is None
+        # 整个流没有 id 字段时也是 None
+        noid = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        assert (await converter._collect_stream(converter._aiter_str_lines(noid)))["upstream_request_id"] is None
+    asyncio.run(run())
+
+
 def test_collect_stream_keep_reasoning():
     stream = (
         b'data: {"choices":[{"delta":{"reasoning_content":"think "}}]}\n\n'

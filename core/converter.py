@@ -868,7 +868,11 @@ async def chat_completions(
             detail=_safe_err_raw(e.body, e.status),
         )
     _log_finish(model_name, t0, collected, rid)
-    return JSONResponse(content=collected)
+    # 上游请求 ID 不进响应体（客户端不需要认识它），改成响应头，
+    # 让本地中间件能记录到 request_logs，用于和上游账单逐条对账。
+    upstream_id = collected.pop("upstream_request_id", None)
+    headers = {"X-Upstream-Request-Id": upstream_id} if upstream_id else None
+    return JSONResponse(content=collected, headers=headers)
 
 def _last_user_text(messages: list) -> str:
     """取最后一条 user 消息的文本，用于日志预览。"""
@@ -969,6 +973,9 @@ async def _collect_stream(lines, *, keep_reasoning: bool = False) -> dict:
     model: str | None = None
     finish_reason: str | None = None
     usage: dict | None = None
+    # 上游的请求 ID（crb-… 开头）。和 usage 一样，只在最后一个 chunk 里出现也没关系，
+    # 因为每个 chunk 的顶层都带同一个 id，取「首个非空」即可。
+    upstream_id: str | None = None
 
     async for line in lines:
         line = line.strip()
@@ -984,6 +991,8 @@ async def _collect_stream(lines, *, keep_reasoning: bool = False) -> dict:
         model = chunk.get("model") or model
         if chunk.get("usage"):
             usage = chunk["usage"]
+        if not upstream_id and chunk.get("id"):
+            upstream_id = chunk["id"]
         for choice in chunk.get("choices") or []:
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
@@ -1032,6 +1041,9 @@ async def _collect_stream(lines, *, keep_reasoning: bool = False) -> dict:
         ],
         "usage": usage
         or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        # 上游请求 ID。塞在响应体里会让客户端多看到一个不认识字段，
+        # 所以调用方（chat_completions）pop 走后放进响应头，由本地中间件记录。
+        "upstream_request_id": upstream_id,
     }
 
 

@@ -543,6 +543,15 @@ function tokenCells(r) {
     + `<td class="align-right mono">${fmtLogToken(r.tokens_out)}</td>`
     + `<td class="align-right mono">${cache}</td>`;
 }
+// 上游请求 ID（用户 2026-10-19 要求）：拿它去和上游账单里的 requestId 逐条对账。
+// 挂在模型名下的小字，不加列——弹框 560px 已经横向溢出（用户 2026-10-17 报过）。
+// 老日志是 NULL（改动前没记），不渲染，不显示「—」占位。
+function upstreamIdCell(r) {
+  const id = r.upstream_request_id || "";
+  if (!id) return "";
+  const short = id.length > 16 ? id.slice(0, 16) + "…" : id;
+  return `<small class="cell-note mono" title="${esc(id)}">${esc(short)}</small>`;
+}
 
 function renderLogRows(rows) {
   // 账号列 = 后端小图标 + 账号名：图标区分是哪个上游（用户 2026-10-17：去掉
@@ -550,7 +559,7 @@ function renderLogRows(rows) {
   const accountCell = r => r.account_name
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}</td><td>${accountCell(r)}</td><td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>${tokenCells(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="9" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td><td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>${tokenCells(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="9" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
   const size = Number($("dash-page-size").value) || 10;
@@ -1245,7 +1254,7 @@ async function loadAccountLogs() {
     $("account-logs-body").innerHTML = data.rows.map(r =>
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td>${esc(keyLabel(r))}</td>`
-      + `<td class="mono">${esc(r.model_id || "—")}</td>`
+      + `<td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td>`
       + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + tokenCells(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
@@ -1995,7 +2004,7 @@ async function loadKeyRequests(offset) {
     // 行结构与 key-requests-dialog 的表头一致：时间/模型/账号/状态/耗时（无密钥列）。
     $("key-requests-body").innerHTML = data.rows.map(r =>
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
-      + `<td class="mono">${esc(r.model_id || "—")}</td>`
+      + `<td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td>`
       + `<td>${r.account_name ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>` : "—"}</td>`
       + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + tokenCells(r)

@@ -1595,7 +1595,10 @@ class PoolMiddleware:
                        "backend": self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend()),
                        "model_id": model_name, "model_name": model_name,
                        "error_code": None,
-                       "tokens_detail": None}
+                       "tokens_detail": None,
+                       # 上游返回的请求 ID（crb-…）。非流式走响应头
+                       # X-Upstream-Request-Id，流式从 SSE 顶层 id 取。
+                       "upstream_request_id": None}
         # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
         scope[REQUEST_LOG_CONTEXT] = log_context
         pool_cfg = self.pool.store.data.get("pool", {})
@@ -1660,11 +1663,15 @@ class PoolMiddleware:
                 log_context["model_id"] = attempt_model
                 log_context["model_name"] = attempt_model
                 log_context["tokens_detail"] = outcome.get("tokens_detail")
+                # 换号/换模型后这一 attempt 才算数：上游请求 ID 跟着覆盖，
+                # 不然日志里会留下上一次 attempt 的 ID。
+                log_context["upstream_request_id"] = outcome.get("upstream_request_id")
             # 每次尝试都要用新的 receive 闭包与新的 attempt_body（换模型时 body 变了）。
             attempt_receive = _replay_receive(attempt_body, receive)
             outcome = await self._attempt(scope, attempt_receive, send, manager)
             if outcome["kind"] == "done":
                 log_context["tokens_detail"] = outcome.get("tokens_detail")
+                log_context["upstream_request_id"] = outcome.get("upstream_request_id")
                 # 已放行并完整结束：记录本次生效的账号与用量，收工。
                 self.pool.record(aid, outcome["status"],
                                  hint_text=outcome.get("error_text"),
@@ -1762,7 +1769,8 @@ class PoolMiddleware:
         """
         hold_ms = max(0, int(self.pool.store.data.get("pool", {}).get("queue_hold_ms", 3000)))
         state = {"status": 200, "headers": [], "held": False, "first_body": None,
-                 "queue": False, "started": False, "tokens": 0}
+                 "queue": False, "started": False, "tokens": 0,
+                 "upstream_request_id": None}
         # 上游错误文案：判定排队之外，冷却时长也要用它（可能写了恢复时刻）。
         err_texts: list[str] = []
         body_ready = asyncio.Event()
@@ -1886,6 +1894,7 @@ class PoolMiddleware:
         return {"kind": "done", "status": state["status"], "tokens": state["tokens"],
                 "usage": state.get("usage"),
                 "tokens_detail": detail,
+                "upstream_request_id": state.get("upstream_request_id"),
                 "error_text": " ".join(err_texts) or None,
                 "error_code": state.get("error_code"),
                 "error_headers": state["headers"]}
@@ -1913,6 +1922,7 @@ class PoolMiddleware:
 
         旧的 observe 只留 total_tokens；实测成本账本还需要 credit，所以这里
         把整个 usage 对象留下最后一份副本（最后一次出现的 usage 才是最终用量）。
+        同时取上游请求 ID：每个 chunk 顶层都带同一个 id，取首个非空即可。
         """
         text = payload.decode("utf-8", "replace")
         for line in text.split("\n"):
@@ -1925,6 +1935,8 @@ class PoolMiddleware:
                 continue
             if not isinstance(obj, dict):
                 continue
+            if not state.get("upstream_request_id") and obj.get("id"):
+                state["upstream_request_id"] = obj["id"]
             usage = obj.get("usage") or (obj.get("response") or {}).get("usage")
             total = usage.get("total_tokens") if isinstance(usage, dict) else None
             if isinstance(total, (int, float)):
@@ -1932,6 +1944,20 @@ class PoolMiddleware:
             # 留最后一份完整 usage：账本要从这里读实测 credit。
             if isinstance(usage, dict):
                 state["usage"] = usage
+
+    @staticmethod
+    def _header_id(headers, name=b"x-upstream-request-id"):
+        """从 ASGI 响应头里取上游请求 ID（非流式路径由转换器放进响应头）。
+
+        头名要小写比较——ASGI 规范要求原始字节形式，大小写随实现而定。
+        """
+        for key, value in headers or []:
+            if bytes(key).lower() == name:
+                try:
+                    return bytes(value).decode("latin-1") or None
+                except Exception:
+                    return None
+        return None
 
     async def _serve_once(self, scope, receive, send, aid, manager, kid, log_context, model=None):
         """开关关闭时的原路径：完全保持改动前的行为。"""
@@ -1941,12 +1967,15 @@ class PoolMiddleware:
         usage_tokens = 0
         # 失败冷却可能要采信上游明示的恢复时刻（见 admin/reset_at.py）。
         resp_headers = []
+        # 上游请求 ID（用户 2026-10-19 要求）：非流式从响应头取，流式从 SSE
+        # 顶层 id 取，两路都拿不到就留 NULL——不猜。
+        upstream_id = None
         err_texts: list[str] = []
         # 最后一次出现的完整 usage：实测成本账本要读 credit。
         nonlocal_last_usage = [None]
 
         def extract_usage(obj):
-            nonlocal usage_tokens
+            nonlocal usage_tokens, upstream_id
             usage = obj.get("usage") if isinstance(obj, dict) else None
             total = usage.get("total_tokens") if isinstance(usage, dict) else None
             if isinstance(total, (int, float)):
@@ -1954,12 +1983,20 @@ class PoolMiddleware:
             if isinstance(usage, dict):
                 # 账本要从这里读实测 credit。
                 nonlocal_last_usage[0] = usage
+            # 每个 chunk 顶层都带同一个 id，取首个非空即定。
+            if not upstream_id and isinstance(obj, dict) and obj.get("id"):
+                upstream_id = obj["id"]
 
         async def observe(message):
-            nonlocal status, buffer
+            nonlocal status, buffer, upstream_id
             if message["type"] == "http.response.start":
                 status = message["status"]
                 resp_headers = message.get("headers", [])
+                # 非流式的上游 id 走响应头（converter 从聚合结果里 pop 出来放这的）。
+                # 先清掉流式路径可能已经取到的值，再从头取：一次请求只有一条路径，
+                # 混着留会串号。upstream_id 必须在 nonlocal 里声明——漏了它就变成
+                # 本闭包的局部变量，finally 读到的永远是 None（实测踩过）。
+                upstream_id = self._header_id(resp_headers) or None
             if message["type"] == "http.response.body":
                 buffer += message.get("body", b"")
                 while b"\n" in buffer:
@@ -1990,6 +2027,7 @@ class PoolMiddleware:
             # token 明细（用户 2026-10-19）：原路径也用最后一次完整 usage 归一化，
             # 让关闭排队切换时请求日志同样有输入/输出/缓存 token。
             log_context["tokens_detail"] = _tokens_of(nonlocal_last_usage[0])
+            log_context["upstream_request_id"] = upstream_id
             self.pool.record(aid, status,
                              hint_text=" ".join(err_texts) or None,
                              hint_headers=resp_headers,
