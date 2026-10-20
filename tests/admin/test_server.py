@@ -457,19 +457,34 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["synced"], 0)
         self.assertTrue(any("刚拉取过" in (x.get("reason") or "") for x in again["skipped"]))
 
-        # Trae 账号不进同步队列：用量对账接口只认默认后端凭据（它的 token 打过去
-        # 必然 401）。生产上曾因无差别入队，Trae 账号每天留一条永远清不掉的
-        # usage_sync_error 留痕（usage_synced_at 从未成功过）。
+        # Trae 账号也进同步队列：现在每个后端各有自己的上游用量接口
+        # （WorkBuddy 打计费域、Trae 打 api.trae.cn 的按 session 聚合），
+        # 由后端自己声明、pool 只读声明 —— 不再是「只有默认后端能对账」。
         store.data["accounts"]["t1"] = {
             "name": "Trae号", "file": "session.info", "enabled": True,
             "created": now, "backend": "trae"}
         called.clear()
         result = await self.client.post("/admin/api/usage/sync", json={
             "start": now - 7200, "end": now})
-        self.assertNotIn("t1", called)
-        # 显式指定 Trae 账号：给出明确原因，而不是「没有可拉取的账号」让人以为选错人。
-        picked = (await self.client.post("/admin/api/usage/sync", json={
-            "start": now - 7200, "end": now, "account_id": "t1"})).json()
+        self.assertIn("t1", called)
+        # 显式指定「没有用量接口的后端」：给出明确原因，而不是「没有可拉取的账号」
+        # 让人以为选错人。后端没有该能力时，给出的是声明，不是名字。
+        import admin.pool as pool_mod
+        real_spec_for = pool_mod.spec_for
+
+        def spec_without_usage(name):
+            spec = real_spec_for(name)
+            if getattr(spec, "supports_upstream_usage", False):
+                class _NoUsage:
+                    supports_upstream_usage = False
+                return _NoUsage()
+            return spec
+        pool_mod.spec_for = spec_without_usage
+        try:
+            picked = (await self.client.post("/admin/api/usage/sync", json={
+                "start": now - 7200, "end": now, "account_id": "t1"})).json()
+        finally:
+            pool_mod.spec_for = real_spec_for
         self.assertEqual(picked["message"], "该后端没有上游用量对账接口")
 
     async def test_key_usage_history_endpoint(self):

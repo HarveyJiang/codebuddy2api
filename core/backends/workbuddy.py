@@ -10,9 +10,20 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import httpx
 
-from .base import BackendHTTPError, BackendSpec
+from .base import BackendHTTPError, BackendSpec, BackendUsageError
+
+#: 北京时间（上游 requestTime 是北京时间且无时区标记）。
+CN = timezone(timedelta(hours=8))
+
+#: 上游用量明细接口在另一个域、且没有 /v2 前缀，不能复用积分/签到的那个域。
+#: 注意参数名是驼峰 pageNum/pageSize（与同域 get-user-resource 的 PageNumber/PageSize 不同）。
+USAGE_BILLING = "https://www.workbuddy.cn/billing/meter/"
+USAGE_PAGE_SIZE = 100
+USAGE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def _site_headers(headers: dict) -> dict:
@@ -38,6 +49,69 @@ def _site_headers(headers: dict) -> dict:
     out["Referer"] = f"{origin}/"
     out["Accept-Language"] = "en-US" if domain.endswith(".ai") else "zh-CN"
     return out
+
+
+def _usage_time(value):
+    """上游 requestTime 是北京时间且无时区标记，必须按 CN 解析，否则跨天统计差 8 小时。"""
+    try:
+        return int(datetime.strptime(value, USAGE_TIME_FORMAT).replace(tzinfo=CN).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_upstream_usage(manager, client, start, end) -> list[dict]:
+    """拉本后端的上游用量明细，返回归一化行。
+
+    签名与 BackendSpec.usage_fetcher 的约定一致（见 base.py 的说明）：
+    ``f(manager, client, start, end) -> list[dict]``。manager 用来取本后端
+    的凭据头（chat 与账单接口共用同一套凭据），client 由调用方给
+    （测试用 MockTransport 注入），start/end 是北京时间带时区的 datetime。
+
+    归一化行字段与 upstream_request_usage 表一一对应：
+    request_id / credit / model / client / request_time / agent_purpose / input_trunc。
+    """
+    headers = manager.get_headers()
+    rows, page, total = [], 1, None
+    while page <= 200:
+        response = client.post(USAGE_BILLING + "get-user-request-usage", headers=headers,
+                               json={"startTime": start.strftime(USAGE_TIME_FORMAT),
+                                     "endTime": end.strftime(USAGE_TIME_FORMAT),
+                                     "pageNum": page, "pageSize": USAGE_PAGE_SIZE})
+        if response.status_code != 200:
+            raise BackendUsageError("上游用量接口请求失败", response.status_code)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise BackendUsageError("上游用量接口返回格式异常")
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            raise BackendUsageError("上游未返回用量明细")
+        data = payload.get("data") or {}
+        batch = data.get("data") or []
+        if not isinstance(batch, list):
+            raise BackendUsageError("上游用量明细格式异常")
+        total = int(data.get("total") or 0)
+        rows.extend(item for item in batch if isinstance(item, dict))
+        if not batch or len(rows) >= total:
+            break
+        page += 1
+    normalized = []
+    for row in rows:
+        request_id = row.get("requestId")
+        when = _usage_time(row.get("requestTime"))
+        if not request_id or when is None:
+            continue
+        normalized.append({
+            "request_id": request_id,
+            "credit": row.get("credit"),
+            "model": row.get("model"),
+            "client": row.get("client"),
+            "request_time": when,
+            "agent_purpose": row.get("agentPurpose"),
+            # 上游截好的请求内容摘要。只存摘要、不存 input 全文——input 是
+            # 完整正文，隐私面差一个量级（见 specs/db-redesign.md）。
+            "input_trunc": row.get("inputTrunc") or None,
+        })
+    return normalized
 
 
 class WorkBuddyBackend(BackendSpec):
@@ -72,9 +146,10 @@ class WorkBuddyBackend(BackendSpec):
 
     # 积分/签到走 pool 的默认实现（billing 接口），故不声明 account_ops_backend。
     #
-    # 上游用量明细（pool.USAGE_BILLING 的 get-user-request-usage）只认本后端
-    # 凭据，对账功能仅默认后端可用——声明出来，让 pool 据此过滤同步队列。
+    # 上游用量明细（get-user-request-usage）只认本后端凭据：实现放在本模块，
+    # 由 usage_fetcher 声明（pool 只读声明，不认后端名）。
     supports_upstream_usage = True
+    usage_fetcher = "fetch_upstream_usage"
     #
     # 模型目录来自 /v3/config（见 admin/models.py:fetch）。它只认**本后端**账号的
     # 凭据，所以拉目录时必须挑一个默认后端的账号 —— 由本声明告诉 admin，

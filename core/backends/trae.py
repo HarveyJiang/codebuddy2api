@@ -23,12 +23,13 @@ import os
 import re
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 
-from .base import BackendHTTPError, BackendSpec
+from .base import BackendHTTPError, BackendSpec, BackendUsageError
 
 # ---------------------------------------------------------------------------
 # 常量（SPEC §1，来自实测，禁止随意改动）
@@ -73,6 +74,17 @@ EP_USERINFO = "/cloudide/api/v3/trae/GetUserInfo"
 EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
 EP_CHECKIN_CLAIM = "/trae/api/v2/ug/checkin_credits/claim"
 EP_ENT_USAGE = "/trae/api/v2/pay/ide_user_ent_usage"
+# 上游用量明细：按 session 聚合（不是按单次请求），所以行粒度是「一次会话里
+# 的一组用量」。实测响应没有 code 字段（不像 WorkBuddy 那套 code==0 包裹），
+# 分页靠 total + page_num/page_size。
+EP_USAGE_GROUP = "/trae/api/v1/pay/query_user_usage_group_by_session"
+# usage_type=7：实测请求固定带这个值（对应「按积分计费」那一类用量）。
+USAGE_TYPE_CREDITS = 7
+USAGE_PAGE_SIZE = 20
+# 拉取窗口的下限（天）。上游是会话级聚合，窄窗口会拿到更小的会话积分，
+# 与宽窗口的结果 UPSERT 覆盖时会把积分算少——所以窗口不足就撑宽。
+# 与 admin/pool.py 的 USAGE_SYNC_DAYS 同口径（core 不 import admin）。
+USAGE_MIN_WINDOW_DAYS = 30
 
 DEFAULT_CONFIG_NAME = "glm-5.2"
 REFRESH_SKEW_SECONDS = 24 * 3600  # token 预刷新窗口（Go RefreshSkew=24h）
@@ -762,6 +774,89 @@ def user_ent_summary(client: httpx.Client, headers: dict, ug_host: str | None = 
             "expiring_soon_updated": int(ts)}
 
 
+def fetch_upstream_usage(manager, client, start, end) -> list[dict]:
+    """拉本后端的上游用量明细，返回归一化行。
+
+    签名与 BackendSpec.usage_fetcher 的约定一致（见 base.py 的说明）：
+    ``f(manager, client, start, end) -> list[dict]``。
+
+    与 WorkBuddy 那套的差别（这正是「用量接口不是各后端通用」的含义）：
+    - 域名与鉴权头都不同：打 api.trae.cn，用 ug_headers()（chat 那套
+      Cloud-IDE-JWT 头只对 SOLO 接口有效）；
+    - 分页参数是下划线 page_num/page_size（不是驼峰 pageNum/pageSize）；
+    - 响应**没有 code 字段**（WorkBuddy 那套是 code==0 包裹），成败看 HTTP
+      状态与结构；
+    - 粒度是**会话**（query_user_usage_group_by_session）而不是单次请求，
+      一行里再按 usage_group_details 分组。
+
+    归一化行字段与 upstream_request_usage 表一一对应。
+    """
+    headers = manager.ug_headers()
+    # 窗口至少 30 天：上游是**会话级**聚合（一个 session 一行，不是逐次请求），
+    # 窗口越窄，同一会话的积分越少。用户手动拉一个窄区间时，窄口径的数字会
+    # 覆盖掉宽口径的那条（UPSERT 覆盖语义），积分凭空缩水。所以这里把窗口
+    # 撑到至少 30 天，与后台每日同步的口径一致（admin/pool.py 的
+    # USAGE_SYNC_DAYS 同为 30；core 不 import admin，两边各持一份字面量）。
+    # 代价：Trae 的每日积分消费是**近似值**——一行代表「该会话截至本次拉取
+    # 的累计消耗」，记在它最后一次活动的那天，而不是逐天切分。
+    start = min(start, end - timedelta(days=USAGE_MIN_WINDOW_DAYS))
+    rows, page, total = [], 1, None
+    while page <= 200:
+        response = client.post(UG_HOST + EP_USAGE_GROUP, headers=headers,
+                               json={"start_time": int(start.timestamp()),
+                                     "end_time": int(end.timestamp()),
+                                     "page_size": USAGE_PAGE_SIZE,
+                                     "page_num": page,
+                                     "usage_type": [USAGE_TYPE_CREDITS]})
+        if response.status_code != 200:
+            raise BackendUsageError("上游用量接口请求失败", response.status_code)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise BackendUsageError("上游用量接口返回格式异常")
+        if not isinstance(payload, dict):
+            raise BackendUsageError("上游用量明细格式异常")
+        batch = payload.get("user_usage_group_by_sessions") or []
+        if not isinstance(batch, list):
+            raise BackendUsageError("上游用量明细格式异常")
+        total = int(payload.get("total") or 0)
+        rows.extend(item for item in batch if isinstance(item, dict))
+        if not batch or len(rows) >= total:
+            break
+        page += 1
+    normalized = []
+    for session in rows:
+        session_id = session.get("session_id")
+        when = session.get("usage_time")
+        if not session_id or not isinstance(when, (int, float)) or when <= 0:
+            continue
+        # 一个会话内可能按 group_key 分组（不同模型/来源各一组），每组一行。
+        # group_key 参与 request_id，同组重复拉到时 UPSERT 更新同一条。
+        groups = session.get("usage_group_details") or []
+        if not isinstance(groups, list) or not groups:
+            groups = [session]
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_key = group.get("group_key") or "default"
+            credit = group.get("credits_float")
+            if credit is None:
+                credit = session.get("credits_float")
+            normalized.append({
+                "request_id": f"trae-{session_id}-{group_key}",
+                "credit": credit,
+                "model": group.get("model_display_name") or group.get("model_name")
+                         or session.get("model_name"),
+                "client": "trae",
+                "request_time": int(when),
+                "agent_purpose": session.get("mode") or "trae",
+                # user_input_preview 是上游给的请求内容摘要（几十字以内），
+                # 正好喂给管理页的「请求内容」列；没有就落 NULL。
+                "input_trunc": session.get("user_input_preview") or None,
+            })
+    return normalized
+
+
 def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = None,
                    now: float | None = None) -> float:
     """只取剩余积分（旧签名保留）；完整口径见 user_ent_summary。"""
@@ -1214,6 +1309,11 @@ class TraeBackend(BackendSpec):
 
     # 积分/签到走 ug 接口，由 pool 分派到本后端的实现（_operate_nondefault）。
     account_ops_backend = "trae"
+
+    # 上游用量明细：Trae 有一套自己的接口（api.trae.cn 的按 session 聚合），
+    # 实现放在本模块，由 usage_fetcher 声明（pool 只读声明，不认后端名）。
+    supports_upstream_usage = True
+    usage_fetcher = "fetch_upstream_usage"
 
     # 上游错误类型与签到报文解释规则都归本后端声明 —— pool 只读声明、不认名字。
     # （见 base.BackendSpec.error_class_name 的说明：这里给的是**类名**，

@@ -32,6 +32,7 @@ from core.bare_routing import (
     decide,
     NoCandidate,
 )
+from core.backends.base import BackendUsageError
 from core.backends.registry import (
     backend_name_for,
     default_name as default_backend,
@@ -57,10 +58,8 @@ ROUTED_BACKEND = "codebuddy.routed_backend"
 _logger = logging.getLogger("admin.pool")
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
-# 上游用量明细接口在另一个域、且没有 /v2 前缀，不能复用 BILLING 常量。
-# 注意参数名是驼峰 pageNum/pageSize（与同域 get-user-resource 的 PageNumber/PageSize 不同）。
-USAGE_BILLING = "https://www.workbuddy.cn/billing/meter/"
-USAGE_PAGE_SIZE = 100
+# 上游用量明细接口由各后端自己实现（域名/鉴权/分页/结构都不同，见
+# BackendSpec.usage_fetcher），pool 不再写死任何后端的计费域。
 USAGE_SYNC_DAYS = 30   # 拉取窗口必须 ≥ 同步周期，否则连续断档会留永久空洞
 EXPIRY_SOON_DAYS = 7
 # 三档轮转策略。round_robin 按权重+最早过期排序后用游标轮转；
@@ -1190,57 +1189,30 @@ class AccountPool:
         return {"refreshed": len(ids)}
 
     # -- 上游用量明细（对账）-----------------------------------------------
-    @staticmethod
-    def _usage_time(value):
-        """上游 requestTime 是北京时间且无时区标记，必须按 CN 解析，否则跨天统计差 8 小时。"""
-        try:
-            return int(datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN).timestamp())
-        except (TypeError, ValueError):
-            return None
-
-    def fetch_upstream_usage(self, client, headers, start, end):
-        """按 data.total 翻页拉取近端用量明细，返回原始行列表。"""
-        rows, page, total = [], 1, None
-        while page <= 200:
-            response = client.post(USAGE_BILLING + "get-user-request-usage", headers=headers,
-                                   json={"startTime": start, "endTime": end,
-                                         "pageNum": page, "pageSize": USAGE_PAGE_SIZE})
-            if response.status_code != 200:
-                raise BillingError("上游用量接口请求失败", response.status_code)
-            try:
-                payload = response.json()
-            except ValueError:
-                raise BillingError("上游用量接口返回格式异常")
-            if not isinstance(payload, dict) or payload.get("code") != 0:
-                raise BillingError("上游未返回用量明细")
-            data = payload.get("data") or {}
-            batch = data.get("data") or []
-            if not isinstance(batch, list):
-                raise BillingError("上游用量明细格式异常")
-            total = int(data.get("total") or 0)
-            rows.extend(item for item in batch if isinstance(item, dict))
-            if not batch or len(rows) >= total:
-                break
-            page += 1
-        return rows
-
     # 手动拉取的每账号节流（秒）：连点「拉取上游」不该反复打上游。
     USAGE_MANUAL_THROTTLE = 60
 
     def _pull_upstream_usage(self, aid, item, start, end):
-        """拉一个账号在 [start, end) 区间的用量并落库，返回记录数。"""
-        fmt = "%Y-%m-%d %H:%M:%S"
+        """拉一个账号在 [start, end) 区间的用量并落库，返回记录数。
+
+        拉取由**后端自己实现**（各后端的用量接口域名/鉴权/分页/结构都不同，
+        见 BackendSpec.usage_fetcher）：pool 只负责分派与落库。
+        """
+        spec = spec_for(item.get("backend", default_backend()))
         with self.operation_lock(aid):
             manager = self.store.manager_for(aid, item)
-            headers = manager.get_headers()
             with self.client_factory() as client:
-                rows = self.fetch_upstream_usage(
-                    client, headers, start.strftime(fmt), end.strftime(fmt))
+                try:
+                    rows = spec.fetch_usage_rows(manager, client, start, end)
+                except BackendUsageError as e:
+                    # 后端只说「哪一步坏了、什么状态码」；对用户可见的文案
+                    # 由 admin 决定，所以在这里翻成 pool 自己的 BillingError。
+                    raise BillingError(str(e), e.status) from e
         name = item.get("name")
         records = []
         for row in rows:
-            request_id = row.get("requestId")
-            when = self._usage_time(row.get("requestTime"))
+            request_id = row.get("request_id")
+            when = row.get("request_time")
             if not request_id or when is None:
                 continue
             records.append({
@@ -1248,11 +1220,11 @@ class AccountPool:
                 # credit 可能不是终值，db 层用 UPSERT 允许后续修正，不能 OR IGNORE。
                 "credit": number(row.get("credit")), "model": row.get("model"),
                 "client": row.get("client"), "request_time": when,
-                "agent_purpose": row.get("agentPurpose"),
+                "agent_purpose": row.get("agent_purpose"),
                 # 上游截好的请求内容摘要（用户 2026-10-19 要求展示）。只存摘要、
                 # 不存 input 全文——input 是完整正文，隐私面差一个量级。
                 # 可空：上游不给或为空串时落 NULL，前端显示「—」。
-                "input_trunc": row.get("inputTrunc") or None,
+                "input_trunc": row.get("input_trunc") or None,
             })
         self.store.db.save_upstream_usage(records)
         return len(records)
@@ -1304,8 +1276,8 @@ class AccountPool:
                 # 总闸关掉的后端不打上游（与 tick 同一口径）。
                 if not item["enabled"] or not is_backend_enabled(item.get("backend", default_backend())):
                     continue
-                # 用量对账接口只认默认后端凭据（见 BackendSpec.supports_upstream_usage）：
-                # 不支持的账号进队列就是每天一次必然的 401 + 一条永远清不掉的留痕。
+                # 用量对账接口由**各后端自己声明**（见 BackendSpec.supports_upstream_usage）：
+                # 没有该能力的后端进队列就是每天一次必然的 401 + 一条永远清不掉的留痕。
                 if not spec_for(item.get("backend", default_backend())).supports_upstream_usage:
                     continue
                 status = self.store.data["account_status"].get(aid, {})

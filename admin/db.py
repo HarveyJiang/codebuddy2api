@@ -1538,7 +1538,8 @@ class Database:
                    VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(request_id) DO UPDATE SET
                      credit_micro=excluded.credit_micro,
-                     account_name=excluded.account_name""",
+                     account_name=excluded.account_name,
+                     request_time=excluded.request_time""",
                 rows)
         return len(rows)
 

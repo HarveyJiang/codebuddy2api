@@ -14,6 +14,7 @@ pool / server / models / converter / 前端零改动。**
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -641,10 +642,19 @@ def test_auto_checkin_participation_is_declared():
 
 
 def test_upstream_usage_support_is_declared():
-    """上游用量对账只默认后端可用：Trae 的 token 打 WorkBuddy 计费域必然 401，
-    不声明就意味着不进同步队列（曾因无差别入队每天留一条永远清不掉的留痕）。"""
-    assert registry.spec_for("workbuddy").supports_upstream_usage is True
-    assert registry.spec_for("trae").supports_upstream_usage is False
+    """上游用量对账由**各后端自己声明**：每个后端有自己的用量接口
+    （WorkBuddy 打计费域、Trae 打 api.trae.cn 的按 session 聚合），域名/鉴权/
+    分页/结构都不同，所以实现放在后端模块里、由 usage_fetcher 指名。
+
+    声明 supports_upstream_usage 的意义是「这个后端有对账接口」——所以
+    两个后端都应为 True；再由 usage_fetcher 指到各自模块里的实现。
+    """
+    for name in ("workbuddy", "trae"):
+        spec = registry.spec_for(name)
+        assert spec.supports_upstream_usage is True, name
+        # 指名的函数必须真的在本后端模块里可调用（不靠 import 拖进来）。
+        module = sys.modules.get(type(spec).__module__)
+        assert callable(getattr(module, spec.usage_fetcher, None)), name
 
 
 # --------------------------------------------------------------------------

@@ -43,6 +43,19 @@ class BackendHTTPError(Exception):
         self.upstream_code = upstream_code
 
 
+class BackendUsageError(Exception):
+    """拉上游用量明细失败（各后端共用）。
+
+    放在 core 而不是 admin：实现方在后端模块里（core 不能反向依赖 admin），
+    而 admin 侧（pool）要把它翻成自己的 BillingError —— 对用户可见的报错
+    文案与状态码由 admin 决定，后端只负责说「哪一步坏了、什么状态码」。
+    """
+
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.status = int(status)
+
+
 class BackendSpec:
     """上游后端规格。子类覆盖下面的能力声明与 chat_url/astream。
 
@@ -194,11 +207,45 @@ class BackendSpec:
 
     #: 该后端是否有「上游用量明细」可对账（pool 的每日/手动同步）。默认 False。
     #:
-    #: 用量对账接口**不是各后端通用**的：它打在默认后端的计费域上
-    #: （pool.USAGE_BILLING），只认默认后端的凭据。新后端接入时若无差别地
-    #: 进同步队列，就是每天拿它的 token 去打别人的域网关——必然 401，
-    #: 只会在 usage_sync_error 里堆一条永远清不掉的留痕。
+    #: 用量对账接口**不是各后端通用**的：域名、鉴权头、分页参数、返回结构
+    #: 全都不同（WorkBuddy 打在计费域、用驼峰分页参数、返回 code==0 的包裹；
+    #: Trae 打在 api.trae.cn、用下划线分页参数、按 session 聚合且无 code 字段）。
+    #: 新后端若无差别地进同步队列，就是每天拿它的 token 去打别人的网关——
+    #: 必然 401，只会在 usage_sync_error 里堆一条永远清不掉的留痕。
     supports_upstream_usage: bool = False
+
+    #: 本后端模块里「拉上游用量明细」的**模块级函数名**。
+    #: 约定签名 ``f(manager, client, start, end) -> list[dict]``：
+    #: - ``manager``：该后端的凭据管理器（用它取该后端该用的头）；
+    #: - ``client``：调用方给的 httpx.Client（测试用 MockTransport 注入）；
+    #: - ``start``/``end``：datetime（北京时间，带时区）；
+    #: - 返回**归一化行**列表，每行 ``{request_id, credit, model, client,
+    #:   request_time, agent_purpose, input_trunc}``，字段语义与
+    #:   upstream_request_usage 表一一对应。
+    #:
+    #: 写模块级函数名（而不是 import 或方法转发）是为了不破坏懒构造：
+    #: 后端模块在 registry 里是按需 import 的，基类顶层 import 它就等于
+    #: 每次都把整个后端拖进来。取函数时用 ``sys.modules.get`` 现取
+    #: （与 ``upstream_error_class`` 同一手法）。
+    usage_fetcher: str = ""
+
+    def fetch_usage_rows(self, manager, client, start, end) -> list[dict]:
+        """拉本后端的上游用量明细，返回归一化行列表。
+
+        默认实现转发到本后端模块里的 ``usage_fetcher``。子类一般不覆盖，
+        覆盖的理由只有「拉取需要的不止一次请求」这种。
+        """
+        if not self.usage_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明上游用量明细拉取方式")
+        module_name = type(self).__module__
+        module = sys.modules.get(module_name)
+        fn = getattr(module, self.usage_fetcher, None) if module else None
+        if not callable(fn):
+            raise TypeError(
+                f"{type(self).__name__}.usage_fetcher={self.usage_fetcher!r} "
+                f"在模块 {module_name} 里不是可调用对象；该名字必须指向与后端同模块的函数"
+            )
+        return fn(manager, client, start, end)
 
     #: 账号操作（积分/签到）由谁实现：None = 用 pool 里的默认实现（默认后端走这条路，
     #: 因为是 billing 接口）；否则是后端名，表示「交给该后端自己的实现」。

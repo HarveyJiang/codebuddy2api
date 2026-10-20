@@ -171,7 +171,7 @@ ON CONFLICT(key_id, day) DO UPDATE SET
 > 据此跳过当天，其余时段永远拉不到，**留下永久空洞**（`db-redesign.md` 已把这个坑
 > 列为窗口必须 ≥ 同步周期的理由）。
 
-因此拆成两个方法，共用已有的 `fetch_upstream_usage(client, headers, start, end)`：
+因此拆成两个方法，共用已有的用量拉取（各后端自己实现，见下节）：
 
 - `sync_upstream_usage(aid)`：**后台每日同步**，30 天窗口，写 `usage_synced_at`
   / `usage_sync_error`。行为不变。
@@ -187,18 +187,50 @@ ON CONFLICT(key_id, day) DO UPDATE SET
   表 DDL（走 v2→v3 迁移补列）。只写内存字典的话它重启即丢，「留痕」名存实亡，
   且**不报错**、只有主动查库才会发现。
 
-上游参数沿用驼峰（与同域 `get-user-resource` 的 `PageNumber/PageSize` 不同）：
+### 上游拉取：各后端自己实现（不再只有默认后端）
+
+用量对账接口**不是各后端通用**的：域名、鉴权头、分页参数、返回结构全都不同。
+所以实现放在**后端自己的模块**里，由 `BackendSpec` 声明（pool 只读声明、
+不认后端名 —— 与 `catalog_method` / `account_ops_backend` 同一手法）：
+
+| 声明 | 含义 |
+|---|---|
+| `supports_upstream_usage: bool` | 该后端有没有上游用量对账接口（决定是否进同步队列） |
+| `usage_fetcher: str` | 本后端模块里的**模块级函数名**（`f(manager, client, start, end) -> list[dict]`） |
+
+`BackendSpec.fetch_usage_rows(manager, client, start, end)` 转发到该函数：
+用 `sys.modules.get(type(self).__module__)` 现取，不在基类顶层 import
+后端模块（那会破坏 registry 的懒构造）。
+
+归一化行字段与 `upstream_request_usage` 表一一对应：
+`request_id / credit / model / client / request_time / agent_purpose / input_trunc`。
+
+| 后端 | 接口 | 分页 | 时间口径 | 行粒度 |
+|---|---|---|---|---|
+| WorkBuddy | `www.workbuddy.cn/billing/meter/get-user-request-usage` | 驼峰 `pageNum`/`pageSize`，响应 `code==0` 包裹 | `requestTime` 是北京时间无时区字符串，按 CN 解析 | 单次请求 |
+| Trae | `api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session` | 下划线 `page_num`/`page_size`，响应**无 code 字段** | `usage_time` 是 unix 秒 | **会话**（会话内再按 `usage_group_details` 分组） |
+
+WorkBuddy 侧的请求参数沿用驼峰（与同域 `get-user-resource` 的
+`PageNumber/PageSize` 不同）：
 
 ```json
 {"startTime": "2026-10-07 00:00:00", "endTime": "2026-10-14 23:59:59",
  "pageNum": 1, "pageSize": 100}
 ```
 
-按 `data.total` 翻页，上限 200 页。落库仍是
-`ON CONFLICT(request_id) DO UPDATE`（credit 可能不是终值，不能 `OR IGNORE`）。
+按 `data.total` 翻页，上限 200 页。失败一律抛
+`core.backends.base.BackendUsageError`（带 status）；pool 把它翻成自己的
+`BillingError` —— 对用户可见的文案由 admin 决定，后端只负责说「哪一步坏了、
+什么状态码」。
 
-**时区**：`requestTime` 是 `YYYY-MM-DD HH:MM:SS` 无时区标记，必须按 CN 解析
-（现有 `_usage_time`，`pool.py:535`）。漏掉差 8 小时，跨天统计全错。
+落库仍是 `ON CONFLICT(request_id) DO UPDATE`（credit 可能不是终值，不能
+`OR IGNORE`）。**UPSERT 同时更新 `request_time`**：WorkBuddy 侧同一个
+requestId 的时间不变（无副作用），Trae 侧同一会话的行要随最新 `usage_time`
+落到正确的那一天。
+
+**时区**：WorkBuddy 的 `requestTime` 是 `YYYY-MM-DD HH:MM:SS` 无时区标记，
+必须按 CN 解析（漏掉差 8 小时，跨天统计全错）；Trae 的 `usage_time` 是 unix
+秒，直接用。
 
 ### 报表口径
 
