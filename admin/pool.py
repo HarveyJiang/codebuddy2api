@@ -57,11 +57,9 @@ REQUEST_LOG_CONTEXT = "codebuddy.request_log"
 ROUTED_BACKEND = "codebuddy.routed_backend"
 _logger = logging.getLogger("admin.pool")
 CN = timezone(timedelta(hours=8))
-BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
 # 上游用量明细接口由各后端自己实现（域名/鉴权/分页/结构都不同，见
 # BackendSpec.usage_fetcher），pool 不再写死任何后端的计费域。
 USAGE_SYNC_DAYS = 30   # 拉取窗口必须 ≥ 同步周期，否则连续断档会留永久空洞
-EXPIRY_SOON_DAYS = 7
 # 三档轮转策略。round_robin 按权重+最早过期排序后用游标轮转；
 # random 随机；expiry_first 只看最早过期、不看权重。
 ROUTING_POLICIES = frozenset(("round_robin", "random", "expiry_first"))
@@ -89,49 +87,6 @@ def _same_day(timestamp, now):
     except (TypeError, ValueError, OSError):
         return False
     return day == today
-
-
-def package_expiry(p):
-    """Parse CycleEndTime (Beijing time) into a unix timestamp; None if absent/invalid."""
-    value = p.get("CycleEndTime")
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN).timestamp()
-    except ValueError:
-        return None
-
-
-def summarize_packages(packages, now=None):
-    """Aggregate credits. `expiring_soon` sums the spendable balance of every package whose
-    CycleEndTime falls within the next `EXPIRY_SOON_DAYS` days."""
-    now = time.time() if now is None else now
-    cutoff = now + EXPIRY_SOON_DAYS * 86400
-    remain = Decimal(0)
-    size = Decimal(0)
-    earliest = None
-    earliest_remaining = None
-    expiring_soon = Decimal(0)
-    for p in packages:
-        # Precise values carry fractional credit balances; cycle values are spendable now.
-        prefix = "Cycle" if any(k in p for k in ["CycleCapacityRemainPrecise", "CycleCapacityRemain"]) else ""
-        def field(name, default=None):
-            return p.get(prefix + name + "Precise", p.get(prefix + name, default))
-        r = number(field("CapacityRemain"))
-        capacity = number(field("CapacitySize", r))
-        spendable = min(r, capacity) if capacity else r
-        remain += spendable
-        size += capacity
-        if spendable > 0:
-            expiry = package_expiry(p)
-            if expiry is not None:
-                if earliest is None or expiry < earliest:
-                    earliest, earliest_remaining = expiry, float(spendable)
-                if now < expiry <= cutoff:
-                    expiring_soon += spendable
-    return {"remaining": float(remain), "packages": len(packages),
-            "earliest_expiry": earliest, "earliest_expiry_remaining": earliest_remaining,
-            "expiring_soon": float(expiring_soon), "expiring_soon_updated": int(now)}
 
 
 class BillingError(Exception):
@@ -823,54 +778,6 @@ class AccountPool:
         elif recovered:
             _logger.info("账号 %s 请求恢复正常", aid)
 
-    def billing(self, client, headers, path, body=None):
-        response = client.post(BILLING + path, headers=headers, json=body or {})
-        if response.status_code != 200:
-            raise BillingError("积分服务请求失败", response.status_code)
-        try:
-            d = response.json()
-        except ValueError:
-            raise BillingError("积分服务返回格式异常")
-        if not isinstance(d, dict) or d.get("code") != 0:
-            raise BillingError("上游未接受该操作，请检查账号或稍后重试", code=d.get("code") if isinstance(d, dict) else None)
-        return d.get("data")
-
-    def credits(self, client, headers):
-        packages = []
-        now = datetime.fromtimestamp(self.clock(), CN)
-        for page in range(1, 101):
-            d = self.billing(client, headers, "get-user-resource", {"PageNumber": page, "PageSize": 100, "ProductCode": "p_tcaca", "Status": [0, 3], "PackageEndTimeRangeBegin": now.strftime("%Y-%m-%d %H:%M:%S"), "PackageEndTimeRangeEnd": "2126-01-01 00:00:00"})
-            try:
-                data = d["Response"]["Data"]
-                current = data["Accounts"]
-                total = int(data["TotalCount"])
-                if not isinstance(current, list) or total < 0:
-                    raise ValueError()
-            except (KeyError, TypeError, ValueError):
-                raise BillingError("积分数据格式异常，上次余额已保留")
-            packages.extend(current)
-            if len(packages) >= total:
-                return summarize_packages(packages, now=self.clock())
-            if not current:
-                break
-        raise BillingError("积分包分页不完整，上次余额已保留")
-
-    def checkin_status(self, client, headers):
-        try:
-            d = self.billing(client, headers, "checkin-activity-status")
-        except BillingError as e:
-            if e.status not in (404, 405):
-                raise
-            d = self.billing(client, headers, "checkin-status")
-        if not isinstance(d, dict):
-            raise BillingError("签到状态格式异常")
-        def flag(snake, camel):
-            v = d.get(snake, d.get(camel))
-            if v not in (True, False, 0, 1, "true", "false", "1", "0"):
-                raise BillingError("签到状态缺少必要字段")
-            return v in (True, 1, "true", "1")
-        return {"active": flag("active", "active"), "checked": flag("today_checked_in", "todayCheckedIn")}
-
     def operate(self, aid, action):
         with self.operation_lock(aid):
             item, previous = self.snapshot(aid)
@@ -894,11 +801,10 @@ class AccountPool:
                         manager._refresh()
                     self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
-                # 非默认后端（如 Trae）：刷新（上方）走各自凭据的刷新；积分/签到
-                # 走各自的上游接口。分派依据是后端**声明**的支持情况，不是后端名。
-                only = spec.account_ops_backend
-                if only is not None:
-                    return self._operate_nondefault(aid, manager, action, only)
+                # 积分/签到：**一条路径**，实现由后端自己声明（credits_fetcher /
+                # checkin_status_fetcher / checkin_claim_fetcher，见 base.py）。
+                # 这里不再有「默认后端特权代码」——WorkBuddy 与 Trae 一样，
+                # 都在各自模块里提供同签名的模块级函数。
                 headers = manager.get_headers()
                 if "workbuddy.ai" in str(headers.get("X-Domain", "")).lower():
                     return {"id": aid, "ok": False, "message": "当前仅支持国内账号积分与签到"}
@@ -907,31 +813,58 @@ class AccountPool:
                     message = "积分状态已更新"
                     checkin_error = None
                     try:
-                        ci = self.checkin_status(client, headers)
+                        ci = spec.fetch_checkin_status(manager, client, headers)
                         if ci["checked"]:
                             self.update(aid, checkin_date=today)
                         if action == "checkin":
                             if ci["checked"]:
                                 message = "今日已签到，无需重复签到"
-                            elif not ci["active"]:
+                            elif not ci.get("active", ci.get("enable")):
                                 message = "当前没有可参与的签到活动"
                             else:
-                                self.billing(client, headers, "daily-checkin")
-                                ci = self.checkin_status(client, headers)
-                                if not ci["checked"]:
-                                    raise BillingError("签到已提交，但上游尚未确认；请刷新状态")
+                                # 上游对签到失败也返回 HTTP 200，真实结果看 claim 的 code。
+                                # 9074/9004 等＝上游暂时拒绝（高峰限流或设备/请求形态问题），
+                                # 对 claim 本身做有界重试；其余非 0＝明确失败，透出上游
+                                # message（而非误报"尚未确认"）。
+                                confirmed = False
+                                last_msg = "签到失败，请稍后再试"
+                                for attempt in range(4):
+                                    ok, msg, retryable = spec.interpret_checkin_claim(
+                                        spec.fetch_checkin_claim(manager, client, headers))
+                                    if ok:
+                                        confirmed = True
+                                        break
+                                    last_msg = msg or last_msg
+                                    if retryable and attempt < 3:
+                                        time.sleep(2.5)
+                                        continue
+                                    # 明确失败：可能是"今日已签到"之类，查一次 status 兜底
+                                    if spec.fetch_checkin_status(manager, client, headers)["checked"]:
+                                        confirmed = True
+                                    break
+                                if not confirmed:
+                                    raise BillingError(last_msg)
                                 self.update(aid, checkin_date=today)
                                 message = "签到成功"
-                    except (BillingError, httpx.HTTPError) as e:
+                    except (BillingError, BackendUsageError, httpx.HTTPError) as e:
                         if action == "checkin":
                             raise
                         checkin_error = "签到状态暂时无法查询"
-                    data = self.credits(client, headers)
+                    data = spec.fetch_credits(manager, client, headers)
                     # A successful balance lookup is proof of current authentication.
                     self.update(aid, **data, credits_updated=int(self.clock()), auth_invalid=False, last_error=checkin_error)
                     if data["remaining"] > 0 and action == "checkin":
                         self.update(aid, cooldown_until=0)
                     return {"id": aid, "ok": True, "message": message, "remaining": data["remaining"]}
+            except BackendUsageError as e:
+                # 后端只说「哪一步坏了、什么状态码」；对用户可见的文案与
+                # 冷却策略由 admin 决定，所以翻成 pool 自己的 BillingError
+                # 后走同一条处理（401/403 → 冷却 300s，见 usage 那条同样的翻法）。
+                err = BillingError(str(e), e.status)
+                self.update(aid, last_error=str(err))
+                if err.status in (401, 403):
+                    self.update(aid, cooldown_until=self.clock()+300)
+                return {"id": aid, "ok": False, "message": str(err)}
             except BillingError as e:
                 self.update(aid, last_error=str(e))
                 if e.status in (401, 403):
@@ -953,70 +886,6 @@ class AccountPool:
                 message = "操作失败：请检查登录凭据或网络，必要时重新授权"
                 self.update(aid, last_error=message)
                 return {"id": aid, "ok": False, "message": message}
-
-    def _operate_nondefault(self, aid, manager, action, backend):
-        """非默认后端的积分/签到（目前即 Trae：ug 接口 checkin_credits + ide_user_ent_usage）。
-
-        与 WorkBuddy 路径同构：先查签到状态 → 按需执行签到 → 拉积分余额。
-        签到查询失败不阻断积分拉取（action=checkin 除外，必须显式报错）。
-
-        ``backend`` 由 BackendSpec.account_ops_backend 分派传入，本方法目前只有
-        Trae 一种实现（凭据管理器的 checkin_status / checkin_claim /
-        user_ent_summary 是 Trae 侧的能力）；第三个后端接入时按同样的接口实现，
-        pool 无需再改。
-        """
-        today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
-        message = "积分状态已更新"
-        with self.client_factory() as client:
-            checkin_error = None
-            try:
-                ci = manager.checkin_status(client)
-                if ci["checked"]:
-                    self.update(aid, checkin_date=today)
-                if action == "checkin":
-                    if ci["checked"]:
-                        message = "今日已签到，无需重复签到"
-                    elif not ci["enable"]:
-                        message = "当前没有可参与的签到活动"
-                    else:
-                        # 上游对签到失败也返回 HTTP 200，真实结果看 claim 的 code。
-                        # 9074/9004 等＝上游暂时拒绝（高峰限流或设备/请求形态问题），
-                        # 对 claim 本身做有界重试；其余非 0＝明确失败，透出上游
-                        # message（而非误报"尚未确认"）。
-                        confirmed = False
-                        last_msg = "签到失败，请稍后再试"
-                        for attempt in range(4):
-                            ok, msg, retryable = spec_for(backend).interpret_checkin_claim(manager.checkin_claim(client))
-                            if ok:
-                                confirmed = True
-                                break
-                            last_msg = msg or last_msg
-                            if retryable and attempt < 3:
-                                time.sleep(2.5)
-                                continue
-                            # 明确失败：可能是"今日已签到"之类，查一次 status 兜底
-                            if manager.checkin_status(client)["checked"]:
-                                confirmed = True
-                            break
-                        if not confirmed:
-                            raise BillingError(last_msg)
-                        self.update(aid, checkin_date=today)
-                        message = "签到成功"
-            except (BillingError, httpx.HTTPError):
-                if action == "checkin":
-                    raise
-                checkin_error = "签到状态暂时无法查询"
-            remain = manager.user_ent_summary(client)
-            # remain>0 说明至少有一个权益包；为 0 时不置 packages（避免把「无权益包」
-            # 误判成 exhausted，真实耗尽由上游 1005→402 冷却兜底）。
-            # earliest_* / expiring_* 与 WorkBuddy 路径（summarize_packages）同字段名，
-            # 前端「最近过期 / 7 天内过期」两列对两个后端同一套渲染。
-            self.update(aid, **{k: v for k, v in remain.items() if k != "remaining"},
-                        remaining=remain["remaining"], packages=1 if remain["remaining"] > 0 else 0,
-                        credits_updated=int(self.clock()), auth_invalid=False, last_error=checkin_error)
-            if remain["remaining"] > 0 and action == "checkin":
-                self.update(aid, cooldown_until=0)
-            return {"id": aid, "ok": True, "message": message, "remaining": remain["remaining"]}
 
     async def batch(self, action):
         if self.jobs.locked():

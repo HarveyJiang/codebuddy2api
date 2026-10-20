@@ -191,7 +191,7 @@ ON CONFLICT(key_id, day) DO UPDATE SET
 
 用量对账接口**不是各后端通用**的：域名、鉴权头、分页参数、返回结构全都不同。
 所以实现放在**后端自己的模块**里，由 `BackendSpec` 声明（pool 只读声明、
-不认后端名 —— 与 `catalog_method` / `account_ops_backend` 同一手法）：
+不认后端名 —— 与 `catalog_method` 同一手法）：
 
 | 声明 | 含义 |
 |---|---|
@@ -231,6 +231,48 @@ requestId 的时间不变（无副作用），Trae 侧同一会话的行要随�
 **时区**：WorkBuddy 的 `requestTime` 是 `YYYY-MM-DD HH:MM:SS` 无时区标记，
 必须按 CN 解析（漏掉差 8 小时，跨天统计全错）；Trae 的 `usage_time` 是 unix
 秒，直接用。
+
+### 积分 / 签到同样各后端自己实现（2026-10-20 收口）
+
+`account_ops_backend` 这个「默认 / 非默认」分派开关已退场。它与 `usage_fetcher`
+的分裂来自历史顺序（WorkBuddy 先写、pool 就是它；Trae 后靠它绕开 pool 里的
+默认分支），不是设计选择 —— 结果是 pool 里永远留着一份「默认后端特权代码」
+（`BILLING` 域名、`billing()` / `credits()` / `checkin_status()` 三个专用方法、
+`summarize_packages()` / `package_expiry()` / `_credits_of()` 三个助手）。
+
+现在与 `usage_fetcher` 完全同款，四个 fetcher 声明：
+
+| 声明 | 签名 | 返回 |
+|---|---|---|
+| `credits_fetcher` | `f(manager, client, headers)` | `{remaining, packages, earliest_expiry, earliest_expiry_remaining, expiring_soon, expiring_soon_updated}` |
+| `checkin_status_fetcher` | `f(manager, client, headers)` | `{checked, ...}`（其余字段各后端自定，pool 只取 `checked` 与 `active`/`enable`） |
+| `checkin_claim_fetcher` | `f(manager, client, headers)` | 上游原始报文（成败由 `interpret_checkin_claim` 判） |
+| `billing_fetcher` | `f(manager, client, path, body)` | billing 直连接口（WorkBuddy 专有；Trae 无此概念，声明为空） |
+
+`BackendSpec` 上对应四个转发方法（`fetch_credits` / `fetch_checkin_status` /
+`fetch_checkin_claim` / `fetch_billing`），复用同一个 `_module_fn()` 懒取助手。
+pool 的 `operate()` 收敛成**一条路径**：查状态 → 按需签到（有界重试 +
+`interpret_checkin_claim`）→ 拉积分。两个后端的差异只剩数据本身：
+
+| 后端 | 积分 | 签到 |
+|---|---|---|
+| WorkBuddy | `get-user-resource` 翻页 → `summarize_packages()`（`packages` = 包个数） | `daily-checkin` + 回查状态（无业务码，`fetch_checkin_claim` 内部做完两步再合成报文） |
+| Trae | `ide_user_ent_usage` → `user_ent_summary()`（`packages` = 1/0，见下） | `checkin_credits/claim`，业务码 0/9074/9004 由 `interpret_checkin_claim` 判 |
+
+`packages` 字段两边语义不同（包个数 vs 有/无），由各自的 fetcher 决定，
+pool 不再替任一端推导 —— 这正是「相同部分抽象到基类、不同部分各自实现」
+的字面落地：基类给流程与分派，后端给数据。
+
+签名差异的处理：Trae 那批既有模块函数的签名是 `(client, headers, ug_host)`
+（凭据头由调用方备好），与 fetcher 约定的 `(manager, client, headers)` 不同。
+在 trae.py 里加了三个三行适配（`fetch_credits` / `fetch_checkin_status` /
+`fetch_checkin_claim`），把 manager 自带的 `ug_headers()` 翻译成旧签名 ——
+不改旧函数签名，因为它们的调用方还包括 `TraeCredentialManager` 的方法与
+一堆单测。
+
+`admin/pool.py` 净删约 120 行，不再出现任何后端计费域名字面量
+（`tests/protocol/test_backend_arch_guard.py::test_pool_holds_no_backend_billing_domain`
+守着这条）。
 
 ### 报表口径
 

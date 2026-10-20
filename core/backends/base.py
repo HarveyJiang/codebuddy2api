@@ -51,9 +51,10 @@ class BackendUsageError(Exception):
     文案与状态码由 admin 决定，后端只负责说「哪一步坏了、什么状态码」。
     """
 
-    def __init__(self, message, status=502):
+    def __init__(self, message, status=502, code=None):
         super().__init__(message)
         self.status = int(status)
+        self.code = code
 
 
 class BackendSpec:
@@ -237,21 +238,76 @@ class BackendSpec:
         """
         if not self.usage_fetcher:
             raise NotImplementedError(f"{type(self).__name__} 未声明上游用量明细拉取方式")
-        module_name = type(self).__module__
-        module = sys.modules.get(module_name)
-        fn = getattr(module, self.usage_fetcher, None) if module else None
-        if not callable(fn):
-            raise TypeError(
-                f"{type(self).__name__}.usage_fetcher={self.usage_fetcher!r} "
-                f"在模块 {module_name} 里不是可调用对象；该名字必须指向与后端同模块的函数"
-            )
-        return fn(manager, client, start, end)
+        return self._module_fn(self.usage_fetcher, "上游用量明细")(manager, client, start, end)
 
     #: 账号操作（积分/签到）由谁实现：None = 用 pool 里的默认实现（默认后端走这条路，
     #: 因为是 billing 接口）；否则是后端名，表示「交给该后端自己的实现」。
     #: 这么个形状的理由：默认后端的积分/签到是 pool 里唯一写死的一套，另建后端
     #: 时不该去改 pool，让它在此声明自己接管，pool 只做分派。
     account_ops_backend: str | None = None
+
+    # --- 账号操作（积分 / 签到）的实现位置 ---------------------------------
+    #
+    # 与 ``usage_fetcher`` 完全同款：**本后端模块里的模块级函数名**，运行时用
+    # ``sys.modules.get(type(self).__module__)`` 现取，不顶层 import（保 registry
+    # 懒构造）。约定签名：
+    #
+    # - ``credits_fetcher``    → ``f(manager, client, headers) -> dict``
+    #   （剩余积分 + 过期信息，字段名见 workbuddy.summarize_packages / trae.user_ent_summary）
+    # - ``checkin_status_fetcher`` → ``f(manager, client, headers) -> dict``
+    #   （``{checked, active|enable, credits}``，字段名两边不同，pool 只取自己那两个键）
+    # - ``checkin_claim_fetcher`` → ``f(manager, client, headers) -> dict``
+    #   （上游原始签到响应；HTTP 恒 200，成败由 interpret_checkin_claim 判）
+    # - ``billing_fetcher``    → ``f(manager, client, path, body) -> dict``
+    #   （WorkBuddy 的 billing 直连接口；Trae 没有这个概念，声明为空即可）
+    #
+    # 用四个独立声明而不是一个 ``account_ops()`` 入口：签到失败不该阻断积分拉取、
+    # 积分拉取又要在签到成功后才做，pool 需要**分步**调用，一个大入口反而要
+    # 在基类里替各后端决定流程。
+    credits_fetcher: str = ""
+    checkin_status_fetcher: str = ""
+    checkin_claim_fetcher: str = ""
+    billing_fetcher: str = ""
+
+    def _module_fn(self, name, what):
+        """从本后端模块里取名为 ``name`` 的模块级函数（取不到即报错）。
+
+        三个调用点（fetch_usage_rows / fetch_credits / fetch_checkin_status …）
+        共用这套懒取逻辑：后端模块在 registry 里按需 import，基类顶层 import
+        会破坏懒构造（每次把整个后端拖进内存）。
+        """
+        module_name = type(self).__module__
+        module = sys.modules.get(module_name)
+        fn = getattr(module, name, None) if module else None
+        if not callable(fn):
+            raise NotImplementedError(
+                f"{type(self).__name__} 未提供{what}实现（模块 {module_name} 里没有可调用的 {name!r}）"
+            )
+        return fn
+
+    def fetch_credits(self, manager, client, headers) -> dict:
+        """拉本后端的积分余额与过期信息。字段名与后端无关，前端同一套渲染。"""
+        if not self.credits_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明积分拉取方式")
+        return self._module_fn(self.credits_fetcher, "积分")(manager, client, headers)
+
+    def fetch_checkin_status(self, manager, client, headers) -> dict:
+        """拉本后端的签到状态。"""
+        if not self.checkin_status_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明签到状态查询方式")
+        return self._module_fn(self.checkin_status_fetcher, "签到状态")(manager, client, headers)
+
+    def fetch_checkin_claim(self, manager, client, headers) -> dict:
+        """执行本后端的签到，返回上游原始响应（成败由 interpret_checkin_claim 判）。"""
+        if not self.checkin_claim_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明签到执行方式")
+        return self._module_fn(self.checkin_claim_fetcher, "签到")(manager, client, headers)
+
+    def fetch_billing(self, manager, client, path, body=None):
+        """WorkBuddy 的 billing 直连接口（Trae 无此概念，声明为空 → 不可调用）。"""
+        if not self.billing_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明计费接口")
+        return self._module_fn(self.billing_fetcher, "计费")(manager, client, path, body or {})
 
     # --- 失败归因 --------------------------------------------------------
 
@@ -297,8 +353,8 @@ class BackendSpec:
         """签到 claim 响应的业务码 → ``(成功?, 消息, 可重试?)``。
 
         默认实现覆盖不了任何后端：签到报文的形状纯粹是各家的私有协议，
-        所以约定由**声明了 ``account_ops_backend`` 的后端**自己实现
-        （pool 只调 ``spec_for(backend).interpret_checkin_claim(...)``）。
+        所以约定由**有签到能力的后端**自己实现（pool 只调
+        ``spec.interpret_checkin_claim(...)``）。
         之所以是 spec 上的方法而不是 pool 里的一个函数 + 类型判断，见
         ``error_class_name`` 的说明：调用方不该知道是哪个后端在签到。
         """

@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import httpx
 
@@ -24,6 +26,17 @@ CN = timezone(timedelta(hours=8))
 USAGE_BILLING = "https://www.workbuddy.cn/billing/meter/"
 USAGE_PAGE_SIZE = 100
 USAGE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+#: 积分 / 签到接口（billing 直连）。与 USAGE_BILLING 不同域、不同鉴权面，
+#: 所以各有一套 URL，互不复用。
+BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
+BILLING_PAGE_SIZE = 100
+#: 积分包分页上限（防御性：上游 TotalCount 异常时不无限翻页）。
+BILLING_MAX_PAGES = 100
+
+#: 「7 天内过期」窗口（天），与 trae.EXPIRY_SOON_DAYS 同口径。core 不 import admin，
+#: 两边各自持一份相同数值 —— 改任一处都要同步改另一处（trae.py:93 有互指注释）。
+EXPIRY_SOON_DAYS = 7
 
 
 def _site_headers(headers: dict) -> dict:
@@ -59,15 +72,178 @@ def _usage_time(value):
         return None
 
 
+def _billing(manager, client, path, body=None):
+    """打一次 billing 直连接口。非 200 / 非 JSON / code≠0 → BackendUsageError。
+
+    ``code != 0`` 的 message 不透出：上游把内部细节（如「签名错误」）放在
+    message 里，透给前端等于把上游内部信息暴露给调用方。
+    """
+    headers = manager.get_headers()
+    response = client.post(BILLING + path, headers=headers, json=body or {})
+    if response.status_code != 200:
+        raise BackendUsageError("积分服务请求失败", response.status_code)
+    try:
+        d = response.json()
+    except ValueError:
+        raise BackendUsageError("积分服务返回格式异常")
+    if not isinstance(d, dict) or d.get("code") != 0:
+        raise BackendUsageError("上游未接受该操作，请检查账号或稍后重试",
+                                code=d.get("code") if isinstance(d, dict) else None)
+    return d.get("data")
+
+
+def _credits_of(usage):
+    """从 usage 里取实测 credit；取不到返回 0.0（护栏按「没花钱」计）。
+
+    字段名逐个试、试不到就当 0：护栏的 credit 计数是**辅助**维度，
+    拿到 0 不会让护栏放行本该拦下的请求（token 计数仍然可靠）。
+    """
+    if not isinstance(usage, dict):
+        return 0.0
+    for field in ("credit", "credits", "total_credit", "credit_used", "cost"):
+        if field in usage:
+            try:
+                return float(usage[field])
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def package_expiry(p):
+    """Parse CycleEndTime (Beijing time) into a unix timestamp; None if absent/invalid."""
+    value = p.get("CycleEndTime")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN).timestamp()
+    except ValueError:
+        return None
+
+
+def summarize_packages(packages, now=None):
+    """Aggregate credits. `expiring_soon` sums the spendable balance of every package whose
+    CycleEndTime falls within the next `EXPIRY_SOON_DAYS` days."""
+    now = time.time() if now is None else now
+    cutoff = now + EXPIRY_SOON_DAYS * 86400
+    remain = Decimal(0)
+    size = Decimal(0)
+    earliest = None
+    earliest_remaining = None
+    expiring_soon = Decimal(0)
+    for p in packages:
+        # Precise values carry fractional credit balances; cycle values are spendable now.
+        prefix = "Cycle" if any(k in p for k in ["CycleCapacityRemainPrecise", "CycleCapacityRemain"]) else ""
+        def field(name, default=None):
+            return p.get(prefix + name + "Precise", p.get(prefix + name, default))
+        r = number(field("CapacityRemain"))
+        capacity = number(field("CapacitySize", r))
+        spendable = min(r, capacity) if capacity else r
+        remain += spendable
+        size += capacity
+        if spendable > 0:
+            expiry = package_expiry(p)
+            if expiry is not None:
+                if earliest is None or expiry < earliest:
+                    earliest, earliest_remaining = expiry, float(spendable)
+                if now < expiry <= cutoff:
+                    expiring_soon += spendable
+    return {"remaining": float(remain), "packages": len(packages),
+            "earliest_expiry": earliest, "earliest_expiry_remaining": earliest_remaining,
+            "expiring_soon": float(expiring_soon), "expiring_soon_updated": int(now)}
+
+
+def number(value):
+    """上游金额字段 → Decimal（非法值抛 ValueError，pool 侧兜底转成 0）。
+
+    放在本模块：包里只有积分/签到链路用得到它，core 不依赖 admin，
+    而 admin 已不再持有计费细节。
+    """
+    if value is None:
+        raise ValueError("empty")
+    return Decimal(str(value))
+
+
+def fetch_credits(manager, client, headers=None) -> dict:
+    """拉本后端的积分余额与过期信息（BackendSpec.credits_fetcher）。
+
+    签名 ``f(manager, client, headers)`` —— headers 由 pool 统一取好传进来
+    （pool 还要用同一份头判 X-Domain），本函数内部自行再取一次也行。
+    """
+    packages = []
+    now = datetime.now(CN)
+    for page in range(1, BILLING_MAX_PAGES + 1):
+        d = _billing(manager, client, "get-user-resource", {
+            "PageNumber": page, "PageSize": BILLING_PAGE_SIZE, "ProductCode": "p_tcaca",
+            "Status": [0, 3], "PackageEndTimeRangeBegin": now.strftime(USAGE_TIME_FORMAT),
+            "PackageEndTimeRangeEnd": "2126-01-01 00:00:00"})
+        try:
+            data = d["Response"]["Data"]
+            current = data["Accounts"]
+            total = int(data["TotalCount"])
+            if not isinstance(current, list) or total < 0:
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise BackendUsageError("积分数据格式异常，上次余额已保留")
+        packages.extend(current)
+        if len(packages) >= total:
+            return summarize_packages(packages, now=now.timestamp())
+        if not current:
+            break
+    raise BackendUsageError("积分包分页不完整，上次余额已保留")
+
+
+def fetch_checkin_status(manager, client, headers=None) -> dict:
+    """签到状态查询（BackendSpec.checkin_status_fetcher）。
+
+    先问活动状态接口，404/405 回落旧接口；字段名双形态（snake/camel）都试。
+    返回 ``{active, checked}`` —— 与 Trae 的 ``{checked, enable, credits}``
+    只共用 ``checked`` 一个键，其余各取各的（pool 按需读）。
+    """
+    try:
+        d = _billing(manager, client, "checkin-activity-status")
+    except BackendUsageError as e:
+        if e.status not in (404, 405):
+            raise
+        d = _billing(manager, client, "checkin-status")
+    if not isinstance(d, dict):
+        raise BackendUsageError("签到状态格式异常")
+    def flag(snake, camel):
+        v = d.get(snake, d.get(camel))
+        if v not in (True, False, 0, 1, "true", "false", "1", "0"):
+            raise BackendUsageError("签到状态缺少必要字段")
+        return v in (True, 1, "true", "1")
+    return {"active": flag("active", "active"), "checked": flag("today_checked_in", "todayCheckedIn")}
+
+
+def fetch_checkin_claim(manager, client, headers=None) -> dict:
+    """执行签到（BackendSpec.checkin_claim_fetcher）。
+
+    本后端的签到是「POST daily-checkin 后回查状态」两步：上游不返回可判定的
+    业务码，成败只能看回查结果。所以这里**做完两步**再返回一个合成报文，
+    交给同模块的 interpret_checkin_claim 解读 —— pool 因此不需要为 WorkBuddy
+    单独留一条「先 POST 再回查」的分支。
+    """
+    _billing(manager, client, "daily-checkin")
+    return {"checked": fetch_checkin_status(manager, client, headers)["checked"]}
+
+
+def interpret_checkin_claim(data: dict) -> tuple[bool, str, bool]:
+    """签到结果解读（BackendSpec.interpret_checkin_claim）。
+
+    本后端没有业务码（见 fetch_checkin_claim），只看回查的 checked；
+    不可重试 —— 上游要么已接受、要么当场报错，重试同一个签到没有意义。
+    """
+    if data.get("checked"):
+        return True, "签到成功", False
+    return False, "签到已提交，但上游尚未确认；请刷新状态", False
+
+
 def fetch_upstream_usage(manager, client, start, end) -> list[dict]:
-    """拉本后端的上游用量明细，返回归一化行。
+    """拉本后端的上游用量明细，返回归一化行（BackendSpec.usage_fetcher）。
 
-    签名与 BackendSpec.usage_fetcher 的约定一致（见 base.py 的说明）：
-    ``f(manager, client, start, end) -> list[dict]``。manager 用来取本后端
-    的凭据头（chat 与账单接口共用同一套凭据），client 由调用方给
-    （测试用 MockTransport 注入），start/end 是北京时间带时区的 datetime。
-
-    归一化行字段与 upstream_request_usage 表一一对应：
+    签名 ``f(manager, client, start, end)``：manager 用来取本后端的凭据头，
+    client 由调用方给（测试用 MockTransport 注入），start/end 是北京时间
+    带时区的 datetime。归一化行字段与 upstream_request_usage 表一一对应：
     request_id / credit / model / client / request_time / agent_purpose / input_trunc。
     """
     headers = manager.get_headers()
@@ -151,6 +327,15 @@ class WorkBuddyBackend(BackendSpec):
     supports_upstream_usage = True
     usage_fetcher = "fetch_upstream_usage"
     #
+    # 积分 / 签到同样只认本后端凭据（billing 域），实现也在本模块 —— 由这组
+    # fetcher 指名，pool 的 operate() 一条路径分派，不再有「默认后端特权代码」。
+    # checkin_claim 留空：本后端的签到是「POST daily-checkin 后回查状态」，
+    # 没有独立 claim 接口，也不需要 interpret_checkin_claim（上游直接给结果）。
+    credits_fetcher = "fetch_credits"
+    checkin_status_fetcher = "fetch_checkin_status"
+    checkin_claim_fetcher = "fetch_checkin_claim"
+    billing_fetcher = "_billing"
+    #
     # 模型目录来自 /v3/config（见 admin/models.py:fetch）。它只认**本后端**账号的
     # 凭据，所以拉目录时必须挑一个默认后端的账号 —— 由本声明告诉 admin，
     # 而不是在 admin 里写死「用 workbuddy 账号」。
@@ -185,6 +370,10 @@ class WorkBuddyBackend(BackendSpec):
         from .. import converter  # 延迟 import 防循环
 
         return converter.CredentialManager(path)
+
+    def interpret_checkin_claim(self, data: dict):
+        """签到结果解读。实现见模块级同名函数。"""
+        return interpret_checkin_claim(data)
 
     async def astream(self, headers, body, *, timeout=None, raise_on_error=False):
         url = self.chat_url()

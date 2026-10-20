@@ -15,7 +15,9 @@ from fastapi import HTTPException
 from core import converter
 from admin.db import Database
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, _replay_receive, summarize_packages, request_affinity, CN, _tokens_of
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, _replay_receive, request_affinity, CN, _tokens_of
+from core.backends.registry import spec_for as registry_spec_for
+from core.backends.workbuddy import summarize_packages
 from conftest import credential  # 跨模块共用 helper，见 tests/conftest.py
 from conftest import recorded_no_sleep as _recorded_no_sleep
 
@@ -1051,12 +1053,16 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pool.select()[0],self.b)
 
     def test_pagination_is_complete(self):
+        # 积分分页实现在后端模块里（credits_fetcher），这里经 spec 分派调它：
+        # 行为不变（翻页直到收齐 TotalCount），只是调用点从 pool 挪进了 workbuddy。
         def handler(req):
             page=json.loads(req.content)['PageNumber']
             accounts=[{'CapacityRemainPrecise':'1.25','CapacitySize':2}]* (100 if page==1 else 1)
             return httpx.Response(200,json={'code':0,'data':{'Response':{'Data':{'TotalCount':101,'Accounts':accounts}}}})
+        spec = registry_spec_for("workbuddy")
+        manager = self.pool.store.manager_for(self.a, self.pool.store.data["accounts"][self.a])
         with httpx.Client(transport=httpx.MockTransport(handler)) as c:
-            result=self.pool.credits(c,{})
+            result=spec.fetch_credits(manager, c, {})
         self.assertEqual(result['packages'],101)
         self.assertEqual(result['remaining'],126.25)
 

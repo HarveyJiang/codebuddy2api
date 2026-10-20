@@ -719,7 +719,7 @@ def user_ent_summary(client: httpx.Client, headers: dict, ug_host: str | None = 
     """聚合积分余额 + 过期信息，供账号池「最近过期 / 7 天内过期」两列。
 
     返回 {remaining, earliest_expiry, earliest_expiry_remaining, expiring_soon,
-    expiring_soon_updated}——字段名与 pool.summarize_packages（WorkBuddy 路径）
+    expiring_soon_updated}——字段名与 workbuddy.summarize_packages（WorkBuddy 路径）
     一致，前端两列对两个后端同一套渲染。
 
     remaining 口径同旧 user_ent_usage：每个权益包可用额度 =
@@ -861,6 +861,43 @@ def user_ent_usage(client: httpx.Client, headers: dict, ug_host: str | None = No
                    now: float | None = None) -> float:
     """只取剩余积分（旧签名保留）；完整口径见 user_ent_summary。"""
     return user_ent_summary(client, headers, ug_host, now)["remaining"]
+
+
+# --- fetcher 适配层（BackendSpec 的 *_fetcher 约定） -------------------------
+#
+# 上面那批函数的签名是 ``(client, headers, ...)`` —— 凭据头由调用方
+# （TraeCredentialManager 的方法、或单测）准备好。而 pool 经 spec 分派时
+# 拿到的是 ``(manager, client, headers)``：manager 是凭据管理器、headers 是
+# pool 统一取好的（它还要拿这回头判 X-Domain）。这里补三个薄适配，
+# 把 manager 自带的凭据头翻译成上面那批函数要的形状。
+#
+# 为什么不直接把上面那批函数改签名：它们的调用方不只在 pool ——
+# TraeCredentialManager 的方法（checkin_status/claim/user_ent_summary）
+# 与一堆单测都按 (client, headers) 调。改签名要连带动一片，
+# 而适配层只有三行、语义无歧义。
+
+def fetch_credits(manager, client, headers=None) -> dict:
+    """积分余额 + 过期信息（BackendSpec.credits_fetcher）。
+
+    在 user_ent_summary 之上补 ``packages``：本后端没有「包个数」概念，
+    但账号池与前端按同一个字段渲染（>0 即「有余额」）。为 0 时不置
+    packages —— 避免把「无权益包」误判成 exhausted，真实耗尽由上游
+    1005→402 冷却兜底。earliest_* / expiring_* 字段名与
+    workbuddy.summarize_packages 一致，前端两列同一套渲染。
+    """
+    data = user_ent_summary(client, manager.ug_headers())
+    data["packages"] = 1 if data.get("remaining", 0) > 0 else 0
+    return data
+
+
+def fetch_checkin_status(manager, client, headers=None) -> dict:
+    """签到状态（BackendSpec.checkin_status_fetcher）。"""
+    return checkin_status(client, manager.ug_headers())
+
+
+def fetch_checkin_claim(manager, client, headers=None) -> dict:
+    """执行签到，返回上游原始报文（BackendSpec.checkin_claim_fetcher）。"""
+    return checkin_claim(client, manager.ug_headers())
 
 
 # ---------------------------------------------------------------------------
@@ -1307,13 +1344,14 @@ class TraeBackend(BackendSpec):
     # 设置页总闸（settings.backend_enabled）是另一层，两者都为「开」才启用。
     kill_switch_env = "CODEBUDDY_ENABLE_TRAE"
 
-    # 积分/签到走 ug 接口，由 pool 分派到本后端的实现（_operate_nondefault）。
-    account_ops_backend = "trae"
-
-    # 上游用量明细：Trae 有一套自己的接口（api.trae.cn 的按 session 聚合），
-    # 实现放在本模块，由 usage_fetcher 声明（pool 只读声明，不认后端名）。
+    # 积分/签到走 ug 接口，实现就在本模块；由这组 fetcher 指名（与 usage_fetcher
+    # 同款），pool 的 operate() 一条路径分派，不再有「默认后端特权代码」。
+    # checkin_claim 返回上游原始报文，成败由下面的 interpret_checkin_claim 判。
     supports_upstream_usage = True
     usage_fetcher = "fetch_upstream_usage"
+    credits_fetcher = "fetch_credits"
+    checkin_status_fetcher = "fetch_checkin_status"
+    checkin_claim_fetcher = "fetch_checkin_claim"
 
     # 上游错误类型与签到报文解释规则都归本后端声明 —— pool 只读声明、不认名字。
     # （见 base.BackendSpec.error_class_name 的说明：这里给的是**类名**，

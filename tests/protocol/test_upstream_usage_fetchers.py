@@ -292,5 +292,19 @@ class DeclarationTests(unittest.TestCase):
         class _Broken(registry.BackendSpec):
             name = "broken"
             usage_fetcher = "not_here"
-        with self.assertRaises(TypeError):
+        # 声明了个模块里不存在的名字：报「未提供实现」而不是裸 AttributeError
+        # （fetch_usage_rows 跑在上游调用路径上，最不该在这里出难懂的二次异常）。
+        with self.assertRaises(NotImplementedError):
             _Broken().fetch_usage_rows(_FakeManager(), None, START, END)
+
+    def test_undeclared_fetchers_raise_not_implemented(self):
+        """基类默认四个账号操作 fetcher 都没声明 → 调用即 NotImplementedError。"""
+        plain = registry.BackendSpec()
+        with self.assertRaises(NotImplementedError):
+            plain.fetch_credits(None, None, {})
+        with self.assertRaises(NotImplementedError):
+            plain.fetch_checkin_status(None, None, {})
+        with self.assertRaises(NotImplementedError):
+            plain.fetch_checkin_claim(None, None, {})
+        with self.assertRaises(NotImplementedError):
+            plain.fetch_billing(None, None, "x")

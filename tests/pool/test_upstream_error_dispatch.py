@@ -84,7 +84,7 @@ def test_nondefault_backend_errors_are_caught_by_declared_type(trae_pool, monkey
     def boom(*a, **k):
         raise registry.spec_for("trae").upstream_error_class()("凭据过期", status=401)
 
-    monkeypatch.setattr(pool.store.manager_for(aid, pool.store.data["accounts"][aid]), "checkin_status", boom)
+    monkeypatch.setattr(registry.spec_for("trae"), "fetch_checkin_status", boom)
     result = pool.operate(aid, "status")
 
     assert result["ok"] is False
@@ -104,7 +104,7 @@ def test_nondefault_backend_error_message_uses_declared_label(trae_pool, monkeyp
     def boom(*a, **k):
         raise registry.spec_for("trae").upstream_error_class()("上游 500", status=500)
 
-    monkeypatch.setattr(pool.store.manager_for(aid, pool.store.data["accounts"][aid]), "checkin_status", boom)
+    monkeypatch.setattr(registry.spec_for("trae"), "fetch_checkin_status", boom)
     result = pool.operate(aid, "status")
     # 500 不判失效：原样透出上游消息。
     assert result["ok"] is False and "上游 500" in result["message"]
@@ -137,25 +137,25 @@ def test_checkin_claim_retryable_code_is_retried(trae_pool, monkeypatch):
 
     seen = {"claim": 0}
 
-    def claim(client):
+    def claim(manager, client, headers=None):
         seen["claim"] += 1
         if seen["claim"] == 1:
             return {"code": 9074, "message": "请求过于频繁，请稍后重试"}
         return {"code": 0, "message": "ok"}
 
-    monkeypatch.setattr(pool.store.manager_for(aid, pool.store.data["accounts"][aid]), "checkin_claim", claim)
+    monkeypatch.setattr(registry.spec_for("trae"), "fetch_checkin_claim", claim)
     result = pool.operate(aid, "checkin")
 
     assert seen["claim"] == 2, "可重试码必须触发第二次尝试"
     assert result["ok"] is True, result
 
 
-def test_workbuddy_account_does_not_take_nondefault_path(tmp_path, monkeypatch):
-    """腾讯账号不走非默认后端那条路 —— 分派是按声明、不是按「有没有 trae」。
+def test_workbuddy_account_uses_its_own_fetchers(tmp_path, monkeypatch):
+    """腾讯账号的积分/签到实现来自它自己的 fetcher 声明，不是别人的。
 
-    上游返回一份**合法**的腾讯账单响应，让这条用例只验分派、不依赖
-    「上游会失败」这种隐式前提（否则腾讯路径哪天变得容忍空 body，测试仍绿
-    但语义已经漂移）。
+    重构后 pool 里只有一条路径，这条用例盯的是「分派没串」：上游返回一份
+    合法的腾讯账单响应，同时把 Trae 的 credits fetcher 换成会爆炸的桩 ——
+    若分派错了（腾讯账号打到 Trae 实现），这里必炸。
     """
     def handler(request):
         return httpx.Response(200, json={
@@ -166,16 +166,10 @@ def test_workbuddy_account_does_not_take_nondefault_path(tmp_path, monkeypatch):
     pool = build_pool(tmp_path, [_workbuddy_info(tmp_path)], handler)
     aid = next(iter(pool.store.data["accounts"]))
 
-    called = {"n": 0}
-    real = pool._operate_nondefault
+    def boom(*a, **k):
+        raise AssertionError("腾讯账号不该被分派到 Trae 的积分实现")
 
-    def spy(*a, **k):
-        called["n"] += 1
-        return real(*a, **k)
-
-    monkeypatch.setattr(pool, "_operate_nondefault", spy)
-    try:
-        pool.operate(aid, "status")
-    except Exception:
-        pass  # 上游是空 body，腾讯路径会自己失败 —— 我们只看分派
-    assert called["n"] == 0, "腾讯账号不该被分派到非默认后端实现"
+    monkeypatch.setattr(registry.spec_for("trae"), "fetch_credits", boom)
+    result = pool.operate(aid, "status")
+    # 空包 → remaining 0，但路径正确走完（没炸）即证明分派对。
+    assert result["ok"] is True, result

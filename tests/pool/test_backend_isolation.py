@@ -265,20 +265,55 @@ class BackendIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(state["cooldown_until"], self.now)
 
     def test_account_ops_dispatch_follows_declaration(self):
-        """积分/签到的实现由 BackendSpec.account_ops_backend 决定，不是比后端名。"""
+        """积分/签到的实现由各后端自己的 fetcher 声明决定，不是比后端名。
+
+        重构后 pool 里只有一条路径：读 spec 的 credits/checkin fetcher，
+        两个后端各自在模块里提供同签名函数。这里盯的是「分派真的按声明走」：
+        Trae 的调用落到 trae 模块的函数上，腾讯的落到 workbuddy 模块的。
+        """
         from core.backends.registry import spec_for
 
-        self.assertIsNone(spec_for("workbuddy").account_ops_backend,
-                          "默认后端走 pool 的默认实现（billing 接口）")
-        self.assertEqual(spec_for("trae").account_ops_backend, "trae")
-        # 池子确实按声明分派：Trae 账号打到 _operate_nondefault，腾讯不走那里。
-        calls = []
-        self.pool._operate_nondefault = lambda aid, mgr, action, backend: (
-            calls.append((aid, backend)), {"id": aid, "ok": True, "message": "x"})[1]
-        self.pool.operate(self.tr, "status")
-        self.assertEqual(calls, [(self.tr, "trae")])
-        self.pool.operate(self.wb, "status")
-        self.assertEqual(calls, [(self.tr, "trae")], "腾讯账号不该走非默认后端的实现")
+        for name, fetcher in (("workbuddy", "fetch_credits"), ("trae", "fetch_credits")):
+            spec = spec_for(name)
+            self.assertTrue(getattr(spec, "credits_fetcher"), name)
+            module = __import__("sys").modules[type(spec).__module__]
+            self.assertIs(getattr(spec, "credits_fetcher"), fetcher, name)
+            self.assertTrue(callable(getattr(module, fetcher)), name)
+        # account_ops_backend 这个「默认/非默认」分派开关已退场：pool 不再
+        # 区分谁是默认后端，实现位置全看 fetcher 声明。
+        self.assertIsNone(spec_for("workbuddy").account_ops_backend)
+        self.assertIsNone(spec_for("trae").account_ops_backend)
+
+    def test_operate_calls_each_backend_own_fetcher(self):
+        """池子按账号的声明分派：两个账号各打各的积分实现。"""
+        from core.backends.registry import spec_for
+
+        seen = []
+        # spec 上的方法是基类定义的；这里在**实例**上覆写 → 调用时不再绑 self，
+        # 收到的就是 pool 传的三个参数（manager, client, headers）。
+        real = spec_for("workbuddy").fetch_credits
+
+        def spy_workbuddy(manager, client, headers):
+            seen.append("workbuddy")
+            return real(manager, client, headers)
+
+        def spy_trae(manager, client, headers):
+            seen.append("trae")
+            return {"remaining": 0.0, "packages": 0, "earliest_expiry": None,
+                    "earliest_expiry_remaining": None, "expiring_soon": 0.0,
+                    "expiring_soon_updated": int(time.time())}
+
+        spec_for("workbuddy").fetch_credits = spy_workbuddy
+        spec_for("trae").fetch_credits = spy_trae
+        try:
+            self.pool.operate(self.wb, "status")
+            self.assertEqual(seen, ["workbuddy"])
+            seen.clear()
+            self.pool.operate(self.tr, "status")
+            self.assertEqual(seen, ["trae"], "Trae 账号必须打到 Trae 的积分实现")
+        finally:
+            del spec_for("workbuddy").fetch_credits
+            del spec_for("trae").fetch_credits
 
 
 if __name__ == "__main__":

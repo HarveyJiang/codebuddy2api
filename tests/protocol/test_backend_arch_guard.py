@@ -28,7 +28,7 @@
 - 404 冷却时长 → `BackendSpec.soft_cooldown`
 - reasoning / count_tokens 行为 → `keep_reasoning_delta` / `count_tokens_upstream`
 - 凭据归属、expiresAt 单位 → `credential_backend` / `expires_at_to_ms`
-- 积分签到由谁实现 → `account_ops_backend`
+- 积分/签到/用量明细的实现位置 → `credits_fetcher` / `checkin_status_fetcher` / `usage_fetcher`
 - 展示用的 label / icon / 颜色 / 顺序 → `label` / `icon` / `color` / `order`
 
 如果**确实**是「全局唯一、与具体后端无关」的开关，用 `# arch-guard: ok` 在该行注明
@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -203,7 +204,7 @@ def test_callers_do_not_branch_on_backend_name():
     """调用方不得用 ``== "trae"`` / ``in ("workbuddy", "trae")`` 判断后端。
 
     这类判断是「加后端要改 N 处」的根因。改用 ``BackendSpec`` 的声明：
-    软冷却、flags、account_ops_backend、credential_name 等。
+    软冷却、flags、各 fetcher 声明、credential_name 等。
     """
     offenders = []
     for rel, path in _caller_files():
@@ -243,7 +244,7 @@ def test_callers_do_not_use_backend_specific_names():
     assert not offenders, (
         "调用方出现「为某一个后端写的」标识符：\n  "
         + "\n  ".join(offenders)
-        + "\n\n请改成通用名字（如 any_manager(backend) / _operate_nondefault(...)），"
+        + "\n\n请改成通用名字（如 any_manager(backend) / spec.fetch_credits(...)），"
           "确有例外时在该行加 `# arch-guard: ok`。"
     )
 
@@ -277,6 +278,31 @@ def test_callers_do_not_import_a_backend_module():
         "调用方 import 了某一个后端的模块（加新后端时要改，且会破坏懒构造）：\n  "
         + "\n  ".join(offenders)
         + "\n\n请把差异声明成 BackendSpec 的能力；确实需要该模块时在 registry/后端内部取。"
+    )
+
+
+def test_pool_holds_no_backend_billing_domain():
+    """pool 里不得再出现任何后端的计费域名字面量。
+
+    历史形状：pool 写死 ``BILLING = "https://www.codebuddy.cn/v2/billing/meter/"``
+    （积分/签到）与 ``USAGE_BILLING = "https://www.workbuddy.cn/billing/meter/"``
+    （用量明细），加第二个后端时只能靠 ``account_ops_backend`` 绕开它 ——
+    「默认后端特权代码」就是这么留下来的。现在两者的实现都在各自后端模块里
+    （``credits_fetcher`` / ``usage_fetcher``），pool 只读声明。
+    """
+    src = (ROOT / "admin" / "pool.py").read_text(encoding="utf-8")
+    domains = []
+    for spec_name in ("workbuddy", "trae"):
+        # 从后端模块里取该后端自己的计费域名，避免这里再抄一份字面量。
+        module = sys.modules.get(f"core.backends.{spec_name}")
+        for const in ("BILLING", "USAGE_BILLING", "UG_HOST"):
+            value = getattr(module, const, None) if module else None
+            if isinstance(value, str) and value and value in src:
+                domains.append(f"{spec_name}.{const}={value}")
+    assert not domains, (
+        "admin/pool.py 里出现后端计费域名字面量（实现该搬进后端模块了）：\n  "
+        + "\n  ".join(domains)
+        + "\n\n请把该接口搬进 core/backends/<后端>.py，用 fetcher 声明指名。"
     )
 
 

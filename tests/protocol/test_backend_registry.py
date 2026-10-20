@@ -629,10 +629,21 @@ def test_credential_name_matches_backend_by_default():
     assert registry.spec_for("trae").credential_name() == "trae"
 
 
-def test_account_ops_backend_declares_implementation():
-    """积分/签到由谁实现，由声明决定：默认后端走 pool 的默认实现，Trae 自己接管。"""
+def test_account_ops_implementation_is_declared_per_backend():
+    """积分/签到的实现由各后端自己的 fetcher 声明指名。
+
+    ``account_ops_backend`` 这个「默认/非默认」分派开关已退场：pool 不再
+    区分谁是默认后端，两个后端一样，都在各自模块里提供同签名的模块级函数。
+    """
     assert registry.spec_for("workbuddy").account_ops_backend is None
-    assert registry.spec_for("trae").account_ops_backend == "trae"
+    assert registry.spec_for("trae").account_ops_backend is None
+    for name in ("workbuddy", "trae"):
+        spec = registry.spec_for(name)
+        assert spec.credits_fetcher, name
+        assert spec.checkin_status_fetcher, name
+        module = sys.modules.get(type(spec).__module__)
+        assert callable(getattr(module, spec.credits_fetcher, None)), name
+        assert callable(getattr(module, spec.checkin_status_fetcher, None)), name
 
 
 def test_auto_checkin_participation_is_declared():
@@ -680,8 +691,8 @@ def test_upstream_error_class_resolves_from_declaration():
     assert trae.upstream_error_class() is TraeAPIError
 
 
-def test_only_account_ops_backend_implements_checkin_claim():
-    """签到报文的解释规则由**声明了 account_ops_backend 的后端**实现。
+def test_checkin_claim_interpretation_is_declared_per_backend():
+    """签到报文的解释规则由**有签到能力的后端**自己实现。
 
     各家签到报文的形状是私有协议，没有通用默认值 —— 所以默认实现必须显式
     拒绝（否则第三个后端会静默套用别人的规则，把失败读成成功）。
