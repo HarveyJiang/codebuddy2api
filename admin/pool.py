@@ -186,6 +186,12 @@ class AccountPool:
                      "affinity_expiry_days": 3, "credit_min_interval": 60,
                      "sync_start": "10:00", "sync_end": "20:00", "batch_spread": 90,
                      "default_routing": "round_robin",
+                     # 成长任务（任务 / 旅行 / 活跃）。默认关闭：这些动作会真的
+                     # 打上游并领积分，替用户自动做主不合适，所以整块默认 0。
+                     # 时点用「小时列表」字符串（逗号分隔），取自参考项目：
+                     # 旅行早/晚各一次（出发与领奖），活跃一次。
+                     "growth_travel_hours": "",
+                     "growth_activity_hours": "",
                      # 容量队列自动切换（specs/queue-failover.md）。默认关闭：这是
                      # 唯一会「重放整个请求」的功能，出问题的影响面比其它设置大，
                      # 让用户在管理页显式打开。
@@ -214,7 +220,8 @@ class AccountPool:
     # 分类口径跟着走才不会两头对不上。
     SETTING_GROUPS = {
         "checkin": ("auto_checkin", "checkin_time", "batch_spread",
-                    "credit_min_interval", "sync_start", "sync_end"),
+                    "credit_min_interval", "sync_start", "sync_end",
+                    "growth_travel_hours", "growth_activity_hours"),
         "queue": ("queue_failover", "queue_model_fallback", "queue_retry",
                   "queue_cooldown", "queue_hold_ms", "queue_fallback_model"),
         "routing": ("default_routing",),
@@ -330,7 +337,14 @@ class AccountPool:
                         # 上游用量同步留痕：不吐给 overview 的话「留痕」没人看得到，
                         # 出了同步故障只能翻库，等于没有这个功能。
                         "usage_synced_at": status.get("usage_synced_at"),
-                        "usage_sync_error": status.get("usage_sync_error")})
+                        "usage_sync_error": status.get("usage_sync_error"),
+                        # 成长中心：活跃上报每号每天一次即可，记住上次是哪天，
+                        # 前端据此显示「今日已上报」并挡住重复上报。
+                        "activity_date": status.get("activity_date"),
+                        "today_activity_reported": status.get("activity_date") == today,
+                        # 旅行同理：一天最多跑一次「状态→领奖/出发」循环。
+                        "travel_date": status.get("travel_date"),
+                        "today_travel_done": status.get("travel_date") == today})
         return rows
 
     # -- 容量队列（specs/queue-failover.md） --------------------------------
@@ -887,6 +901,100 @@ class AccountPool:
                 self.update(aid, last_error=message)
                 return {"id": aid, "ok": False, "message": message}
 
+    # -- 成长任务（任务 / 旅行 / 活跃） ---------------------------------------
+    #
+    # 签到与保活本项目已有（签到走 checkin_* 声明、保活是 tick 里刷新凭据），
+    # 这里只补上游成长中心那三件：成长任务、猫猫旅行、活跃上报。
+    #
+    # 实现同样由后端自己声明（growth_tasks_fetcher / growth_task_action_fetcher /
+    # travel_fetcher / activity_report_fetcher，见 base.py），pool 只做分派——
+    # 没声明的后端（Trae）会抛 NotImplementedError，这里翻成一句人话。
+
+    #: 成长动作 → 走哪个 fetcher。分派表也是声明，调用方不认后端名。
+    GROWTH_ACTIONS = {
+        "tasks": "fetch_growth_tasks",
+        "accept": "fetch_growth_task_action",
+        "claim": "fetch_growth_task_action",
+        "travel_status": "fetch_travel",
+        "travel_depart": "fetch_travel",
+        "travel_claim": "fetch_travel",
+        "activity": "fetch_activity_report",
+    }
+
+    def growth(self, aid, action, **params):
+        """成长任务动作：拉任务列表、接单/领奖、旅行三态、活跃上报。
+
+        返回统一的 {id, ok, message, ...}；data 里放上游归一化后的结果。
+        """
+        if action not in self.GROWTH_ACTIONS:
+            return {"id": aid, "ok": False, "message": "未知的成长任务动作"}
+        with self.operation_lock(aid):
+            item, previous = self.snapshot(aid)
+            manager = self.store.manager_for(aid, item)
+            spec = spec_for(item.get("backend", default_backend()))
+            try:
+                headers = manager.get_headers()
+                today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
+                with self.client_factory() as client:
+                    if action == "tasks":
+                        data = spec.fetch_growth_tasks(manager, client, headers)
+                    elif action in ("accept", "claim"):
+                        # 领奖/接单的动作名与后端 fetcher 的 action 参数同名，
+                        # 只有接单要带 task_codes、领奖要带 task_code。
+                        kwargs = {k: v for k, v in params.items() if v is not None}
+                        data = spec.fetch_growth_task_action(
+                            manager, client, headers, action, **kwargs)
+                    elif action == "activity":
+                        data = spec.fetch_activity_report(manager, client, headers)
+                    else:
+                        # 旅行：pool 的动作名带 travel_ 前缀（避免与别处撞名），
+                        # 后端 fetcher 认的是 status/depart/claim，这里做一次映射。
+                        kwargs = {k: v for k, v in params.items() if v is not None}
+                        travel_action = action.split("_", 1)[-1]
+                        data = spec.fetch_travel(manager, client, headers, travel_action, **kwargs)
+                if action == "activity":
+                    # 活跃上报每号每天一次即可（多打既没收益又是密度特征），
+                    # 记住今天报过了，前端就能显示「今日已上报」并挡住重复上报。
+                    self.update(aid, activity_date=today)
+                message = {
+                    "tasks": "任务列表已更新",
+                    "accept": "已提交接单请求",
+                    "claim": "领奖请求已提交",
+                    "travel_status": "旅行状态已更新",
+                    "travel_depart": "已出发",
+                    "travel_claim": "旅行奖励已领取",
+                    "activity": "活跃已上报",
+                }[action]
+                return {"id": aid, "ok": True, "message": message, "data": data}
+            except NotImplementedError:
+                # 后端没声明这个能力（NotImplementedError 是 RuntimeError 的
+                # 子类，必须在兜底之前单独接住，否则文案会变成「操作失败」）。
+                message = "该后端暂不支持成长任务"
+                return {"id": aid, "ok": False, "message": message}
+            except BackendUsageError as e:
+                err = BillingError(str(e), e.status)
+                self.update(aid, last_error=str(err))
+                if err.status in (401, 403):
+                    self.update(aid, cooldown_until=self.clock() + 300)
+                return {"id": aid, "ok": False, "message": str(err)}
+            except BillingError as e:
+                self.update(aid, last_error=str(e))
+                if err.status in (401, 403):
+                    self.update(aid, cooldown_until=self.clock() + 300)
+                return {"id": aid, "ok": False, "message": str(e)}
+            except spec.upstream_error_class() as e:
+                label = spec.label
+                if getattr(e, "status", None) in (401, 403):
+                    self.update(aid, auth_invalid=True, cooldown_until=self.clock() + 300,
+                                last_error=f"{label} 登录凭据已失效，请重新授权")
+                    return {"id": aid, "ok": False, "message": f"{label} 登录凭据已失效，请重新授权"}
+                self.update(aid, last_error=str(e))
+                return {"id": aid, "ok": False, "message": str(e)}
+            except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError):
+                message = "操作失败：请检查登录凭据或网络，必要时重新授权"
+                self.update(aid, last_error=message)
+                return {"id": aid, "ok": False, "message": message}
+
     async def batch(self, action):
         if self.jobs.locked():
             raise HTTPException(409, "已有批量任务进行中，请稍后刷新")
@@ -1025,9 +1133,88 @@ class AccountPool:
                     except Exception:
                         # 同上：逐账号兜住，否则一个坏账号会让本轮后续账号都刷不到。
                         _logger.exception("账号 %s 凭据预刷新异常，已跳过（不影响其它账号）", aid)
+        # 成长任务（旅行 / 活跃）：按配置时点自动跑。
+        # 默认关闭（growth_*_hours 为空）——这些动作会真打上游并领积分，
+        # 替用户自动做主不合适，所以整块默认空。
+        await self._tick_growth(cfg, now, today)
         self.flush()
         # 上游用量明细：每账号每天一次，失败只留痕不影响其它账号。
         await self.sync_upstream_usage_batch()
+
+    @staticmethod
+    def _growth_hours(value):
+        """把 "9,21" 这样的配置解析成整数小时集合（空串 = 不跑）。"""
+        hours = set()
+        for part in str(value or "").split(","):
+            part = part.strip()
+            if part.isdigit():
+                hours.add(int(part) % 24)
+        return hours
+
+    async def _tick_growth(self, cfg, now, today):
+        """按配置时点自动执行旅行与活跃上报。
+
+        - 旅行：一次「状态→领奖/出发」的完整循环。每号每天一次（travel_date 去重），
+          上午发一次、晚上再发一次（linguo 的排程是 [9,21]），第二次多半是去领奖。
+        - 活跃：每号每天一次（activity_date 去重）。一次上报同时点亮连登、
+          解锁领养任务，所以放在旅行之前做（领养任务依赖它）。
+        """
+        travel_hours = self._growth_hours(cfg.get("growth_travel_hours"))
+        activity_hours = self._growth_hours(cfg.get("growth_activity_hours"))
+        if not travel_hours and not activity_hours:
+            return
+        hour = now.hour
+        with self.store.lock:
+            targets = [aid for aid, item in self.store.data["accounts"].items()
+                       if item.get("enabled")
+                       and is_backend_enabled(item.get("backend", default_backend()))
+                       and spec_for(item.get("backend", default_backend())).supports_growth]
+            statuses = {aid: dict(self.store.data["account_status"].get(aid, {}))
+                        for aid in targets}
+        for aid in targets:
+            status = statuses.get(aid, {})
+            spec = spec_for(self.store.data["accounts"][aid].get("backend", default_backend()))
+            # 活跃先跑：领养（first_buddy）任务要靠它解锁。
+            if hour in activity_hours and status.get("activity_date") != today:
+                try:
+                    # growth() 内部已经把 activity_date 记成今天，这里不用再写。
+                    await asyncio.to_thread(self.growth, aid, "activity")
+                except HTTPException:
+                    pass
+                except Exception:
+                    _logger.exception("账号 %s 活跃上报异常，已跳过（不影响其它账号）", aid)
+            # 旅行：一天最多跑一次「状态→领奖/出发」循环。
+            if hour in travel_hours and status.get("travel_date") != today:
+                try:
+                    result = await asyncio.to_thread(self._growth_travel_cycle, aid)
+                    if result.get("ok"):
+                        self.update(aid, travel_date=today)
+                except HTTPException:
+                    pass
+                except Exception:
+                    _logger.exception("账号 %s 旅行任务异常，已跳过（不影响其它账号）", aid)
+
+    def _growth_travel_cycle(self, aid):
+        """一次旅行循环：查状态 → 已到达就领奖，闲着就出发。
+
+        领奖优先于出发：88lin 的做法是「只有领取成功才把 state 视为 idle，
+        否则不派 Buddy」——未领的奖励不该被下一次出发覆盖。
+        """
+        state = self.growth(aid, "travel_status")
+        if not state.get("ok"):
+            return state
+        info = state.get("data") or {}
+        mode = info.get("state")
+        if mode == "arrived":
+            record_id = info.get("record_id")
+            if record_id in (None, ""):
+                return {"id": aid, "ok": False, "message": "旅行已到达但没有记录编号，无法领奖"}
+            return self.growth(aid, "travel_claim", record_id=record_id)
+        if mode == "traveling":
+            return {"id": aid, "ok": True, "message": "旅行进行中"}
+        if info.get("daily_limit_reached"):
+            return {"id": aid, "ok": False, "message": "今日旅行名额已用完"}
+        return self.growth(aid, "travel_depart")
 
     # 页面刷新触发的积分拉取：每账号限流，避免频繁请求被上游风控。
     REFRESH_MIN_INTERVAL = 60

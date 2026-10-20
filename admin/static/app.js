@@ -22,6 +22,7 @@ const labels = {
   models: ["模型管理", "MODEL CATALOG", "与官方客户端一致的模型列表，可按需启用或禁用。"],
   test: ["连接测试", "CONNECTION LAB", "经账号池按路由规则发起请求，确认模型能否正常响应。"],
   usage: ["用量明细", "USAGE LEDGER", "查看上游账单级的积分消耗，默认只读本地库，点击「拉取上游」才请求上游。"],
+  growth: ["成长任务", "GROWTH TASKS", "上游的每日任务、猫咪旅行与活跃上报；签到与保活也在这里一并看。"],
   settings: ["设置", "WORKSPACE SETTINGS", "签到、排队容错、默认分配与数据库备份等全局设置。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
 };
@@ -80,6 +81,7 @@ function goPage(next) {
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
   if (next === "usage") initUsagePage();
+  if (next === "growth") loadGrowth();
   if (next === "logs") loadLogs(logOffset);
   if (next === "settings") loadBackups().catch(e => toast(e.message));
 }
@@ -148,7 +150,7 @@ function render() {
   $("accounts-empty").hidden = accounts.length > 0;
   renderAccounts();
   if (!$("pool-settings").contains(document.activeElement)) {
-    $("pool-routing").value = overview.pool?.default_routing || "round_robin"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; $("sync-start").value = overview.pool?.sync_start || "10:00"; $("sync-end").value = overview.pool?.sync_end || "20:00";
+    $("pool-routing").value = overview.pool?.default_routing || "round_robin"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; $("sync-start").value = overview.pool?.sync_start || "10:00"; $("sync-end").value = overview.pool?.sync_end || "20:00"; $("growth-travel-hours").value = overview.pool?.growth_travel_hours || ""; $("growth-activity-hours").value = overview.pool?.growth_activity_hours || "";
     $("queue-failover").checked = overview.pool?.queue_failover || false; $("queue-model-fallback").checked = overview.pool?.queue_model_fallback !== false; $("queue-retry").value = overview.pool?.queue_retry ?? 3; $("queue-cooldown").value = overview.pool?.queue_cooldown ?? 120; $("queue-hold-ms").value = overview.pool?.queue_hold_ms ?? 3000; $("queue-fallback-model").value = overview.pool?.queue_fallback_model || "fast-model";
     paintBackendToggles();
     paintSettings();
@@ -730,6 +732,7 @@ async function refresh(loadCredits) {
     // initUsagePage 不会跑，首次进入前 tab 条必须是空的而不是陈旧的。
     if (usageInitialized) { fillUsageAccounts(); paintUsageTabs(); }
     if (page === "dashboard" || page === "logs") loadLogs(logOffset);
+    if (page === "growth") loadGrowth();
   }
   catch (e) { $("load-error").textContent = e.message; $("load-error").hidden = false; throw e; }
   finally { $("refresh").disabled = false; }
@@ -786,7 +789,7 @@ $("dash-add").addEventListener("click", () => openAccount());
 $("dash-add-account").addEventListener("click", () => openAccount());
 $("empty-add").addEventListener("click", () => openAccount());
 $("accounts-back-dash").addEventListener("click", e => { e.preventDefault(); goPage("dashboard"); });
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{backup_enabled:$("backup-enabled").checked,backup_interval_hours:Number($("backup-interval").value),backup_keep:Number($("backup-keep").value),default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody()}});await refresh();await loadBackups();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{backup_enabled:$("backup-enabled").checked,backup_interval_hours:Number($("backup-interval").value),backup_keep:Number($("backup-keep").value),default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),growth_travel_hours:$("growth-travel-hours").value.trim(),growth_activity_hours:$("growth-activity-hours").value.trim(),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody()}});await refresh();await loadBackups();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 
 // ── 数据库备份 ──────────────────────────────────────────────────────────
@@ -2086,5 +2089,213 @@ $("usage-history-total").addEventListener("click", async e => {
   $("key-requests-dialog").showModal();
   await loadKeyRequests(0);
 });
+
+
+/* ---------- 成长任务（上游任务 / 猫咪旅行 / 活跃上报） ---------- */
+//
+// 上游的成长中心是「接单 → 推进 → 领奖」三段式，代理层不猜哪一步该做，
+// 只把上游返回的真实状态铺开，让人和定时任务都按同一份事实决策。
+// 签到与保活（低峰刷新凭据）本项目本来就有，这里只做展示与手动触发。
+
+// 上游的状态值 → 人话。取值域见后端归一化（workbuddy.py 的 _task_row）。
+const growthTaskState = s => ({
+  not_accepted: "未接单", accepted: "已接单", in_progress: "进行中",
+  completed: "可领奖", claimed: "已领取",
+}[s] || s || "—");
+const growthTravelState = s => ({
+  idle: "待出发", traveling: "在路上", arrived: "已到达",
+}[s] || s || "—");
+// 上游的时间戳单位没写明（epoch 秒 / 毫秒都见过），按量级判断再格式化。
+const growthTime = v => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return stamp(n > 1e11 ? n : n * 1000);
+};
+
+async function loadGrowth() {
+  const body = $("growth-body");
+  if (!overview) { body.innerHTML = '<tr><td colspan="6" class="muted">正在加载…</td></tr>'; return; }
+  const accounts = overview.accounts || [];
+  body.innerHTML = accounts.map(a => {
+    const checkin = a.today_checked_in
+      ? '<span class="pill green">今日已签</span>' : '<span class="pill">未签到</span>';
+    const alive = a.token_refreshed
+      ? `<span class="muted">${esc(growthTime(a.token_refreshed))}</span>` : '<span class="muted">—</span>';
+    const activity = a.today_activity_reported
+      ? '<span class="pill green">今日已报</span>' : '<span class="pill">今日未报</span>';
+    return `<tr data-growth="${esc(a.id)}">`
+      + `<td><div class="account-cell"><strong>${esc(accountLabel(a))}</strong></div></td>`
+      + `<td>${checkin}</td>`
+      + `<td>${alive}</td>`
+      + `<td>${activity}</td>`
+      + `<td class="muted">点行查看上游状态</td>`
+      + `<td class="align-right"><div class="actions">`
+      + `<button class="btn-ghost" data-growth-action="checkin" data-id="${esc(a.id)}">签到</button>`
+      + `<button class="btn-ghost" data-growth-action="refresh" data-id="${esc(a.id)}">保活</button>`
+      + `<button class="btn-ghost" data-growth-action="activity" data-id="${esc(a.id)}">报活跃</button>`
+      + `<button class="btn-ghost" data-growth-action="tasks" data-id="${esc(a.id)}">任务</button>`
+      + `</div></td></tr>`;
+  }).join("") || '<tr><td colspan="6" class="muted">还没有账号。</td></tr>';
+}
+
+// 打开某个账号的成长详情：任务列表 + 旅行状态一次拉齐。
+async function openGrowth(a) {
+  $("growth-dialog-title").textContent = `「${accountLabel(a)}」的成长任务`;
+  // 记住当前账号：任务行的接单/领奖要带上它（弹框里没有别的上下文）。
+  $("growth-dialog-title").dataset.account = a.id;
+  $("growth-dialog-sub").textContent = "正在拉取上游状态…";
+  $("growth-tasks-body").innerHTML = '<tr><td colspan="4" class="history-empty">加载中…</td></tr>';
+  $("growth-travel").innerHTML = "";
+  // 已经在弹框里就只换内容：showModal() 对已打开的 dialog 会抛 InvalidStateError。
+  if (!$("growth-dialog").open) $("growth-dialog").showModal();
+  try {
+    const [tasks, travel] = await Promise.all([
+      api(`growth/tasks?account_id=${encodeURIComponent(a.id)}`),
+      api(`growth/travel?account_id=${encodeURIComponent(a.id)}`),
+    ]);
+    if (tasks && tasks.ok === false) {
+      $("growth-tasks-body").innerHTML = `<tr><td colspan="4" class="history-empty">${esc(tasks.message || "该账号暂不支持成长任务")}</td></tr>`;
+    } else {
+      renderGrowthTasks((tasks && tasks.data) || []);
+    }
+    renderGrowthTravel(a, travel);
+  } catch (e) {
+    $("growth-tasks-body").innerHTML = `<tr><td colspan="4" class="history-empty">${esc(e.message)}</td></tr>`;
+    $("growth-travel").innerHTML = "";
+  }
+}
+
+function renderGrowthTasks(rows) {
+  const body = $("growth-tasks-body");
+  if (!rows || !rows.length) {
+    body.innerHTML = '<tr><td colspan="4" class="history-empty">这个账号当前没有成长任务。</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(t => {
+    const actions = [];
+    if (t.status === "not_accepted" && !t.locked) {
+      actions.push(`<button class="btn-ghost" data-task-action="accept" data-code="${esc(t.code)}">接单</button>`);
+    }
+    if (t.status === "completed" && !t.locked) {
+      actions.push(`<button class="btn-ghost" data-task-action="claim" data-code="${esc(t.code)}">领奖</button>`);
+    }
+    const note = t.description || t.code;
+    return `<tr><td><strong>${esc(t.title || t.code)}</strong>`
+      + `<small class="cell-note">${esc(note)}</small></td>`
+      + `<td class="align-right mono">${t.reward_credit ? esc(creditsFmt(t.reward_credit)) : "—"}</td>`
+      + `<td>${esc(growthTaskState(t.status))}</td>`
+      + `<td class="align-right"><div class="actions">${actions.join("")}</div></td></tr>`;
+  }).join("");
+}
+
+function renderGrowthTravel(a, travel) {
+  const host = $("growth-travel");
+  if (!travel || travel.ok === false) {
+    host.innerHTML = `<span class="muted">${esc((travel && travel.message) || "该账号暂不支持旅行")}</span>`;
+    return;
+  }
+  const t = travel.data || {};
+  const parts = [`<span class="pill">${esc(growthTravelState(t.state))}</span>`];
+  if (t.location) parts.push(`<span class="muted">${esc(t.location)}</span>`);
+  if (t.arrive_at) parts.push(`<span class="muted">到达 ${esc(growthTime(t.arrive_at))}</span>`);
+  if (t.daily_limit_reached) parts.push('<span class="muted">今日名额已用完</span>');
+  if (t.state === "arrived") {
+    parts.push(`<button class="btn-ghost" data-travel-action="travel_claim" data-id="${esc(a.id)}" data-record="${esc(String(t.record_id == null ? "" : t.record_id))}">领取到达奖励</button>`);
+  } else if (t.state === "idle" && !t.daily_limit_reached) {
+    parts.push(`<button class="btn-ghost" data-travel-action="travel_depart" data-id="${esc(a.id)}">出发</button>`);
+  }
+  host.innerHTML = parts.join(" ");
+}
+
+// 统一的成长动作调用：动作体由调用方给，后端只认自己声明的那几种。
+async function growthAction(aid, action, extra) {
+  const r = await api("growth/actions", {method: "POST", body: Object.assign({account_id: aid, action}, extra || {})});
+  toast(r.message || "已执行");
+  // 结果横幅常驻：toast 一闪就没了，失败原因（凭据失效/后端不支持）要看时
+  // 就找不回来了。成功时也留一条，让用户知道刚才那一下到底做了什么。
+  const banner = $("growth-result");
+  if (banner) {
+    banner.textContent = r.message || "已执行";
+    banner.classList.toggle("warning", r.ok === false);
+    banner.hidden = false;
+  }
+  return r;
+}
+
+$("growth-body").addEventListener("click", async e => {
+  const btn = e.target.closest("[data-growth-action]");
+  if (btn) {
+    const a = overview.accounts.find(x => x.id === btn.dataset.id);
+    if (!a) return;
+    const action = btn.dataset.growthAction;
+    if (action === "tasks") { await openGrowth(a); return; }
+    btn.disabled = true;
+    try {
+      if (action === "activity") {
+        await growthAction(a.id, "activity");
+      } else {
+        // 签到 / 保活走账号动作那条既有路径（与账号池里的按钮同一条）。
+        const r = await api(`accounts/${a.id}/actions/${action}`, {method: "POST"});
+        toast(r.message || "已执行");
+      }
+      await refresh();
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      btn.disabled = false;
+    }
+    return;
+  }
+  const tr = e.target.closest("tr[data-growth]");
+  if (tr) {
+    const a = overview.accounts.find(x => x.id === tr.dataset.growth);
+    if (a) await openGrowth(a);
+  }
+});
+
+$("growth-tasks-body").addEventListener("click", async e => {
+  const btn = e.target.closest("[data-task-action]");
+  if (!btn) return;
+  const accountId = ($("growth-dialog-title").dataset.account || "");
+  btn.disabled = true;
+  try {
+    if (btn.dataset.taskAction === "accept") {
+      const r = await growthAction(accountId, "accept", {task_codes: [btn.dataset.code]});
+      if (r && r.ok && r.data && Array.isArray(r.data.results)) {
+        const failed = r.data.results.filter(x => x.status !== "success");
+        if (failed.length) toast(failed.map(x => `${x.task_code}：${x.message || x.status}`).join("；"));
+      }
+    } else {
+      const r = await growthAction(accountId, "claim", {task_code: btn.dataset.code});
+      if (r && r.ok && r.data && r.data.credit) toast(`领奖成功，积分 +${creditsFmt(r.data.credit)}`);
+    }
+    const a = overview.accounts.find(x => x.id === accountId);
+    if (a) await openGrowth(a);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("growth-travel").addEventListener("click", async e => {
+  const btn = e.target.closest("[data-travel-action]");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const extra = btn.dataset.travelAction === "travel_claim"
+      ? {record_id: Number(btn.dataset.record)} : {};
+    const r = await growthAction(btn.dataset.id, btn.dataset.travelAction, extra);
+    if (r && r.ok && r.data && r.data.reward_credit) toast(`旅行奖励 +${creditsFmt(r.data.reward_credit)}`);
+    const a = overview.accounts.find(x => x.id === btn.dataset.id);
+    if (a) await openGrowth(a);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("growth-refresh").addEventListener("click", () => loadGrowth());
 
 (async () => { loadVersion(); try { const s = await api("session"); csrf = s.csrf; await enter(); } catch (e) { if (!csrf) showLogin(); } })();

@@ -1636,6 +1636,40 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             raise HTTPException(404)
         return await pool.batch(action)
 
+    # -- 成长任务（任务 / 旅行 / 活跃） ---------------------------------------
+    #
+    # 动作一律走 pool.growth：那里按后端**声明**分派（见 base.py 的
+    # growth_tasks_fetcher / travel_fetcher / activity_report_fetcher），
+    # 没声明的后端自己会回「该后端暂不支持成长任务」。
+
+    @app.get("/admin/api/growth/tasks")
+    async def growth_tasks(req: Request):
+        store.require_admin(req)
+        aid = req.query_params.get("account_id") or ""
+        if not aid:
+            raise HTTPException(400, "缺少 account_id")
+        return await asyncio.to_thread(pool.growth, aid, "tasks")
+
+    @app.get("/admin/api/growth/travel")
+    async def growth_travel(req: Request):
+        store.require_admin(req)
+        aid = req.query_params.get("account_id") or ""
+        if not aid:
+            raise HTTPException(400, "缺少 account_id")
+        return await asyncio.to_thread(pool.growth, aid, "travel_status")
+
+    @app.post("/admin/api/growth/actions")
+    async def growth_actions(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        aid = body.get("account_id") or ""
+        action = body.get("action") or ""
+        if not aid or not action:
+            raise HTTPException(400, "缺少 account_id 或 action")
+        params = {k: body.get(k) for k in ("task_codes", "task_code", "location_id", "record_id")
+                  if body.get(k) is not None}
+        return await asyncio.to_thread(pool.growth, aid, action, **params)
+
     @app.patch("/admin/api/pool/settings")
     async def pool_settings(req: Request):
         store.require_admin(req)
@@ -1680,6 +1714,27 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not 0 <= spread <= 600:
                     raise HTTPException(400, "批量签到错峰需在 0-600 秒之间")
                 settings["batch_spread"] = spread
+            # 成长任务的自动时点：逗号分隔的小时（如 "9,21"）。空串 = 关闭。
+            for field, label in (("growth_travel_hours", "旅行时点"),
+                                  ("growth_activity_hours", "活跃时点")):
+                if field not in body:
+                    continue
+                value = body[field]
+                if value is None:
+                    value = ""
+                if not isinstance(value, str):
+                    raise HTTPException(400, f"{label}需为小时列表")
+                value = value.strip()
+                if value:
+                    parts = value.split(",")
+                    hours = []
+                    for part in parts:
+                        part = part.strip()
+                        if not part.isdigit() or not 0 <= int(part) <= 23:
+                            raise HTTPException(400, f"{label}格式无效：{value}")
+                        hours.append(int(part))
+                    value = ",".join(str(h) for h in sorted(set(hours)))
+                settings[field] = value
             if "queue_failover" in body:
                 if type(body["queue_failover"]) is not bool:
                     raise HTTPException(400, "排队自动切换开关无效")

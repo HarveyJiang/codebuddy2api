@@ -309,6 +309,58 @@ class BackendSpec:
             raise NotImplementedError(f"{type(self).__name__} 未声明计费接口")
         return self._module_fn(self.billing_fetcher, "计费")(manager, client, path, body or {})
 
+    # --- 成长任务（任务 / 旅行 / 活跃） -----------------------------------
+    #
+    # 与上面四个 fetcher 完全同款：**本后端模块里的模块级函数名**，运行时用
+    # ``sys.modules.get(type(self).__module__)`` 现取，不顶层 import（保 registry
+    # 懒构造）。四个动作各自独立声明，而不是一个 ``growth()`` 大入口：
+    #
+    # - ``growth_tasks_fetcher``   → ``f(manager, client, headers) -> list[dict]``
+    #   （成长任务列表；每行已归一化，字段语义与后端无关）
+    # - ``growth_task_action_fetcher`` → ``f(manager, client, headers, action, **kw) -> dict``
+    #   （``action`` ∈ ``accept``/``claim``：接单与领奖）
+    # - ``travel_fetcher``         → ``f(manager, client, headers, action, **kw) -> dict``
+    #   （``action`` ∈ ``status``/``depart``/``claim``：猫猫旅行）
+    # - ``activity_report_fetcher`` → ``f(manager, client, headers) -> dict``
+    #   （活跃上报：一条事件点亮连登并解锁领养任务）
+    #
+    # 签到与保活不在这里声明：签到走上面已有的 checkin_* fetcher，
+    # 保活是「低峰刷新凭据」，由 pool 的定时任务做，两个后端都适用。
+    growth_tasks_fetcher: str = ""
+    growth_task_action_fetcher: str = ""
+    travel_fetcher: str = ""
+    activity_report_fetcher: str = ""
+
+    #: 该后端是否参与**成长任务的自动执行**（定时出发/领奖/上报活跃）。
+    #: 默认 False：与 supports_upstream_usage 同理——成长中心只认自家登录态，
+    #: 别的后端没有这套接口，自动任务打过去只会白跑。
+    supports_growth: bool = False
+
+    def fetch_growth_tasks(self, manager, client, headers) -> list[dict]:
+        """拉本后端的成长任务列表（已归一化的行）。"""
+        if not self.growth_tasks_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明成长任务拉取方式")
+        return self._module_fn(self.growth_tasks_fetcher, "成长任务")(manager, client, headers)
+
+    def fetch_growth_task_action(self, manager, client, headers, action, **kwargs) -> dict:
+        """执行成长任务动作：``accept``（接单）/ ``claim``（领奖）。"""
+        if not self.growth_task_action_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明成长任务动作")
+        return self._module_fn(self.growth_task_action_fetcher, "成长任务动作")(
+            manager, client, headers, action, **kwargs)
+
+    def fetch_travel(self, manager, client, headers, action, **kwargs) -> dict:
+        """旅行动作：``status``/``depart``/``claim``。"""
+        if not self.travel_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明旅行接口")
+        return self._module_fn(self.travel_fetcher, "旅行")(manager, client, headers, action, **kwargs)
+
+    def fetch_activity_report(self, manager, client, headers) -> dict:
+        """活跃上报（点亮连登、解锁领养任务的前置）。"""
+        if not self.activity_report_fetcher:
+            raise NotImplementedError(f"{type(self).__name__} 未声明活跃上报接口")
+        return self._module_fn(self.activity_report_fetcher, "活跃上报")(manager, client, headers)
+
     # --- 失败归因 --------------------------------------------------------
 
     #: 该后端「软冷却」的上游状态码 → 冷却秒数。命中的状态码不进连续失败计数

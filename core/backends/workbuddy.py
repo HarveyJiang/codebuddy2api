@@ -38,6 +38,24 @@ BILLING_MAX_PAGES = 100
 #: 两边各自持一份相同数值 —— 改任一处都要同步改另一处（trae.py:93 有互指注释）。
 EXPIRY_SOON_DAYS = 7
 
+#: 成长任务 / 旅行 —— chat 域（copilot.tencent.com）。
+#: 注意：这条域**不**带 /v2 前缀（与 /v2/chat/completions 不同），是上游活动中心
+#: 自己的子路径；参考项目两家的前缀不一致（一家带 /v2 一家不带），
+#: 这里以不带 /v2 的为主，失败时回落带 /v2 的那条。
+GROWTH_BASE = "https://copilot.tencent.com/activity/growth"
+GROWTH_BASE_V2 = "https://copilot.tencent.com/v2/activity/growth"
+
+#: 领奖走 web 域（www.workbuddy.cn），头与 chat 域不同：必须带
+#: x-client-platform: web 与 growth-center 的 Referer，否则上游当 task not found。
+GROWTH_CLAIM_BASE = "https://www.workbuddy.cn/activity/growth"
+
+#: 活跃上报 —— billing 域的 /v2/report（不是 workbuddy.cn）。
+ACTIVITY_REPORT = "https://www.codebuddy.cn/v2/report"
+
+#: 旅行目的地。参考项目用 locations[0]（88lin）或固定 id=4（linguo）；
+#: 这里默认取配置里的第一个，避免把 id 写死（上游会改）。
+TRAVEL_DEFAULT_LOCATION = 0
+
 
 def _site_headers(headers: dict) -> dict:
     """给 chat 请求补上「像官方客户端」的站点头。
@@ -92,7 +110,258 @@ def _billing(manager, client, path, body=None):
     return d.get("data")
 
 
+def _growth_json(client, url, headers, body=None, method="GET"):
+    """打一次成长中心接口并解出 data。
+
+    成长中心（copilot 域）**没有** code 信封（与 billing 域不同），
+    成功就是 200 + JSON；错误用 4xx/5xx 表达。所以这里不检查 code，
+    只看状态码与 JSON 是否可解析。
+    """
+    response = client.request(method, url, headers=headers, json=body)
+    if response.status_code != 200:
+        raise BackendUsageError("成长中心请求失败", response.status_code)
+    try:
+        payload = response.json()
+    except ValueError:
+        raise BackendUsageError("成长中心返回格式异常")
+    if not isinstance(payload, dict):
+        raise BackendUsageError("成长中心返回格式异常")
+    return payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+
+def _growth_headers(manager, headers=None):
+    """成长中心请求头：凭据头 + 官方客户端的固定头。
+
+    官方客户端打成长中心时会带 X-Requested-With: XMLHttpRequest 与
+    X-CodeBuddy-Request: 1（后者已在凭据头里），少一个上游就当未授权。
+    这里用凭据头（Authorization / X-User-Id 等）而不是另建一套 ——
+    成长中心认的就是同一份登录态。
+    """
+    base = dict(headers if headers is not None else manager.get_headers())
+    base.setdefault("X-Requested-With", "XMLHttpRequest")
+    base.setdefault("X-CodeBuddy-Request", "1")
+    base.setdefault("Accept", "application/json, text/plain, */*")
+    return base
+
+
+def _claim_headers(manager, headers=None):
+    """领奖专用头：web 域要带 x-client-platform: web 与 growth-center 的 Referer。
+
+    少了这两个头，上游把请求当成「小程序/客户端之外的路子」，直接回
+    task not found —— 参考项目实测过。
+    """
+    base = dict(headers if headers is not None else manager.get_headers())
+    base["Origin"] = "https://www.workbuddy.cn"
+    base["Referer"] = "https://www.workbuddy.cn/profile/growth-center"
+    base["x-client-platform"] = "web"
+    base["X-Requested-With"] = "XMLHttpRequest"
+    base["X-CodeBuddy-Request"] = "1"
+    base["Accept"] = "application/json, text/plain, */*"
+    return base
+
+
+def _task_row(task):
+    """把上游任务行归一化成后端无关的字段。
+
+    列表里的 reward_credit 只是**活动配置值**，与实发可能对不上（改版会漂），
+    所以前端要优先用领奖响应里的 credit —— 这里两个都留着。
+    """
+    progress = task.get("progress") if isinstance(task.get("progress"), dict) else {}
+    return {
+        "code": task.get("task_code") or "",
+        "title": task.get("title") or task.get("task_desc") or "",
+        "description": task.get("description") or "",
+        "reward_credit": task.get("reward_credit"),
+        "reward_energy": task.get("reward_energy"),
+        "status": task.get("accept_status") or task.get("status") or "",
+        "locked": bool(task.get("locked")),
+        "current": progress.get("current", task.get("current")),
+        "target": progress.get("target", task.get("target")),
+        "jump_url": task.get("jump_url") or "",
+    }
+
+
+def fetch_growth_tasks(manager, client, headers=None) -> list[dict]:
+    """拉成长任务列表（BackendSpec.growth_tasks_fetcher）。
+
+    返回归一化后的行：code/title/description/reward_credit/reward_energy/
+    status/locked/current/target/jump_url。
+    """
+    request_headers = _growth_headers(manager, headers)
+    data = _growth_json(client, f"{GROWTH_BASE}/tasks", request_headers)
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list):
+        raise BackendUsageError("成长任务列表格式异常")
+    return [_task_row(t) for t in tasks if isinstance(t, dict)]
+
+
+def fetch_growth_task_action(manager, client, headers=None, action="", **kwargs) -> dict:
+    """成长任务动作（BackendSpec.growth_task_action_fetcher）。
+
+    - ``accept``：接单，``task_codes`` 是**复数数组**（单数一律 400）。
+    - ``claim``：领奖，``task_code`` 走**路径**（body 空）——
+      CLI 域的 /reward/claim（code 放 body）实测恒 400，别用。
+    """
+    request_headers = _growth_headers(manager, headers)
+    if action == "accept":
+        codes = [str(c) for c in (kwargs.get("task_codes") or []) if c]
+        if not codes:
+            raise BackendUsageError("没有要接受的任务")
+        data = _growth_json(client, f"{GROWTH_BASE}/tasks/accept", request_headers,
+                            body={"task_codes": codes}, method="POST")
+        results = data.get("results") if isinstance(data, dict) else None
+        return {"action": "accept", "results": results if isinstance(results, list) else []}
+    if action == "claim":
+        code = str(kwargs.get("task_code") or "")
+        if not code:
+            raise BackendUsageError("缺少任务编号")
+        # 领奖走 web 域：头不同（见 _claim_headers），路径带 code、body 空。
+        data = _growth_json(client, f"{GROWTH_CLAIM_BASE}/tasks/{code}/claim",
+                            _claim_headers(manager, headers), body={}, method="POST")
+        return {
+            "action": "claim",
+            "task_code": code,
+            "already_claimed": bool(data.get("already_claimed")) if isinstance(data, dict) else False,
+            # 实发值优先：列表里的 reward_credit 只是活动配置，与实发可能对不上。
+            "credit": data.get("credit") if isinstance(data, dict) else None,
+            "energy": data.get("energy") if isinstance(data, dict) else None,
+        }
+    raise BackendUsageError(f"不支持的成长任务动作：{action or '空'}")
+
+
+def fetch_travel(manager, client, headers=None, action="", **kwargs) -> dict:
+    """旅行动作（BackendSpec.travel_fetcher）。
+
+    - ``status``：查当前状态（idle/traveling/arrived）与今日名额。
+    - ``depart``：出发（location_id 省略则取配置里的第一个）。
+    - ``claim``：领取到达奖励（record_id 来自 status）。
+
+    猫猫旅行（buddy travel）的路径前缀在参考项目两家之间不一致
+    （一家带 /v2 一家不带），这里先试不带 /v2 的，404 再试带 /v2 的。
+    """
+    request_headers = _growth_headers(manager, headers)
+
+    def _call(path, body=None, method="GET"):
+        try:
+            return _growth_json(client, f"{GROWTH_BASE}{path}", request_headers,
+                                body=body, method=method)
+        except BackendUsageError as e:
+            if e.status != 404:
+                raise
+            return _growth_json(client, f"{GROWTH_BASE_V2}{path}", request_headers,
+                                body=body, method=method)
+
+    if action == "status":
+        data = _call("/buddy/travel/status")
+        if not isinstance(data, dict):
+            raise BackendUsageError("旅行状态格式异常")
+        return {
+            "action": "status",
+            "state": data.get("state") or "idle",
+            "record_id": data.get("record_id"),
+            "location": data.get("location") or "",
+            "arrive_at": data.get("arrive_at"),
+            "server_now": data.get("server_now"),
+            "daily_limit_reached": bool(data.get("daily_limit_reached")),
+        }
+    if action == "depart":
+        location_id = kwargs.get("location_id")
+        if location_id in (None, ""):
+            config = _call("/buddy/travel/config")
+            locations = config.get("locations") if isinstance(config, dict) else None
+            if not isinstance(locations, list) or not locations:
+                raise BackendUsageError("没有可用的旅行目的地")
+            first = locations[TRAVEL_DEFAULT_LOCATION]
+            location_id = first.get("id") if isinstance(first, dict) else None
+        if location_id in (None, ""):
+            raise BackendUsageError("旅行目的地无效")
+        data = _call("/buddy/travel/depart", body={"location_id": location_id}, method="POST")
+        if not isinstance(data, dict):
+            raise BackendUsageError("旅行出发返回格式异常")
+        location = data.get("location")
+        return {
+            "action": "depart",
+            "location": location.get("name") if isinstance(location, dict) else (location or ""),
+            "duration_hours": data.get("duration_hours"),
+            "arrive_at": data.get("arrive_at"),
+        }
+    if action == "claim":
+        record_id = kwargs.get("record_id")
+        if record_id in (None, ""):
+            raise BackendUsageError("缺少旅行记录编号")
+        data = _call("/buddy/travel/claim", body={"record_id": record_id}, method="POST")
+        return {
+            "action": "claim",
+            "reward_credit": data.get("reward_credit") if isinstance(data, dict) else None,
+        }
+    raise BackendUsageError(f"不支持的旅行动作：{action or '空'}")
+
+
+def fetch_activity_report(manager, client, headers=None) -> dict:
+    """活跃上报（BackendSpec.activity_report_fetcher）。
+
+    上游按「客户端发过一次请求」的形状收事件：字段全量照抄客户端的
+    chat_request_send 事件，**不能用最小三字段**（上游后续会加严）。
+    一条上报同时点亮连登并解锁领养任务的前置。
+
+    每号每天 1 次就够 —— 频控按密度判罚，多点没有额外收益只有风险。
+    """
+    request_headers = dict(headers if headers is not None else manager.get_headers())
+    request_headers.setdefault("Content-Type", "application/json")
+    request_headers.setdefault("Accept", "application/json")
+    # userId 必填：缺了上游会 200 静默丢弃（看着成功其实没上报）。
+    summary = manager.summary() if hasattr(manager, "summary") else {}
+    user_id = str(summary.get("uid") or "")
+    if not user_id:
+        raise BackendUsageError("账号信息不完整，无法上报活跃")
+    now_ms = int(time.time() * 1000)
+    conversation_id = f"wb2api-{now_ms}"
+    event = {
+        "eventCode": "chat_request_send",
+        "timestamp": now_ms,
+        "reportDelay": 0,
+        "mode": "craft",
+        "conversationId": conversation_id,
+        "requestId": conversation_id,
+        "inputLength": 12,
+        "requestModelId": "deepseek-v4-flash",
+        "requestModelName": "DeepSeek V4 Flash",
+        "isPlan": False,
+        "isAutoExecuteTerminal": False,
+        "isAutoModify": False,
+        "codebaseEnable": False,
+        "maxToken": 0,
+        "maxSteps": 0,
+        "temperature": 0,
+        "maxRetries": 0,
+        "mentionContexts": [],
+        "knowledgeId": [],
+        "knowledgeName": [],
+        "codebaseId": "",
+        "mentionContextCount": 0,
+        "command": "",
+        "expertId": "",
+        "recommendId": "",
+        "skillId": "",
+        "skillCount": 0,
+        "totalCount": 0,
+        "fileUri": "",
+        "presentAt": now_ms,
+        "traceId": "",
+        "rootRequestId": conversation_id,
+        "parentConversationID": conversation_id,
+        "agentName": "default",
+        "agentType": "conversation",
+        "userId": user_id,
+    }
+    response = client.post(ACTIVITY_REPORT, headers=request_headers, json=[event])
+    if response.status_code != 200:
+        raise BackendUsageError("活跃上报失败", response.status_code)
+    return {"action": "report", "at": now_ms, "conversation_id": conversation_id}
+
+
 def _credits_of(usage):
+
     """从 usage 里取实测 credit；取不到返回 0.0（护栏按「没花钱」计）。
 
     字段名逐个试、试不到就当 0：护栏的 credit 计数是**辅助**维度，
@@ -325,6 +594,8 @@ class WorkBuddyBackend(BackendSpec):
     # 上游用量明细（get-user-request-usage）只认本后端凭据：实现放在本模块，
     # 由 usage_fetcher 声明（pool 只读声明，不认后端名）。
     supports_upstream_usage = True
+    # 成长中心（任务/旅行/活跃）只有本后端有：走 copilot 域 + 官方客户端头。
+    supports_growth = True
     usage_fetcher = "fetch_upstream_usage"
     #
     # 积分 / 签到同样只认本后端凭据（billing 域），实现也在本模块 —— 由这组
@@ -335,6 +606,13 @@ class WorkBuddyBackend(BackendSpec):
     checkin_status_fetcher = "fetch_checkin_status"
     checkin_claim_fetcher = "fetch_checkin_claim"
     billing_fetcher = "_billing"
+    #
+    # 成长任务 / 旅行 / 活跃上报：只在 chat 域（copilot）的活动中心有，
+    # Trae 那边没有这套玩法，所以那边不声明（声明为空 → 调用即 NotImplementedError）。
+    growth_tasks_fetcher = "fetch_growth_tasks"
+    growth_task_action_fetcher = "fetch_growth_task_action"
+    travel_fetcher = "fetch_travel"
+    activity_report_fetcher = "fetch_activity_report"
     #
     # 模型目录来自 /v3/config（见 admin/models.py:fetch）。它只认**本后端**账号的
     # 凭据，所以拉目录时必须挑一个默认后端的账号 —— 由本声明告诉 admin，

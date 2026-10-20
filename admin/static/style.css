@@ -400,3 +400,8 @@ dialog>.dialog-body{padding-bottom:22px}
   .usage-filter input,.usage-filter input[type=datetime-local],.usage-filter select{width:100%}
   .usage-summary{grid-template-columns:1fr}
 }
+
+/* 成长任务页：旅行状态条（pill 状态 + 地点 + 到达时间 + 动作按钮）。 */
+.growth-travel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 16px;margin:0 0 16px;background:#f4f7f2;border:1px solid var(--line);border-radius:12px;font-size:12px;color:#41524a}
+.growth-travel .muted{font-size:11px}
+.growth-travel .spacer{flex:1}

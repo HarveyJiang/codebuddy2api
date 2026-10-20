@@ -234,9 +234,12 @@ const READONLY_DIALOGS = new Set(["model-debug-dialog", "key-requests-dialog",
   // 每日积分弹框（用户 2026-10-19）：只读表格 + 档位 + 「拉取上游补算」。
   // 底部不放「关闭」（标题栏 × 已钉住），footer 整栏取消；「拉取上游」是
   // 一个动作按钮而非关闭按钮，所以仍归只读类。
-  "credit-daily-dialog"]);
+  "credit-daily-dialog",
+  // 成长任务弹框（用户 2026-10-20）：只读表格 + 旅行状态条 + 行内动作按钮。
+  // 行内动作在表里，不在底部栏；关闭用标题栏 ×，所以归只读类。
+  "growth-dialog"]);
 const dialogs = [...html.matchAll(/<dialog id="([a-z-]+)">/g)].map(m => m[1]);
-check("共 12 个弹框", dialogs.length, 12);
+check("共 13 个弹框", dialogs.length, 13);
 for (const d of dialogs) {
   const seg = new RegExp(`<dialog id="${d}">[\\s\\S]*?</dialog>`).exec(html)[0];
   check(`${d} 有公共标题栏`, /class="dialog-heading"/.test(seg), true);

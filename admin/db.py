@@ -463,6 +463,31 @@ def _v19_to_v20(db):
         db._write.execute("ALTER TABLE upstream_request_usage ADD COLUMN input_trunc TEXT")
 
 
+def _v20_to_v21(db):
+    """v20 → v21：accounts 补 activity_date（上次活跃上报日期）。
+
+    ## 为什么
+
+    成长中心的「活跃」动作是往上游 /v2/report 打一条事件——一次上报同时
+    点亮连登、解锁 first_buddy 任务。风控口径是**每号每天一次即可**，
+    多打既没收益又是密度特征，所以必须记住「这个号今天报过了」。
+
+    ## 取舍
+
+    - 存日期（YYYY-MM-DD）而不是时间戳：判断只关心「今天」，日期字符串
+      可读、不会因时区换算出错，也与既有的 checkin_date / refresh_slot_date
+      同一套写法。
+    - 可空、存量 NULL：升级前没打过活跃，NULL 即「今天还没报」。
+    - 不加新表：这是账号状态的一部分，跟着 accounts 走最省事。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(accounts)")}
+    if "activity_date" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN activity_date TEXT")
+    # 旅行同理：出发/领奖每天各一次，用同一列记「今天动过旅行」。
+    if "travel_date" not in columns:
+        db._write.execute("ALTER TABLE accounts ADD COLUMN travel_date TEXT")
+
+
 def _v18_to_v19(db):
     """v18 → v19：request_logs 补四项 token 用量（输入/输出/缓存读/缓存写）。
 
@@ -514,7 +539,7 @@ def _v17_to_v18(db):
         "WHERE account_id IN (SELECT id FROM accounts)")
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 MICRO = 1_000_000
@@ -535,7 +560,7 @@ ACCOUNT_STATUS_COLUMNS = (
     "checkin_when", "checkin_offset_date", "token_refreshed", "auth_invalid", "refresh_slot",
     "refresh_slot_date", "refresh_window_date", "consecutive_fails", "cooldown_until",
     "request_count", "last_request", "last_error", "usage_synced_at", "usage_sync_error",
-    "usage_manual_synced_at", "queued_until",
+    "usage_manual_synced_at", "queued_until", "activity_date", "travel_date",
 )
 
 ACCOUNT_STATUS_DEFAULTS = {
@@ -546,6 +571,7 @@ ACCOUNT_STATUS_DEFAULTS = {
 ACCOUNT_INT_COLUMNS = frozenset(ACCOUNT_STATUS_COLUMNS) - {
     "checkin_date", "checkin_slot", "checkin_when", "checkin_offset_date",
     "refresh_slot", "refresh_slot_date", "last_error", "usage_sync_error",
+    "activity_date", "travel_date",
 }
 
 KEY_COLUMNS = (
@@ -673,7 +699,7 @@ class Database:
         queued_until INTEGER,
         request_count INTEGER NOT NULL DEFAULT 0, last_request INTEGER, last_error TEXT,
         usage_synced_at INTEGER, usage_sync_error TEXT,
-        usage_manual_synced_at INTEGER)"""
+        usage_manual_synced_at INTEGER, activity_date TEXT, travel_date TEXT)"""
 
     KEYS_DDL = """CREATE TABLE IF NOT EXISTS keys (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL, hint TEXT NOT NULL,
@@ -916,7 +942,7 @@ class Database:
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
-                  (19, _v18_to_v19), (20, _v19_to_v20))
+                  (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
