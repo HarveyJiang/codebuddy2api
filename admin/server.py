@@ -34,6 +34,8 @@ from core.backends.registry import (
     set_enabled_provider,
     spec_for,
 )
+from core.bare_routing import decode_backend_order as _decode_backend_order
+from core.bare_routing import encode_backend_order as _dumps_backend_order
 from . import config, logging_setup
 from .browser_login import BrowserLogin
 from .db import UPSTREAM_GROUPS, Database
@@ -161,45 +163,18 @@ def _dumps_backend_flags(flags: dict) -> str:
     return json.dumps({k: bool(v) for k, v in flags.items()}, sort_keys=True)
 
 
-def _decode_backend_order(raw):
-    """`model_backend_order` 落库形态 → 内存形态（``list`` 或 ``None``）。
-
-    落库是 JSON 文本（或 NULL），内存必须是**列表或 None** —— 见 `Store._load` 里
-    「为什么必须归一」的说明。脏值一律当「未配置」（回落注册表顺序）：顺序读坏了
-    退回默认顺序是最安全的降级，而顺序本身不是安全边界（价格红线与候选集另有
-    判定），不必像总闸那样朝「全启用」偏。
-
-    只保留字符串项并去重保序；未知后端名**不在这里过滤** —— 那是
-    `build_order` 的职责（它才知道注册表，且要保证「配置里没提到的追加到末尾」）。
-    """
-    if isinstance(raw, list):        # 兼容已解好的形态（测试与内存直塞）
-        data = raw
-    elif isinstance(raw, str) and raw.strip():
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return None
-        if not isinstance(data, list):
-            return None
-    else:
-        return None
-    order, seen = [], set()
-    for name in data:
-        if isinstance(name, str) and name not in seen:
-            seen.add(name)
-            order.append(name)
-    return order or None
-
-
-def _dumps_backend_order(order):
-    """内存形态 → 落库形态：列表存 JSON 文本，None 存 NULL（= 未配置）。"""
-    if not order:
-        return None
-    return json.dumps(list(order), ensure_ascii=False)
+# `model_backend_order` 的编解码住在 `core/bare_routing.py`（与 `build_order`
+# 同源）：全局设置与单 key 覆盖共用同一份规则，落库层（admin/db.py）也要用
+# 同一份，不能各写一遍。这里保留旧名字是为了不打断既有调用与测试。
+# 语义见 `core.bare_routing.encode_backend_order` / `decode_backend_order`。
 
 
 def _validate_backend_order(raw):
-    """校验 `settings.model_backend_order`，返回落库用的列表（或 None = 未配置）。
+    """校验 `model_backend_order`，返回落库用的列表（或 None = 未配置）。
+
+    **全局设置（`settings.model_backend_order`）与单 key 覆盖
+    （`keys.model_backend_order`）共用这一个校验器** —— 两者的形状规则完全一样，
+    分开写就会出现「全局能配的名字单 key 配不了」这种鬼故事。
 
     规则（与 §9.4 / 施工图「决策」表一致）：
 
@@ -347,7 +322,11 @@ class Store:
                 "routing": row.get("routing"),
                 # 必须恢复：不恢复的话重启后内存里没这个键，save_keys 会把
                 # item.get("last_used_at") 缺失值(None) 写回 DB，永久抹掉。
-                "last_used_at": row.get("last_used_at")}
+                "last_used_at": row.get("last_used_at"),
+                # 单 key 的后端优先顺序（v23）：同样是「必须恢复」—— 漏了它，
+                # 重启后这枚 key 就退回「跟随全局」，而且下一次 save 还会把
+                # NULL 写回 DB，把用户配的顺序彻底抹掉。load_keys 已归一成列表。
+                "model_backend_order": row.get("model_backend_order")}
         settings = self.db.get_settings()
         # 池设置可能来自旧数据（缺新字段），用默认值补齐缺失项。
         self.data["pool"] = {**AccountPool.POOL_DEFAULTS, **(settings or {})}
@@ -730,7 +709,9 @@ class Store:
                                   # 空列表 = 不限制：该密钥可使用所有已启用模型 / 所有可用账号。
                                   "models": _id_list(models), "accounts": _id_list(accounts),
                                   # 尚未被任何请求使用过；首次通过鉴权后由 check_api 刷新。
-                                  "last_used_at": None}
+                                  "last_used_at": None,
+                                  # 单 key 的后端优先顺序：None = 跟随全局设置。
+                                  "model_backend_order": None}
         self.keys_dirty = True
         return kid, value
 
@@ -2217,6 +2198,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         body = await payload(req)
         name = clean_name(body.get("name"), "新客户端")
+        # 单 key 的后端优先顺序：None = 跟随全局。校验放在写库之前 ——
+        # 非法形状（未知后端名）必须整单拒绝，不能先建出半个 key 再报错。
+        order = _validate_backend_order(body.get("model_backend_order"))
         with store.lock:
             # 软删保留行之后，已撤销的 key 会一直留在字典里；上限必须只数
             # 未撤销的，否则累计撤销到 100 枚后再也无法新建（与 revoke_key 口径一致）。
@@ -2224,6 +2208,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 raise HTTPException(400, "最多保存 100 枚 API Key")
             kid, key = store.add_key(name, daily_limit=body.get("daily_limit"),
                                      models=body.get("models"), accounts=body.get("accounts"))
+            store.data["keys"][kid]["model_backend_order"] = order
             store.save()
         return {"id": kid, "key": key}
 
@@ -2255,6 +2240,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if routing is not None and routing not in ROUTING_POLICIES:
                     raise HTTPException(400, "routing 需为 " + "／".join(sorted(ROUTING_POLICIES)) + " 或留空")
                 item["routing"] = routing
+            if "model_backend_order" in body:
+                # 单 key 的后端优先顺序：留空 / null = 回到「跟随全局」。
+                item["model_backend_order"] = _validate_backend_order(body["model_backend_order"])
             if "accounts" in body:
                 item["accounts"] = _id_list(body["accounts"])
             if "models" in body:

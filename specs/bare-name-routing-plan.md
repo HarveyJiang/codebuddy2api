@@ -184,30 +184,29 @@ admin/pool.py:1298
 
 ### 6.2 已知遗留
 
-**（a）单 key 调序的前端 UI 与 DB 列未做**
-（`keys.model_backend_order` 列尚未加）：后端解析已支持单 key 覆盖
-（`build_order` 的 `key_configured`），但 DB 列与前端 `routing-chip` 入口留待
-下一步。这是**用户拍板**的范围（「先做后端 + 全局设置项」）。
+**（a）单 key 调序：2026-10-20 已做** ✅
+DB 列（`keys.model_backend_order`，v23 迁移）、后端接口（`POST /admin/api/keys`
+与 `PATCH /admin/api/keys/{kid}`）、前端入口（密钥弹框「后端优先顺序」编辑器）
+全部落地；全局顺序的 UI 也一并补上（此前只能走 API 改）。落库是 JSON 文本、
+内存是列表，编解码统一放在 `core/bare_routing.py`（全局与单 key 共用一份）。
+见 `tests/admin/test_key_backend_order.py` 与 `tests/frontend/keorder.test.mjs`。
 
-**（b）§6.2 的「API 层去重」未做** —— 归并目前**只在管理页前端**做。
-实测 dev `/v1/models` 仍返回 42 条（22 带前缀 + 20 裸名），`kimi-k3-1` 与
-`trae/kimi-k3` **两条都在**。已做的部分：裸名条目的 `owned_by` 报策略第一名
-（§9.6，`658e7ca`）。未做的部分：同一规范名的多后端条目**没有合并成一条**。
+**（b）§6.2 的「API 层去重」：已按拍板实现，不是缺口**（2026-10-16 用户拍板）
+`/v1/models` 现在**每个 (id, backend) 一行**（`core/converter.py` 的注释记着这条
+决定）：同名模型在两个后端各有一行，`owned_by` 逐行报**它自己的后端**。
+原先「只返回一条、id 为裸名」的设计已被这条拍板取代 —— 保留两条反而让客户端
+能看出「这个模型在两个后端都有」，而合并成一条时 `owned_by` 只能报一个后端，
+客户端分不出差别。
 
-  这意味着「用户只看到一个模型」目前只在**管理页**成立，在 **API 客户端侧不成立**
-  —— 客户端仍会看到 `kimi-k3-1` 与 `trae/kimi-k3` 两个 id。
-  §6.2 的设计是「只返回一条、id 为裸名」，这与保留带前缀条目是两个规则，
-  需要一起落地（否则「合并成裸名一条」会给「传裸名」之外的老客户端造成歧义）。
-
-**（c）生产发布未做**：生产仍在 v9 回滚态，缺 v10–v15 迁移。发布前按约定用
+**（c）生产发布未做**：生产仍在 v9 回滚态，缺 v10–v23 迁移。发布前按约定用
   `sqlite3 .backup` 备份。
 
-### 6.3 arch guard 的遗留（文档 §6.2 附注）
+### 6.3 arch guard 的 `startswith` 缺口：已补 ✅
 
-`tests/protocol/test_backend_arch_guard.py` 目前只扫**相等/包含比较**与
-**带后端名的标识符**，**不扫 `startswith("trae")`**。所以「有人新写一句
-`if mid.startswith("trae/")`」不会被守卫拦住（本轮已把现存的三处清掉，但没有
-让守卫覆盖这个形态）。补一条 `startswith` 规则是独立的小任务。
+原记录「`tests/protocol/test_backend_arch_guard.py` 只扫相等/包含比较与带后端名
+的标识符，不扫 `startswith("trae")`」——**现已覆盖**：守卫里有
+`\.startswith\(\s*["'](trae|…)` 规则，新写一句 `if mid.startswith("trae/")`
+会被拦住。
 
 ### 6.4 已确认的决策（用户拍板，2026-10-16）
 
@@ -227,3 +226,4 @@ admin/pool.py:1298
      但 `keys` 表没有这一列，`_resolve_backend_for` 读它时恒为 None → 当前总是
      跟随全局。这是**已知遗留**（见 §6.2(a)），不是「已完成的中间态」。
      写错的原因：施工时把「接口已留好」当成了「列已加」。
+   - **补做**（2026-10-20）：列与 UI 均已落地（§6.2(a)），本条遗留关闭。

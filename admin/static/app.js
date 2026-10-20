@@ -153,6 +153,8 @@ function render() {
     $("pool-routing").value = overview.pool?.default_routing || "round_robin"; $("auto-checkin").checked = overview.pool?.auto_checkin || false; $("checkin-time").value = overview.pool?.checkin_time || "09:00"; $("credit-interval").value = overview.pool?.credit_min_interval ?? 60; $("batch-spread").value = overview.pool?.batch_spread ?? 90; $("sync-start").value = overview.pool?.sync_start || "10:00"; $("sync-end").value = overview.pool?.sync_end || "20:00"; $("growth-travel-hours").value = overview.pool?.growth_travel_hours || ""; $("growth-activity-hours").value = overview.pool?.growth_activity_hours || "";
     $("queue-failover").checked = overview.pool?.queue_failover || false; $("queue-model-fallback").checked = overview.pool?.queue_model_fallback !== false; $("queue-retry").value = overview.pool?.queue_retry ?? 3; $("queue-cooldown").value = overview.pool?.queue_cooldown ?? 120; $("queue-hold-ms").value = overview.pool?.queue_hold_ms ?? 3000; $("queue-fallback-model").value = overview.pool?.queue_fallback_model || "fast-model";
     paintBackendToggles();
+    // 全局后端顺序：未配置 = 跟随注册表顺序（null），别把当前顺序固化成显式配置。
+    renderOrderEditor("backend-order", overview.pool?.model_backend_order, backends.map(b => b.name));
     paintSettings();
   }
   $("keys-body").innerHTML = keys.map(k => {
@@ -246,6 +248,84 @@ const backendFlagsBody = () => Object.fromEntries(
 const backendMeta = b => backends.find(x => x.name === b) || null;
 const backendIcon = b => backendMeta(b)?.icon || "◇";
 const backendName = b => backendMeta(b)?.label || b || "未知";
+
+// -- 后端优先顺序（全局设置 + 单 key 覆盖共用）------------------------------
+//
+// 语义与 core/bare_routing.build_order 一致：配置里点名的后端按配置顺序排在前，
+// 没点名的按注册表顺序追加到末尾；未知后端名忽略。所以编辑器展示的是**生效
+// 顺序**，而不是「用户配的那几个」。
+//
+// 「未配置」是一等状态：全局未配置 = 跟随注册表顺序，单 key 未配置 = 跟随全局。
+// 这两处都用 null 表达，所以编辑器要记住「用户动过没有」——
+// 没动过就交 null（别把当前顺序固化成显式配置：将来加了新后端，
+// 固化的顺序会把它排到末尾，而跟随默认的新后端会按注册表顺序插进来）。
+const orderEditors = {};
+const orderEditorBase = () => {
+  // 基准顺序：全局显式配置（没有则注册表顺序）——单 key 编辑器的「跟随全局」基线。
+  const names = backends.map(b => b.name);
+  const seen = new Set(), order = [];
+  for (const n of (overview.pool?.model_backend_order || [])) {
+    if (names.includes(n) && !seen.has(n)) { seen.add(n); order.push(n); }
+  }
+  for (const n of names) if (!seen.has(n)) { seen.add(n); order.push(n); }
+  return order;
+};
+const orderEditorValue = hostId => {
+  const st = orderEditors[hostId];
+  if (!st || !st.explicit) return null;   // 未配置 → 跟随默认
+  return st.order.slice();
+};
+function renderOrderEditor(hostId, configured, base) {
+  const host = $(hostId);
+  if (!host) return;
+  const explicit = Array.isArray(configured) && configured.length > 0;
+  const names = backends.map(b => b.name);
+  const seen = new Set(), order = [];
+  for (const n of (explicit ? configured : (base || names))) {
+    if (names.includes(n) && !seen.has(n)) { seen.add(n); order.push(n); }
+  }
+  for (const n of names) if (!seen.has(n)) { seen.add(n); order.push(n); }
+  orderEditors[hostId] = {order, explicit};
+  host.innerHTML = order.map((name, i) => `
+    <div class="order-row" data-order-row="${esc(name)}">
+      <span class="order-index">${i + 1}</span>${backendIconSvg(name)}
+      <span class="order-name">${esc(backendName(name))}</span>
+      <button type="button" class="icon-button" data-order-move="up" data-order-name="${esc(name)}"${i === 0 ? " disabled" : ""} title="上移">↑</button>
+      <button type="button" class="icon-button" data-order-move="down" data-order-name="${esc(name)}"${i === order.length - 1 ? " disabled" : ""} title="下移">↓</button>
+    </div>`).join("") || `<span class="muted">没有可用后端</span>`;
+  const note = host.parentElement?.querySelector("[data-order-note]");
+  if (note) note.textContent = explicit ? "已自定义顺序" : "跟随默认顺序";
+}
+// 上移/下移：只改内存里的顺序，用户点「保存」才落库。
+document.addEventListener("click", e => {
+  const btn = e.target.closest("[data-order-move]");
+  if (!btn) return;
+  const host = btn.closest("[data-order-editor]");
+  if (!host) return;
+  const st = orderEditors[host.id];
+  if (!st) return;
+  const i = st.order.indexOf(btn.dataset.orderName);
+  if (i < 0) return;
+  const j = btn.dataset.orderMove === "up" ? i - 1 : i + 1;
+  if (j < 0 || j >= st.order.length) return;
+  [st.order[i], st.order[j]] = [st.order[j], st.order[i]];
+  st.explicit = true;                      // 动过了 = 显式配置
+  renderOrderEditor(host.id, st.order, null);
+});
+// 「恢复默认」：回到未配置。基线按编辑器类型不同：
+// 全局 = 注册表顺序（names），单 key = 全局生效顺序（orderEditorBase()）。
+document.addEventListener("click", e => {
+  const btn = e.target.closest("[data-order-reset]");
+  if (!btn) return;
+  const host = btn.closest("[data-order-editor]");
+  if (!host) return;
+  const st = orderEditors[host.id];
+  if (!st) return;
+  st.explicit = false;
+  const base = host.dataset.orderBase === "global"
+    ? orderEditorBase() : backends.map(b => b.name);
+  renderOrderEditor(host.id, null, base);
+});
 
 // 图形场景的图标：后端声明的内联 SVG（见 BackendSpec.icon_svg）。
 //
@@ -827,7 +907,7 @@ $("dash-add").addEventListener("click", () => openAccount());
 $("dash-add-account").addEventListener("click", () => openAccount());
 $("empty-add").addEventListener("click", () => openAccount());
 $("accounts-back-dash").addEventListener("click", e => { e.preventDefault(); goPage("dashboard"); });
-$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{backup_enabled:$("backup-enabled").checked,backup_interval_hours:Number($("backup-interval").value),backup_keep:Number($("backup-keep").value),default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),growth_travel_hours:$("growth-travel-hours").value.trim(),growth_activity_hours:$("growth-activity-hours").value.trim(),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody()}});await refresh();await loadBackups();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
+$("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{backup_enabled:$("backup-enabled").checked,backup_interval_hours:Number($("backup-interval").value),backup_keep:Number($("backup-keep").value),default_routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value,credit_min_interval:Number($("credit-interval").value),sync_start:$("sync-start").value,sync_end:$("sync-end").value,batch_spread:Number($("batch-spread").value),growth_travel_hours:$("growth-travel-hours").value.trim(),growth_activity_hours:$("growth-activity-hours").value.trim(),queue_failover:$("queue-failover").checked,queue_model_fallback:$("queue-model-fallback").checked,queue_retry:Number($("queue-retry").value),queue_cooldown:Number($("queue-cooldown").value),queue_hold_ms:Number($("queue-hold-ms").value),queue_fallback_model:$("queue-fallback-model").value.trim(),guard_reserve_credits:Number($("guard-reserve-credits").value),guard_daily_token_limit:Number($("guard-daily-token-limit").value),guard_daily_credit_limit:Number($("guard-daily-credit-limit").value),guard_model_daily_token_limit:Number($("guard-model-daily-token-limit").value),backend_enabled:backendFlagsBody(),model_backend_order:orderEditorValue("backend-order")}});await refresh();await loadBackups();toast("设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
 setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },120000);document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 
 // ── 数据库备份 ──────────────────────────────────────────────────────────
@@ -1383,6 +1463,7 @@ function openKeyBind(k, mode = "all") {
   $("key-bind-models-block").hidden = onlyAccounts;
   $("key-bind-accounts-block").hidden = onlyModels;
   $("key-bind-routing-block").hidden = mode !== "all";
+  $("key-bind-order-block").hidden = mode !== "all";
   $("key-bind-limit-block").hidden = mode !== "all";
   $("key-bind-expires-block").hidden = mode !== "all";
   $("key-bind-toggle").hidden = mode !== "all";
@@ -1492,6 +1573,9 @@ function openKeyBind(k, mode = "all") {
   // 下次打开就是新值。
   $("key-bind-routing-hint").textContent = k.routing
     ? "" : `当前默认：${routingShort(overview.pool?.default_routing || "round_robin")}`;
+  // 单 key 的后端优先顺序：未配置 = 跟随全局（null）。编辑器展示的是**生效顺序**
+  // （本 key 配了就用它的，没配就跟全局），动一下就变成本 key 的显式顺序。
+  renderOrderEditor("key-bind-order", k.model_backend_order, orderEditorBase());
   // 撤销不可逆：重置一个已死密钥没有意义（后端也会 400），按钮直接禁掉并说明。
   $("key-bind-reset").disabled = !!k.revoked_at;
   $("key-bind-reset").title = k.revoked_at ? "已撤销的密钥不能重置，请直接新建" : "";
@@ -1522,6 +1606,9 @@ $("key-bind-form").addEventListener("submit", async e => {
         models: checkedValues($("key-bind-models")),
         accounts: checkedValues($("key-bind-accounts")),
         routing: $("key-bind-routing").value || null,
+        // 单 key 的后端优先顺序：null = 跟随全局（后端 PATCH 是「带了键就覆盖」语义，
+        // 所以这一项必须每次都带上，否则「恢复默认」删不掉）。
+        model_backend_order: orderEditorValue("key-bind-order"),
         daily_limit: $("key-bind-limit").value === "" ? null : Number($("key-bind-limit").value),
         expires_at: $("key-bind-expires").value ? fromLocalInput($("key-bind-expires").value) : null};
     await api("keys/" + kid, {method:"PATCH", body});

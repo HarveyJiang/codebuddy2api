@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 #: 「按标准计费」的模型（credits_micro 为 NULL）在价格比较里的取值。
@@ -110,6 +111,57 @@ class BackendOrderSpec:
 def _default_order(names) -> tuple:
     """默认顺序 = 注册表顺序（§9.2：注册表顺序本身就是后端对「我排第几」的声明）。"""
     return tuple(names or ())
+
+
+def encode_backend_order(order):
+    """内存形态（``list`` / ``None``）→ 落库形态（JSON 文本 / ``NULL``）。
+
+    ## 为什么落在 core 而不是 admin
+
+    这份配置的**编解码**被三方共用：全局设置（``settings.model_backend_order``）、
+    单 key 覆盖（``keys.model_backend_order``）与它们的落库层。规则只写一份，
+    才不会出现「全局解得出来、单 key 解不出来」这种漂移。
+
+    ## 为什么用 NULL 表示「未配置」
+
+    ``NULL`` 与 ``'[]'`` 在语义上都是「没配顺序」（:func:`build_order` 两者同义），
+    但落库形态上必须区分：``NULL`` 一眼能看出「这一格用户没碰过」，而 ``'[]'``
+    会被误读成「用户配了空列表」。所以内存里的 ``None`` 落库成 ``NULL``，
+    空列表也落库成 ``NULL``（用户主动清空与从未配置在行为上本就一致）。
+    """
+    if not order:
+        return None
+    return json.dumps(list(order), ensure_ascii=False)
+
+
+def decode_backend_order(raw):
+    """落库形态（JSON 文本 / ``NULL`` / 已解好的列表）→ 内存形态（``list`` / ``None``）。
+
+    脏值一律当「未配置」（回落注册表顺序）：顺序读坏了退回默认顺序是最安全的
+    降级，而顺序本身不是安全边界（价格红线与候选集另有判定），不必像总闸那样
+    朝「全启用」偏。
+
+    只保留字符串项并去重保序；未知后端名**不在这里过滤** —— 那是
+    :func:`build_order` 的职责（它才知道注册表，且要保证「配置里没提到的
+    追加到末尾」）。
+    """
+    if isinstance(raw, list):        # 兼容已解好的形态（测试与内存直塞）
+        data = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(data, list):
+            return None
+    else:
+        return None
+    order, seen = [], set()
+    for name in data:
+        if isinstance(name, str) and name not in seen:
+            seen.add(name)
+            order.append(name)
+    return order or None
 
 
 def build_order(known_names, configured=None, key_configured=None):

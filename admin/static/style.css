@@ -372,6 +372,19 @@ tr:hover .model-name-cell .model-del{opacity:1}
 .routing-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .routing-row select{flex:0 0 auto;width:auto;padding:8px 32px 8px 14px;font-size:12px;border-radius:999px;background-position:right 12px center}
 
+/* 后端优先顺序编辑器（全局设置 + 单 key 覆盖共用）：
+   一行一个后端，左边是序号与图标，右边两个上下移按钮。
+   移动按钮用 .icon-button 的小号规格，禁用态由 .icon-button 自带。 */
+.order-block{margin-top:12px;display:flex;flex-direction:column;gap:6px}
+.order-block>label{font-size:11px;color:var(--muted);margin:0}
+.order-editor{display:flex;flex-direction:column;gap:5px}
+.order-row{display:flex;align-items:center;gap:8px;font-size:12px;padding:5px 9px;border:1px solid var(--line);border-radius:9px;background:#fff}
+.order-index{font-size:11px;color:var(--muted);min-width:14px;text-align:right;font-variant-numeric:tabular-nums}
+.order-name{flex:1 1 auto;color:var(--deep)}
+.order-row .icon-button{width:24px;height:24px;line-height:1;font-size:12px;padding:0;display:inline-flex;align-items:center;justify-content:center}
+.order-foot{display:flex;align-items:center;gap:10px;margin-top:2px}
+.order-foot .btn-ghost{margin-left:auto}
+
 /* 密钥表范围列做成可点 pill：视觉仍是 pill，行为同「设置」按钮。
    「全部」是纯文本样式（muted），hover 才显出可点感。 */
 .scope-pill{cursor:pointer;border:0;font:inherit}

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .models import CN
+from core.bare_routing import decode_backend_order, encode_backend_order
 
 
 # -- schema migrations -------------------------------------------------------
@@ -569,7 +570,33 @@ def _v17_to_v18(db):
         "WHERE account_id IN (SELECT id FROM accounts)")
 
 
-SCHEMA_VERSION = 22
+def _v22_to_v23(db):
+    """v22 → v23：keys 补 model_backend_order（单 key 的后端优先顺序）。
+
+    ## 为什么
+
+    裸名路由的顺序有**两层**：全局（`settings.model_backend_order`）与单 key
+    覆盖（`keys.model_backend_order`）。路由判定（`admin/pool.py` 的
+    `build_order(key_configured=...)`）与 DB 层的读写**早就支持单 key 这一层**，
+    缺的只是「存哪儿」——没有列可写，前端也没有入口，用户永远配不了。
+
+    ## 取舍
+
+    - **列在 keys 表、不另建表**：它就是密钥的一个属性，跟着密钥走最省事；
+      密钥上限 100 行，单独一张关联表纯属多一套读写。
+    - 存 TEXT（JSON 文本）而不是有序表：顺序是**小列表**（后端数量级），
+      存成文本省掉一次 join 与排序语义；读取时由
+      `core/bare_routing.decode_backend_order` 归一成列表。
+    - **可空、存量 NULL**：NULL = 「未配置」= 跟随全局。老密钥升级后行为不变
+      （这正是要的：升级不该悄悄改路由结果）。
+    - 不加索引：按 key 查走主键，没有按顺序筛选的需求。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(keys)")}
+    if "model_backend_order" not in columns:
+        db._write.execute("ALTER TABLE keys ADD COLUMN model_backend_order TEXT")
+
+
+SCHEMA_VERSION = 23
 
 
 MICRO = 1_000_000
@@ -610,6 +637,9 @@ KEY_COLUMNS = (
     # 最后一次通过鉴权且未超配额的时刻（specs/keys-last-used-at.md §2）。
     # 可空：历史调用没有逐 key 留时刻，NULL 即「从未使用」。
     "last_used_at",
+    # v23：单 key 的后端优先顺序（NULL = 跟随全局 settings.model_backend_order）。
+    # 落库是 JSON 文本，内存是列表（编解码见 core/bare_routing）。
+    "model_backend_order",
 )
 
 MODEL_COLUMNS = (
@@ -740,7 +770,7 @@ class Database:
         usage_date TEXT, usage_count INTEGER NOT NULL DEFAULT 0,
         usage_tokens INTEGER NOT NULL DEFAULT 0,
         models TEXT NOT NULL DEFAULT '[]', accounts TEXT NOT NULL DEFAULT '[]', routing TEXT,
-        last_used_at INTEGER)"""
+        last_used_at INTEGER, model_backend_order TEXT)"""
 
     # 逐条执行而不用 executescript()：后者会先隐式 COMMIT，
     # 把外层显式事务直接结束掉，导致随后 COMMIT 报 no transaction is active。
@@ -976,7 +1006,7 @@ class Database:
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
                   (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21),
-                  (22, _v21_to_v22))
+                  (22, _v21_to_v22), (23, _v22_to_v23))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -1094,6 +1124,9 @@ class Database:
             item = {key: row[key] for key in row.keys()}
             item["models"] = _decode_list(item.get("models"))
             item["accounts"] = _decode_list(item.get("accounts"))
+            # 后端顺序：库里是 JSON 文本（或 NULL），内存里必须是**列表或 None**
+            # —— 路由判定（`build_order`）直接吃列表，脏值一律当「未配置」。
+            item["model_backend_order"] = decode_backend_order(item.get("model_backend_order"))
             result[row["id"]] = item
         return result
 
@@ -1116,7 +1149,9 @@ class Database:
                          # 会把「从未使用」写成 0（1970 年）。这里 NULL 必须
                          # 保持 NULL —— 前端按真值判断显示「从未使用」，
                          # 而将来的「早于某时间」比较也依赖 0 与 NULL 可区分。
-                         item.get("last_used_at")))
+                         item.get("last_used_at"),
+                         # 顺序：内存列表 → JSON 文本；未配置（None/空）落 NULL。
+                         encode_backend_order(item.get("model_backend_order"))))
         with self.transaction():
             self._write.execute("DELETE FROM keys")
             self._write.executemany(
