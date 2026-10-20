@@ -9,6 +9,7 @@ import time
 
 from admin.pool import REQUEST_LOG_CONTEXT
 from admin.rotation import is_waf_error
+from core.session_headers import SCOPE_REQUEST_ID, SCOPE_UPSTREAM_MODEL
 
 PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}
 
@@ -301,4 +302,13 @@ class MetricsMiddleware:
             # 来源识别（v22）：哪个客户端在打、从哪个 IP 来，用于排查。
             "client_ip": _client_ip(scope),
             "user_agent": _header(scope, "user-agent"),
+            # v26：把「我们这边看到的名字」和「上游那边看到的名字」都记下来。
+            # upstream_model = 上游最终收到的模型名（trae 还要过一遍别名表），
+            #   与 model_id（客户端请求的裸名）可能不是同一个字符串。
+            # account_uid = 上游侧的身份标识，跨「本地备注名 / 云端昵称」唯一对齐。
+            # client_request_id = 我们发给上游的 X-Request-ID（uuid7 hex），
+            #   上游的用量报表认的就是它——没有它，日志和上游报表永远对不上账。
+            "upstream_model": scope.get(SCOPE_UPSTREAM_MODEL),
+            "account_uid": context.get("account_uid"),
+            "client_request_id": scope.get(SCOPE_REQUEST_ID),
         })

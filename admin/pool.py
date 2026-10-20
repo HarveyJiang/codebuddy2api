@@ -1777,6 +1777,9 @@ class PoolMiddleware:
                        "backend": None, "model_id": None, "model_name": None,
                        "error_code": None, "tokens_detail": None,
                        "upstream_request_id": None,
+                       # 上游侧的身份标识（v26）：本地备注名（「新号」）与云端昵称
+                       # （「15882308279」）根本不是一回事，uid 才是两边能对齐的键。
+                       "account_uid": None,
                        # 本地拒绝的原因（model_cooling / no_account / client_error）。
                        # 非空 = 这个请求**没有打到上游**，日志按它落 outcome。
                        "local_reject": None,
@@ -1890,6 +1893,8 @@ class PoolMiddleware:
         # 的 backend，而不是由模型名推导的值——轮转/降级之后两者可能不同，
         # 记实际发生的事实才能用于事后排查。
         log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
+        # 上游身份（v26）：uid 是本地备注名与云端昵称之间唯一的对齐键。
+        log_context["account_uid"] = self.pool.store.account_uid(aid)
         pool_cfg = self.pool.store.data.get("pool", {})
         failover_on = bool(pool_cfg.get("queue_failover"))
         # 上游 5xx 换号重试（默认开）：与排队切换是两个独立开关、两个独立预算。
@@ -1957,12 +1962,17 @@ class PoolMiddleware:
                 # 排队切号已按后端隔离（try_select 传 backend），所以正常不会变；但一旦
                 # 哪天隔离被改坏，这里如实记录反而能让事后排查看到「打到了另一个后端」。
                 log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
+                # 换号后同步刷新上游身份（v26）：uid 跟着账号走，否则日志里的
+                # uid 会是上一个号的，两边对不上账。
+                log_context["account_uid"] = self.pool.store.account_uid(aid)
                 log_context["model_id"] = attempt_model
                 log_context["model_name"] = attempt_model
-                log_context["tokens_detail"] = outcome.get("tokens_detail")
-                # 换号/换模型后这一 attempt 才算数：上游请求 ID 跟着覆盖，
-                # 不然日志里会留下上一次 attempt 的 ID。
-                log_context["upstream_request_id"] = outcome.get("upstream_request_id")
+                # 换号后**清空**上一轮 attempt 的用量与上游请求 ID：它们属于
+                # 被丢弃的那次请求（排队/5xx 的首轮），留在日志里会让这条记录
+                # 「记的号是 B、用量却是 A 那次的」。真正生效的那次由下面的
+                # kind=="done" 分支如实写入。
+                log_context["tokens_detail"] = None
+                log_context["upstream_request_id"] = None
             # 每次尝试都要用新的 receive 闭包与新的 attempt_body（换模型时 body 变了）。
             attempt_receive = _replay_receive(attempt_body, receive)
             outcome = await self._attempt(scope, attempt_receive, send, manager)
@@ -2186,9 +2196,14 @@ class PoolMiddleware:
 
         token = REQUEST_CREDENTIAL.set(manager)
         app_task = asyncio.ensure_future(self.app(scope, receive, observe))
+        # 等待首包的那个 task 必须自己收尾：``asyncio.wait`` 只等「其中一个完成」，
+        # 另一个（body_ready.wait）会一直挂着。请求结束时它还没被唤醒就成了
+        # 「Task was destroyed but it is pending!」——线上日志里成片出现，
+        # 每个泄漏的 task 都要等事件循环回收才释放。
+        body_wait = asyncio.ensure_future(body_ready.wait())
         try:
             # 要么首包到达、要么硬上界到点——两者取先到者，绝不无限等待。
-            done, _ = await asyncio.wait({app_task, asyncio.ensure_future(body_ready.wait())},
+            done, _ = await asyncio.wait({app_task, body_wait},
                                          timeout=hold_ms / 1000.0,
                                          return_when=asyncio.FIRST_COMPLETED)
             if state["queue"]:
@@ -2210,6 +2225,7 @@ class PoolMiddleware:
             app_task.cancel()
             raise
         finally:
+            body_wait.cancel()
             REQUEST_CREDENTIAL.reset(token)
         # error_text / error_headers 交给调用方的 record()：失败冷却可能需要
         # 采信上游明示的恢复时刻（见 admin/reset_at.py）。error_code 供 WAF
@@ -2544,6 +2560,8 @@ class PoolMiddleware:
             log_context["account_id"] = aid
             log_context["account_name"] = self.pool.store.data["accounts"].get(aid, {}).get("name")
             log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
+            # 换号后同步刷新上游身份（v26）：uid 跟着账号走。
+            log_context["account_uid"] = self.pool.store.account_uid(aid)
             _logger.info("上游 %s，换号重试（账号 %s）", status, aid)
 
 

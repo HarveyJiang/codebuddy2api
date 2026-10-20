@@ -84,6 +84,7 @@ from .session_headers import (
     MODE_OFF,
     MODE_STICKY,
     SCOPE_REQUEST_ID,
+    SCOPE_UPSTREAM_MODEL,
     build_session_headers,
     resolve_session_identity,
 )
@@ -251,6 +252,23 @@ class CredentialManager:
         if self._cached is None:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
         return self._cached
+
+    def account_uid(self) -> str | None:
+        """账号的**上游身份** uid —— 与云端对账的唯一锚点。
+
+        昵称会改、备注名是本地起的，只有 uid 在上游那侧稳定不变（用户
+        2026-10-20 报的「日志记 A、云端却是 B」，根因就是两边拿的是不同
+        的标识：本地备注名 vs 云端昵称/uid）。
+
+        读取走凭据管理器自己的 mtime 缓存，不额外打磁盘；读不到就返回
+        None——**宁可空着也不猜**。
+        """
+        try:
+            doc = self._session()
+        except (RuntimeError, OSError, ValueError):
+            return None
+        uid = str((doc.get("account") or {}).get("uid") or "")
+        return uid or None
 
     def _is_expired(self) -> bool:
         s = self._session()
@@ -820,7 +838,7 @@ def _with_session_headers(headers: dict, request, payload: dict, backend) -> dic
     return headers
 
 
-def _resolve_backend_or_http(model_raw, routed=None) -> tuple:
+def _resolve_backend_or_http(model_raw, routed=None, request=None) -> tuple:
     """四端点共用前置：模型名 → (backend, upstream_model, cred)。
 
     trae/<名> → TraeBackend + map_model 归一（未知模型 → 400）；
@@ -828,8 +846,16 @@ def _resolve_backend_or_http(model_raw, routed=None) -> tuple:
     其余 → WorkBuddyBackend + 原模型名。
     凭据-后端一致性闸门：池选到的账号与请求后端不匹配 → 503
     （防独立部署模式下 Trae 账号收到 WorkBuddy 请求或反之）。
+
+    ``request`` 传进来是为了把**上游实际模型名**记进 scope：请求日志里
+    ``model_id`` 是客户端写的裸名，而上游收到的是归一后的名字，两边对不上
+    时（日志 vs 云端）得能看到上游那份。传 None 只是不记，不影响行为。
     """
     backend, upstream_model = resolve_backend(model_raw, routed=routed)
+    if upstream_model:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, dict):
+            scope[SCOPE_UPSTREAM_MODEL] = upstream_model
     cred = _cred()
     # 凭据-后端一致性闸门：不比后端**名字**，比双方声明的凭据归属
     # （见 BackendSpec.credential_name / CredentialManager.backend_name）。
@@ -879,7 +905,7 @@ async def chat_completions(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae，其余走 WorkBuddy）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(payload.get("model") or "auto", routed=_routed_backend(request))
+    backend, upstream_model, cred = _resolve_backend_or_http(payload.get("model") or "auto", routed=_routed_backend(request), request=request)
 
     # 构造后端 body：只透传已知的合法字段
     client_wants_stream = bool(payload.get("stream"))
@@ -1445,7 +1471,7 @@ async def create_response(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request))
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request), request=request)
 
     if backend.tencent_policies:
         chat_body = filter_system_identity(chat_body)
@@ -1629,7 +1655,7 @@ async def create_message(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request))
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request), request=request)
 
     chat_body.setdefault("model", "auto")
     chat_body["model"] = upstream_model or chat_body.get("model") or "auto"
@@ -1839,7 +1865,7 @@ async def count_tokens(
         )
 
     # 路由：模型名 → 后端（trae/ 前缀进 Trae）；并做凭据一致性闸门
-    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request))
+    backend, upstream_model, cred = _resolve_backend_or_http(chat_body.get("model") or "auto", routed=_routed_backend(request), request=request)
 
     # 最小化实际生成：只需要 usage 统计
     chat_body.setdefault("model", "auto")

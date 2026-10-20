@@ -653,7 +653,42 @@ def _v24_to_v25(db):
             db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
 
 
-SCHEMA_VERSION = 25
+def _v25_to_v26(db):
+    """v25 → v26：request_logs 补三列「能和云端对上」的对账字段。
+
+    ## 为什么
+
+    用户报「日志记录的是 A 账号，但云端账号其实是 B 账号，模型也和选的不一样」。
+    逐层查下来，**代码没有把账号记错**——三条请求路径（日志里的账号 / 模型
+    与真正发请求的凭据）同源。真正的问题是**日志与云端不是同一套标识**，
+    于是没法逐条对账：
+
+    - `upstream_model`：**上游实际收到的模型名**。`model_id` 记的是客户端
+      请求的裸名（`deepseek-v4.1-flash`），而上游按自己的目录记
+      （`deepseek-v4-flash`），trae 还会再走一遍别名表。名字不同是常态，
+      没有这一列就永远只能靠猜。
+    - `account_uid`：**上游身份**。管理页显示的是本地备注名（「新号」），
+      云端显示的是上游昵称（`15882308279`）——两者对不上是常态，uid 才是
+      唯一能跨两边对齐的键。
+    - `client_request_id`：**我们发给上游的 X-Request-ID**（uuid7 hex）。
+      日志原先只存上游聊天流返回的 `cmb-…`，那是上游自己的 id 空间；
+      而上游用量报表/云端认的是我们发过去的这套请求 id（`crb-…` 前缀那套
+      方案的同源 id）。两边 id 空间不同 → 按 id JOIN 命中 0 条，逐条对账
+      根本做不到（实测 1442 × 8827 行零命中）。把我们的请求 id 也记下来，
+      才能与上游侧对上。
+
+    ## 取舍
+
+    - 三个列都**可空、存量一律 NULL**：老数据没有这些信息，不猜、不回填。
+    - 不新增表、不动既有列：老行照旧可读，只是对不上账而已。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(request_logs)")}
+    for name in ("upstream_model", "account_uid", "client_request_id"):
+        if name not in columns:
+            db._write.execute(f"ALTER TABLE request_logs ADD COLUMN {name} TEXT")
+
+
+SCHEMA_VERSION = 26
 
 
 MICRO = 1_000_000
@@ -713,6 +748,10 @@ LOG_COLUMNS = (
     # v24：上游业务错误码。status 只放 HTTP 状态码，error_code 放上游原样码
     # （"11128"/"USER_LIMIT"…，非数字文本也照存）——两列不再互相覆盖。
     "error_code",
+    # v26：能和云端对账的三件套。model_id 是客户端写的裸名、account_name 是
+    # 本地备注名，都不等于云端那侧看到的东西；upstream_model / account_uid
+    # / client_request_id 才是能与上游对上号的键（见 _v25_to_v26 的说明）。
+    "upstream_model", "account_uid", "client_request_id",
 )
 
 REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
@@ -901,7 +940,8 @@ class Database:
             tokens_in INTEGER, tokens_out INTEGER,
             tokens_cache_read INTEGER, tokens_cache_creation INTEGER,
             first_token_ms INTEGER, client_ip TEXT, user_agent TEXT,
-            error_code TEXT)""",
+            error_code TEXT,
+            upstream_model TEXT, account_uid TEXT, client_request_id TEXT)""",
         """CREATE TABLE IF NOT EXISTS upstream_request_usage (
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
@@ -1070,7 +1110,8 @@ class Database:
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
                   (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21),
                   (22, _v21_to_v22), (23, _v22_to_v23), (24, _v23_to_v24),
-                  (25, _v24_to_v25))
+                  (25, _v24_to_v25),
+                  (26, _v25_to_v26))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")

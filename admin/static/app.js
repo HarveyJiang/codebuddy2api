@@ -608,6 +608,8 @@ const outcomes={
   stream_error:"流式错误",
   interrupted:"未完整结束",
   http_error:"请求失败",
+  // 上游视角的流水（v26）：不是本代理发起的请求，是上游自己记的账。
+  upstream_record:"上游记录",
 };
 // 分配策略的图标与短名：列表里用「图标 + 短名」展示，编辑集中到设置弹框。
 // 图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
@@ -679,8 +681,9 @@ function errorCodeCell(r) {
   if (!code) return "";
   return `<small class="cell-note mono" title="上游业务错误码：${esc(code)}">码 ${esc(code)}</small>`;
 }
-// 状态徽标的悬停提示：业务码 + 结果分类 + 来源 IP/UA。
-// 三样都是用户可控的字符串，进属性前统一 esc()。
+// 状态徽标的悬停提示：业务码 + 结果分类 + 来源 IP/UA + 与云端对账用的三列
+// （v26：上游实际模型名 / 上游账号 uid / 本方请求 id）。
+// 都是用户可控的字符串，进属性前统一 esc()。
 function logTip(r) {
   const parts = [];
   const code = r.error_code === null || r.error_code === undefined ? "" : String(r.error_code).trim();
@@ -688,12 +691,50 @@ function logTip(r) {
   parts.push(outcomes[r.outcome] || "请求失败");
   const src = sourceTip(r);
   if (src) parts.push(src);
+  // 上游实际模型名：与客户端请求的裸名不同时才有意义（trae 会做别名归一）。
+  const up = r.upstream_model ? String(r.upstream_model) : "";
+  if (up && up !== String(r.model_id || "")) parts.push("上游模型 " + up);
+  // 上游账号 uid：备注名与云端昵称不是一回事，uid 才是跨两边对齐的键。
+  const uid = r.account_uid ? String(r.account_uid) : "";
+  if (uid) parts.push("账号UID " + uid);
+  // 本方请求 id：我们发给上游的 X-Request-ID，上游用量报表认的是它。
+  const cid = r.client_request_id ? String(r.client_request_id) : "";
+  if (cid) parts.push("本方ID " + cid);
   return parts.join(" · ");
+}
+// 上游视角那一批行的悬停提示：请求 id / 调用方 / 用途 / 消耗积分 / 内容摘要。
+// client=WorkBuddy 是本代理；CLI / app_cloud / CodeBuddyIDE / 空 是别的客户端。
+function upstreamTip(r) {
+  const parts = ["上游记录"];
+  const id = r.upstream_request_id ? String(r.upstream_request_id) : "";
+  if (id) parts.push(id);
+  const client = r.client ? String(r.client) : "";
+  parts.push(client ? `调用方 ${client}` : "调用方未知");
+  if (r.credit !== null && r.credit !== undefined) parts.push(`积分 ${r.credit}`);
+  const purpose = r.agent_purpose ? String(r.agent_purpose) : "";
+  if (purpose) parts.push(purpose);
+  const text = r.input_trunc ? String(r.input_trunc) : "";
+  if (text) parts.push(`内容 ${text}`);
+  return parts.join(" · ")
+    .replace(/["<>]/g, "").replace(/\s+/g, " ").slice(0, 300);
 }
 // 状态列（请求日志页 / 账号日志弹框 / 密钥日志弹框三处共用）：
 // 徽标只显示 HTTP 状态码，业务码另挂小字 —— 混在一格里会看不懂「11128」是什么。
+// 上游视角的行没有 HTTP 状态码，单开一个分支显示「上游记录」。
 function statusCell(r) {
+  if (r.source === "upstream") {
+    return `<td><span class="pill log-status" data-tip="${esc(upstreamTip(r))}">上游记录</span></td>`;
+  }
   return `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(logTip(r))}">${esc(r.status ?? "—")}</span>${errorCodeCell(r)}</td>`;
+}
+
+// 耗时列：本代理的请求有耗时；上游视角的行没有（那是上游记的账，只有时间戳），
+// 显示「—」而不是「0 ms」——0 会让人以为跑得飞快。
+function durationCell(r) {
+  if (r.duration_ms === null || r.duration_ms === undefined) {
+    return `<td class="align-right mono">—</td>`;
+  }
+  return `<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td>`;
 }
 
 function renderLogRows(rows) {
@@ -702,12 +743,23 @@ function renderLogRows(rows) {
   const accountCell = r => r.account_name
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td>${statusCell(r)}${tokenCells(r)}${firstTokenCell(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="10" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
-}async function loadLogs(offset) {
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td>${statusCell(r)}${tokenCells(r)}${firstTokenCell(r)}${durationCell(r)}</tr>`).join("") || '<tr><td colspan="10" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+}// 当前看的日志来源（v26）：本代理的请求 / 上游侧的流水。
+// 上游那一批是**另一个视角**——上游自己记的账，包含官方 App/CLI/IDE 的流量，
+// 用来回答「云端看到的那条请求，到底是不是我这条」。
+function logSource() {
+  const el = $("log-source");
+  return el ? el.value : "all";
+}
+async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
   const size = Number($("dash-page-size").value) || 10;
+  const src = logSource();
+  const query = src === "upstream"
+    ? `logs/upstream?limit=${size}&offset=${offset}`
+    : `logs?limit=${size}&offset=${offset}${src && src !== "all" ? `&source=${encodeURIComponent(src)}` : ""}`;
   try {
-    const data = await api(`logs?limit=${size}&offset=${offset}`);
+    const data = await api(query);
     logOffset = data.offset; logTotal = data.total;
     renderLogRows(data.rows);
     const pages = Math.max(1, Math.ceil(logTotal / size));
@@ -720,6 +772,9 @@ function renderLogRows(rows) {
 $("dash-prev").addEventListener("click", () => loadLogs(Math.max(0, logOffset - Number($("dash-page-size").value))));
 $("dash-next").addEventListener("click", () => loadLogs(logOffset + Number($("dash-page-size").value)));
 $("dash-page-size").addEventListener("change", () => loadLogs(0));
+// 切换日志来源（v26）：本代理的请求 ↔ 上游侧的流水。切来源要回到第一页——
+// 上一页的偏移量在另一批数据里没有意义。
+$("log-source").addEventListener("change", () => loadLogs(0));
 // 请求日志页的「刷新」按钮（用户 2026-10-17：与用量明细页对齐，该页原来只有
 // 翻页、没有主动刷新入口）—— 重新拉当前页。
 $("logs-refresh").addEventListener("click", () => loadLogs(logOffset));

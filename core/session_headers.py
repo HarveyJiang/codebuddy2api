@@ -45,6 +45,15 @@ MODE_STICKY = "sticky"
 # 重试/换号稳定。
 SCOPE_REQUEST_ID = "codebuddy.request_id"
 
+# scope 里缓存「上游实际收到的模型名」的键。
+#
+# 请求日志里的 model_id 记的是**客户端请求的裸名**，而上游真正收到的是归一后
+# 的名字（trae 走 map_model 别名表，workbuddy 走自己的模型目录）。两者不同
+# 是常态——排查「日志说的模型和云端不一样」时必须能看到上游那份，所以单独
+# 记一列。放在本模块而不是 core.converter：管理端（admin/metrics.py）要读
+# 它，但 admin 侧不该为了一个常量去引 converter。
+SCOPE_UPSTREAM_MODEL = "codebuddy.upstream_model"
+
 _HEX_RE = re.compile(r"^[0-9a-fA-F]{16,32}$")
 
 # 入站头候选（按优先级）。大小写不敏感。

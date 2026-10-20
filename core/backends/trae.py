@@ -947,6 +947,18 @@ class TraeCredentialManager:
     def _account(self) -> dict:
         return self._session().get("account") or {}
 
+    def account_uid(self) -> str | None:
+        """账号的上游身份 uid（与 workbuddy 的凭据管理器同语义）。
+
+        供日志记「云端那侧能认的锚点」——昵称会改、备注名是本地起的。
+        """
+        try:
+            doc = self._session()
+        except (RuntimeError, OSError, ValueError):
+            return None
+        uid = str((doc.get("account") or {}).get("uid") or "")
+        return uid or None
+
     def access_token(self) -> str:
         return str(self._auth().get("accessToken") or "")
 

@@ -559,6 +559,28 @@ class Store:
                 self.managers[aid] = make_credential(self.file_for(item))
             return self.managers[aid]
 
+    def account_uid(self, aid):
+        """账号的上游身份 uid（云端对账的锚点），取不到就 None。
+
+        账号行里存的是本地备注名（`name`），云端那侧认的是上游昵称/uid ——
+        两者不是一回事（「新号」在云端叫 15882308279）。uid 由凭据管理器
+        从 auth 文件里读（它自己带 mtime 缓存），读不到就空着，不猜。
+        """
+        item = self.data["accounts"].get(aid)
+        if not item:
+            return None
+        try:
+            manager = self.manager_for(aid, item)
+        except Exception:
+            return None
+        getter = getattr(manager, "account_uid", None)
+        if getter is None:
+            return None
+        try:
+            return getter() or None
+        except Exception:
+            return None
+
     def any_manager(self, backend=None):
         """任一启用账号的凭据管理器；``backend`` 给定时只看该后端。
 
@@ -1408,6 +1430,74 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             key_id=params.get("key_id") or None,
             account_id=params.get("account_id") or None)
         return {**result, "rows": await asyncio.to_thread(_log_rows, result["rows"])}
+
+    @app.get("/admin/api/logs/upstream")
+    async def logs_upstream(req: Request):
+        """分页读**上游用量报表**（上游自己记的请求流水）。
+
+        ## 为什么要有这个接口
+
+        request_logs 记的是「本代理经手的请求」，上游报表记的是「上游账号上的
+        请求」——两者的条数天生不等：上游账号上的官方 App / CLI / IDE 流量、
+        排队时被丢弃的首轮请求、以及本代理之外的客户端，都不在 request_logs 里。
+
+        用户看到的「日志记 A 账号、云端却是 B 账号」正是这两套视角对不上：
+        日志里的 account_name 是**本地备注名**，云端显示的是**上游昵称**
+        （同一个号在管理页可能叫「新号」，在云端叫「15882308279」）。
+
+        这个接口把上游视角原样摆出来（client 字段标明是哪个客户端发的：
+        WorkBuddy = 本代理，CLI / app_cloud / CodeBuddyIDE / 空 = 别的客户端），
+        配合 request_logs 里的 v26 三列（upstream_model / account_uid /
+        client_request_id）就能逐条对账。
+        """
+        store.require_admin(req)
+        params = req.query_params
+
+        def as_int(name, default=None):
+            raw = params.get(name)
+            if raw in (None, ""):
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                raise HTTPException(400, f"{name} 需为整数")
+        result = await asyncio.to_thread(
+            store.db.page_upstream_usage,
+            limit=as_int("limit", 50), offset=as_int("offset", 0),
+            since=as_int("since"), until=as_int("until"),
+            account_id=params.get("account_id") or None,
+            backend=params.get("backend") or None)
+        uid_cache = {}
+        rows = []
+        for index, row in enumerate(result["rows"]):
+            aid = row.get("account_id") or ""
+            if aid not in uid_cache:
+                uid_cache[aid] = store.account_uid(aid)
+            rows.append({
+                "id": f"u{index}",
+                "time": row.get("request_time"),
+                "source": "upstream",
+                "account_id": row.get("account_id"),
+                "account_name": row.get("account_name"),
+                "model_id": row.get("model"),
+                "model_name": row.get("model"),
+                "upstream_request_id": row.get("request_id"),
+                "client": row.get("client") or "",
+                "credit": row.get("credit"),
+                "agent_purpose": row.get("agent_purpose"),
+                "input_trunc": row.get("input_trunc"),
+                "status": None, "outcome": "upstream_record", "duration_ms": None,
+                "key_id": None, "backend": None,
+                "tokens_in": None, "tokens_out": None,
+                "tokens_cache_read": None, "tokens_cache_creation": None,
+                "first_token_ms": None, "client_ip": None, "user_agent": None,
+                "error_code": None, "upstream_model": row.get("model"),
+                # 上游视角的行也要能对上「云端那个号」：account_id 是**本地**账号
+                # 行 id，真正跨两边对齐的是上游 uid（备注名与云端昵称不是一回事）。
+                "account_uid": uid_cache.get(aid),
+                "client_request_id": row.get("request_id"),
+            })
+        return {**result, "rows": rows}
 
     @app.get("/admin/api/logs/stats")
     async def log_stats(req: Request):
