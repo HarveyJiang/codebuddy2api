@@ -183,21 +183,39 @@ def parse_retry_after(headers, now: float | None = None) -> float | None:
 
 
 def _header_getter(headers):
-    """把三种 header 容器归一成一个 (小写名) -> str 的取值函数。
+    """把几种 header 容器归一成一个 (小写名) -> str 的取值函数。
 
     支持的容器：``httpx.Headers``/``httpx.Response``（大小写不敏感）、ASGI 的
-    ``{bytes: bytes}``、以及普通 ``{str: str}`` 字典。
+    ``{bytes: bytes}``、普通 ``{str: str}`` 字典，以及 **ASGI 规范里的
+    ``[(bytes, bytes), ...]`` 列表**。
 
-    统一走「遍历 + 小写比较」而不是多次 ``.get`` 变体：三种容器的键类型与
+    统一走「遍历 + 小写比较」而不是多次 ``.get`` 变体：几种容器的键类型与
     大小写规则各不相同，逐个试很容易漏（``httpx.Headers`` 吃不了 bytes 键，
     普通字典的 ``X-RateLimit-Reset`` 也不会被 ``title()`` 命中）。
+
+    ## 为什么加了列表形态（2026-10-20）
+
+    ASGI 的 ``http.response.start`` 消息里，响应头就是
+    ``[(b"retry-after", b"120"), ...]`` 这种**列表**，不是字典。而
+    ``admin/pool.py`` 的两处扣留路径（``_serve_once`` / ``_attempt``）拿到的
+    正是它 —— 之前这里只认有 ``.items()`` 的容器，于是**上游明示的恢复时刻
+    在这两条路径上从来没被采信过**（``Retry-After`` / ``X-RateLimit-Reset``
+    一律被当成「上游没说」，改用本地退避的 5 分钟起步）。少认一种容器，
+    表现就是「本地猜的时长必然不准」那个老问题又冒出来一次。
     """
-    if headers is None or not hasattr(headers, "items"):
+    if headers is None:
+        return None
+
+    if hasattr(headers, "items"):
+        pairs = headers.items()
+    elif isinstance(headers, (list, tuple)):
+        pairs = headers
+    else:
         return None
 
     def _get(name):
         target = name.lower()
-        for key, value in headers.items():
+        for key, value in pairs:
             if isinstance(key, bytes):
                 key = key.decode("latin-1")
             if isinstance(key, str) and key.lower() == target:

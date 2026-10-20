@@ -628,7 +628,32 @@ def _v23_to_v24(db):
         db._write.execute("ALTER TABLE request_logs ADD COLUMN error_code TEXT")
 
 
-SCHEMA_VERSION = 24
+def _v24_to_v25(db):
+    """v24 → v25：settings 加 upstream_retry / upstream_retry_tries 两项。
+
+    ## 为什么
+
+    上游 502/503/504 是「明确拒绝、没开始生成内容」的临时故障，换个号重发
+    不会重复计费（见 core/replay_policy.py 的 TRANSIENT_STATUS）。要启用
+    这件事需要两个可调项：开关（要不要重试）与次数（最多换几个号）。
+
+    ## 取舍
+
+    - 默认**开**（upstream_retry=1、tries=2）：这类重试只在「一个字节都还没
+      发给客户端」时发生，等于把失败挡在客户端之外，不改变请求语义。
+      与 queue_failover 默认关不同 —— 那个是投机性重放整个请求。
+    - 加列必须带 NOT NULL DEFAULT：settings 是单行表，列在但值为 NULL 时
+      POOL_DEFAULTS 的合并**不认为它是缺键**，None 会一路传到 int() 上
+      （v3→v4、v4→v5 同理）。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(settings)")}
+    for name, ddl in (("upstream_retry", "INTEGER NOT NULL DEFAULT 1"),
+                      ("upstream_retry_tries", "INTEGER NOT NULL DEFAULT 2")):
+        if name not in columns:
+            db._write.execute(f"ALTER TABLE settings ADD COLUMN {name} {ddl}")
+
+
+SCHEMA_VERSION = 25
 
 
 MICRO = 1_000_000
@@ -830,6 +855,8 @@ class Database:
             queue_hold_ms INTEGER NOT NULL DEFAULT 3000,
             queue_model_fallback INTEGER NOT NULL DEFAULT 1,
             queue_fallback_model TEXT NOT NULL DEFAULT 'fast-model',
+            upstream_retry INTEGER NOT NULL DEFAULT 1,
+            upstream_retry_tries INTEGER NOT NULL DEFAULT 2,
             backend_enabled TEXT NOT NULL DEFAULT '{}',
             backup_enabled INTEGER NOT NULL DEFAULT 0,
             backup_interval_hours INTEGER NOT NULL DEFAULT 24,
@@ -1042,7 +1069,8 @@ class Database:
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
                   (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21),
-                  (22, _v21_to_v22), (23, _v22_to_v23), (24, _v23_to_v24))
+                  (22, _v21_to_v22), (23, _v22_to_v23), (24, _v23_to_v24),
+                  (25, _v24_to_v25))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
@@ -1076,6 +1104,8 @@ class Database:
         "sync_start", "sync_end", "batch_spread", "default_routing",
         "queue_failover", "queue_retry", "queue_cooldown", "queue_hold_ms",
         "queue_model_fallback", "queue_fallback_model", "models_updated",
+        # 上游 5xx 换号重试（v25）：开关 + 最多换几个号。
+        "upstream_retry", "upstream_retry_tries",
         # 后端总闸：{后端名: 是否启用}，缺键即启用（specs/backend-toggle.md）。
         # JSON 存 TEXT 而不是加固定列 —— 后端数量可变，装不进固定列结构。
         "backend_enabled",

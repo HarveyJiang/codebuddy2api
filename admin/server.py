@@ -1754,6 +1754,21 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(fallback, str) or not fallback.strip() or len(fallback) > 100:
                     raise HTTPException(400, "兜底模型名无效")
                 settings["queue_fallback_model"] = fallback.strip()
+            # 上游 5xx 换号重试（v25）。只在「一个字节都还没发给客户端」时
+            # 才可能发生，所以它不改变请求语义；次数上限收紧到 5，防止把
+            # 一次客户端请求放大成十几次上游请求。
+            if "upstream_retry" in body:
+                if type(body["upstream_retry"]) is not bool:
+                    raise HTTPException(400, "上游 5xx 重试开关无效")
+                settings["upstream_retry"] = body["upstream_retry"]
+            if "upstream_retry_tries" in body:
+                try:
+                    tries = int(body["upstream_retry_tries"])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "上游 5xx 重试次数需为整数")
+                if not 0 <= tries <= 5:
+                    raise HTTPException(400, "上游 5xx 重试次数需在 0-5 之间")
+                settings["upstream_retry_tries"] = tries
             # 账号级限额护栏（admin/guards.py）。上界给得宽，但要挡住明显误输入
             # （把 token 上限填成 1e9 等于没开，填成负数会绕过 0=关闭 的语义）。
             for field, label, upper in (

@@ -41,6 +41,7 @@ from core.backends.registry import (
     pinned_model_owner,
     spec_for,
 )
+from core.replay_policy import is_transient_status
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 # 池中间件观察到的路由信息，交由外层 MetricsMiddleware 合并成一行 request_logs。
@@ -101,6 +102,42 @@ class ModelCoolingError(LocalReject):
     def __init__(self, detail, model=None):
         super().__init__(503, detail)
         self.model = model
+
+
+def _obj_has_content(obj):
+    """这个 SSE/JSON 对象里有没有**真实内容**。
+
+    choices / delta / content / output / output_text 任一出现，就说明上游
+    **已经开始生成** —— 这种响应绝不能重发（客户端会收到重复输出）。
+    错误响应体（``{"error": {...}}``）没有这些键，可以安全换号重发。
+    """
+    if not isinstance(obj, dict):
+        return False
+    return bool(obj.get("choices") or obj.get("delta") or obj.get("content")
+                or obj.get("output") or obj.get("output_text"))
+
+
+def _body_has_content(raw):
+    """一份响应体里有没有真实内容（见 :func:`_obj_has_content`）。
+
+    与 ``_attempt`` 里的 sniff 用同一份判据：同一个问题只留一处实现，
+    两边判断不一致会出「以为没内容→重发→客户端收到两遍」的怪事。
+    """
+    for line in (raw or b"").split(b"\n"):
+        stripped = line.strip()
+        for prefix in (b"data:", b"event:"):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):].strip()
+                break
+        if not stripped or stripped in (b"[DONE]",):
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if _obj_has_content(obj):
+            return True
+    return False
 
 
 def number(value):
@@ -239,6 +276,14 @@ class AccountPool:
                      "queue_hold_ms": 3000,
                      "queue_model_fallback": True,
                      "queue_fallback_model": "fast-model",
+                     # 上游 5xx（502/503/504）换号重试。默认**开**：
+                     # 这类响应是上游**明确拒绝**、没开始生成内容，换个号重发
+                     # 不会重复计费（见 core/replay_policy.py 的 TRANSIENT_STATUS）。
+                     # 与 queue_failover 的区别：那个功能是「投机性重放整个请求」，
+                     # 默认关是因为影响面大；这个只在**一个字节都还没发给客户端**
+                     # 时才可能发生，属于「把失败挡在客户端之外」。
+                     "upstream_retry": True,
+                     "upstream_retry_tries": 2,
                      # 数据库备份（admin/backup.py）。默认关闭：定时备份持续占磁盘，
                      # 开不开由用户决定，不因升级替人做主。
                      "backup_enabled": False,
@@ -261,7 +306,8 @@ class AccountPool:
                     "credit_min_interval", "sync_start", "sync_end",
                     "growth_travel_hours", "growth_activity_hours"),
         "queue": ("queue_failover", "queue_model_fallback", "queue_retry",
-                  "queue_cooldown", "queue_hold_ms", "queue_fallback_model"),
+                  "queue_cooldown", "queue_hold_ms", "queue_fallback_model",
+                  "upstream_retry", "upstream_retry_tries"),
         "routing": ("default_routing",),
         "guards": ("guard_reserve_credits", "guard_daily_token_limit",
                    "guard_daily_credit_limit", "guard_model_daily_token_limit"),
@@ -801,7 +847,13 @@ class AccountPool:
     # 下面这组状态码（以及后端声明的 soft_cooldown）判为**模型级**：只记
     # ``model_cooldowns[model]``，账号本身仍参与分配——请求别的模型时它会
     # 被正常选中，请求同一个模型时才被跳过（见 select / state）。
-    MODEL_LEVEL_STATUSES = frozenset({429, 503})
+    #
+    # 502/504 与 503 同列：它们是「上游明确拒绝、没开始生成」的临时故障，
+    # 换个模型/换个号照样能成，属模型（或资源）级不可用。
+    #
+    # **不能把它们留在「其它」分支**：那里会被当成「recovered 成功」，
+    # 把连续失败计数清零——等于把一次故障当成成功记账。
+    MODEL_LEVEL_STATUSES = frozenset({429, 502, 503, 504})
     # 账号级：凭据/权限/额度层面的问题，换什么模型都没用。
     #   401/403 认证与权限被拒      402 账号额度耗尽
     ACCOUNT_LEVEL_STATUSES = frozenset({401, 402, 403})
@@ -1840,12 +1892,20 @@ class PoolMiddleware:
         log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
         pool_cfg = self.pool.store.data.get("pool", {})
         failover_on = bool(pool_cfg.get("queue_failover"))
+        # 上游 5xx 换号重试（默认开）：与排队切换是两个独立开关、两个独立预算。
+        retry_on = bool(pool_cfg.get("upstream_retry", True))
         max_tries = max(1, int(pool_cfg.get("queue_retry", 3))) if failover_on else 1
         if not failover_on:
-            # 开关关闭时走原路径：必须仍然用重放闭包包一层 receive，
-            # 否则下游应用第二次 await receive() 会阻塞在 ASGI 上。
-            return await self._serve_once(scope, _replay_receive(raw, receive), send,
-                                          aid, manager, kid, log_context, model=model_name)
+            if not retry_on:
+                # 两个开关都关：走原路径，行为与改动前完全一致。
+                # 必须仍然用重放闭包包一层 receive，
+                # 否则下游应用第二次 await receive() 会阻塞在 ASGI 上。
+                return await self._serve_once(scope, _replay_receive(raw, receive), send,
+                                              aid, manager, kid, log_context, model=model_name)
+            # 默认路径 + 上游 5xx 换号重试。
+            return await self._serve_with_retry(scope, raw, receive, send, aid, manager, kid,
+                                                log_context, model_name, affinity_key,
+                                                backend, pool_cfg)
 
         # -- 容量队列自动切换（specs/queue-failover.md） ------------------------
         # 只有在「尚未向客户端发出任何字节」时才能重放；一旦开始输出内容就必须
@@ -1929,11 +1989,16 @@ class PoolMiddleware:
                 return
             # 命中排队：标记让位。决策顺序见 spec 4.4——先换号，候选耗尽再降级模型。
             last_outcome = outcome
-            self.pool.mark_queued(aid)
+            if outcome.get("transient"):
+                # 上游 5xx：换号重试，但**不**记成「排队让位」——排队是容量问题，
+                # 记上去会让这个号在 queue_cooldown 秒内被平白跳过。
+                _logger.info("账号 %s 上游 %s，换号重试", aid, outcome.get("status"))
+            else:
+                self.pool.mark_queued(aid)
+                _logger.info("账号 %s 命中容量队列（%s），让位 %s 秒", aid,
+                             outcome.get("code") or "WAITING",
+                             pool_cfg.get("queue_cooldown", 120))
             tried_accounts.append(aid)
-            _logger.info("账号 %s 命中容量队列（%s），让位 %s 秒", aid,
-                         outcome.get("code") or "WAITING",
-                         pool_cfg.get("queue_cooldown", 120))
             # WAF/通道拦截是**出口 IP 级**的，换号无用（实测换遍全池仍被拦）。
             # 识别出来就立刻停手：继续轮转只会把一次客户端请求放大成 N 次上游
             # 请求，把一个已经触发的风控推得更重。见 admin/rotation.py。
@@ -1956,7 +2021,9 @@ class PoolMiddleware:
         if last_outcome is not None:
             # 全部重试都用尽：把上游的排队响应原样还给客户端。日志要能看出
             # 「这次没拿到答案，是被上游排队了」——它既不是成功也不是失败。
-            log_context["queued"] = True
+            # 上游 5xx 不算排队（那是故障，分类要落到 upstream_error）。
+            if not last_outcome.get("transient"):
+                log_context["queued"] = True
             log_context["error_code"] = last_outcome.get("code")
             await send({"type": "http.response.start", "status": last_outcome["status"],
                         "headers": last_outcome["headers"]})
@@ -2082,8 +2149,14 @@ class PoolMiddleware:
                 is_queue, code, has_content = sniff(payload)
                 if code is not None:
                     state["error_code"] = code
-                if is_queue and not has_content:
+                # 上游 5xx 也走「换号」这条路：它和排队一样是「换个别号再试」，
+                # 但**不是**容量问题（不能记成排队让位——那会让这个号在
+                # queue_cooldown 秒内被平白跳过），冷却口径也不同（5xx 属
+                # 模型级，见 record()）。
+                transient = is_transient_status(state["status"]) and not has_content
+                if (is_queue or transient) and not has_content:
                     state["queue"] = True
+                    state["transient"] = transient
                     state["code"] = code
                     # 记下被丢弃的原始分片，并继续收集后续分片：全部重试都用尽时
                     # 要把这份响应**原样**还给客户端（让它按 retry_after 轮询），
@@ -2124,7 +2197,8 @@ class PoolMiddleware:
                     app_task.exception()  # 吞掉异常：这次响应本来就要丢弃
                 return {"kind": "queue", "code": state.get("code"),
                         "status": state["status"], "headers": state["headers"],
-                        "body": b"".join(state.get("raw") or [])}
+                        "body": b"".join(state.get("raw") or []),
+                        "transient": bool(state.get("transient"))}
             if state["held"] and not state["started"]:
                 # 窗口内没有首包：不是排队，是上游慢。原样放行，本次不切号。
                 state["held"] = False
@@ -2209,8 +2283,26 @@ class PoolMiddleware:
                     return None
         return None
 
-    async def _serve_once(self, scope, receive, send, aid, manager, kid, log_context, model=None):
-        """开关关闭时的原路径：完全保持改动前的行为。"""
+    async def _serve_once(self, scope, receive, send, aid, manager, kid, log_context,
+                          model=None, hold_retryable=False):
+        """把一次请求交给一个账号跑完。
+
+        ## 扣留可重试响应（``hold_retryable``）
+
+        打开时（``upstream_retry`` 开关）会**扣住**上游的 502/503/504，
+        在确认「上游没吐内容」之前**一个字节都不发给客户端** —— 只有这样
+        才能换号重发，而不会让客户端先看到一个错误、随后又收到一次完整响应。
+
+        扣留**必须有硬上界**（``queue_hold_ms``，默认 3 秒）：历史上排队扣留
+        被回滚就是因为无上界扣留把 /health 一起拖死。到点立刻放行，行为退回
+        改动前（不重试）。
+
+        ## 返回值
+
+        - ``None`` → 响应已放行（成功，或非重试类错误），调用方收工。
+        - ``{"kind": "retryable", ...}`` → 上游明确拒绝且没吐内容，一个字节都
+          没发给客户端；调用方可以换号重发（见 :meth:`_serve_with_retry`）。
+        """
         token = REQUEST_CREDENTIAL.set(manager)
         status = 200
         buffer = b""
@@ -2223,6 +2315,11 @@ class PoolMiddleware:
         err_texts: list[str] = []
         # 最后一次出现的完整 usage：实测成本账本要读 credit。
         nonlocal_last_usage = [None]
+        # 扣留状态：hit=扣住了一个可重试响应，raw=扣下来的分片。
+        hold = {"hit": False, "raw": [], "status": None, "headers": [],
+                "released": False, "flushed": False}
+        # 非 None 表示「这次不发给客户端，交给调用方换号重发」。
+        outcome = None
 
         def extract_usage(obj):
             nonlocal usage_tokens, upstream_id
@@ -2237,60 +2334,217 @@ class PoolMiddleware:
             if not upstream_id and isinstance(obj, dict) and obj.get("id"):
                 upstream_id = obj["id"]
 
+        def scan(payload):
+            """从一段分片里提取 usage / 错误码 / 文案。
+
+            扣留与放行两条路**共用**它：扣留期间同样要认错误码（上游常把
+            429 裹在 200 里），冷却判定与请求日志都要用它。
+            """
+            nonlocal status, buffer
+            buffer += payload
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line.startswith(b"data:"):
+                    continue
+                try:
+                    obj = json.loads(line[5:])
+                    extract_usage(obj.get("response") or obj)
+                    err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
+                    if isinstance(err, dict) and err.get("message"):
+                        err_texts.append(str(err["message"]))
+                    code = err.get("code") if isinstance(err, dict) else None
+                    if code is not None:
+                        # v24：业务码**原样**进 error_code 列（非数字文本
+                        # 如 "USER_LIMIT" 也照存），与 HTTP 状态码分开。
+                        log_context["error_code"] = str(code)
+                        numeric = int(code) if isinstance(code, str) and code.isdigit() else code
+                        if numeric in (401, 402, 403, 404, 429):
+                            # 冷却判定用**业务码**：上游会用「HTTP 200 + SSE
+                            # 里的 429」表示限流，按 HTTP 200 判会以为这次成功。
+                            status = numeric
+                except (ValueError, AttributeError):
+                    pass
+            if len(buffer) > 65536:
+                buffer = b""
+
+        async def flush_held():
+            """把扣留的响应**原样**放行给客户端（放弃重试时用）。
+
+            只能在 observe 内部、或应用已结束之后调用：`await send()` 会把
+            事件循环让出去，应用可能趁机把后面的分片发出来 —— 那样客户端
+            会先收到分片、再收到响应头（顺序错乱）。
+            """
+            if hold["flushed"]:
+                return
+            hold["flushed"] = True
+            hold["released"] = True
+            await send({"type": "http.response.start",
+                        "status": hold["status"], "headers": hold["headers"]})
+            for chunk in hold["raw"]:
+                await send({"type": "http.response.body", "body": chunk})
+            hold["raw"] = []
+
         async def observe(message):
-            nonlocal status, buffer, upstream_id
+            nonlocal status, buffer, upstream_id, resp_headers
             if message["type"] == "http.response.start":
                 status = message["status"]
+                # resp_headers 必须在 nonlocal 里声明——漏了它它就变成 observe
+                # 的局部变量，外层永远读到 []，于是上游明示的恢复时刻
+                # （Retry-After / reset_at）从来没被采信过（实测踩过）。
                 resp_headers = message.get("headers", [])
                 # 非流式的上游 id 走响应头（converter 从聚合结果里 pop 出来放这的）。
                 # 先清掉流式路径可能已经取到的值，再从头取：一次请求只有一条路径，
                 # 混着留会串号。upstream_id 必须在 nonlocal 里声明——漏了它就变成
                 # 本闭包的局部变量，finally 读到的永远是 None（实测踩过）。
                 upstream_id = self._header_id(resp_headers) or None
+                if hold_retryable and not hold["hit"] and is_transient_status(status):
+                    # 扣住：先不发，看完整个响应再决定是重发还是原样放行。
+                    hold["hit"] = True
+                    hold["status"] = status
+                    hold["headers"] = resp_headers
+                    return
             if message["type"] == "http.response.body":
-                buffer += message.get("body", b"")
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    if line.startswith(b"data:"):
-                        try:
-                            obj = json.loads(line[5:])
-                            extract_usage(obj.get("response") or obj)
-                            err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
-                            if isinstance(err, dict) and err.get("message"):
-                                err_texts.append(str(err["message"]))
-                            code = err.get("code") if isinstance(err, dict) else None
-                            if code is not None:
-                                # v24：业务码**原样**进 error_code 列（非数字文本
-                                # 如 "USER_LIMIT" 也照存），与 HTTP 状态码分开。
-                                log_context["error_code"] = str(code)
-                                numeric = int(code) if isinstance(code, str) and code.isdigit() else code
-                                if numeric in (401, 402, 403, 404, 429):
-                                    # 冷却判定用**业务码**：上游会用「HTTP 200 + SSE
-                                    # 里的 429」表示限流，按 HTTP 200 判会以为这次成功。
-                                    status = numeric
-                        except (ValueError, AttributeError):
-                            pass
-                if len(buffer) > 65536:
-                    buffer = b""
+                payload = message.get("body", b"")
+                if hold["hit"] and not hold["released"]:
+                    # 扣留期间：只收集，不转发。
+                    hold["raw"].append(payload)
+                    scan(payload)
+                    return
+                if hold["released"] and not hold["flushed"]:
+                    # 放行：先补发响应头 + 已扣留的分片，再走普通透传。
+                    await flush_held()
+                scan(payload)
             await send(message)
 
         try:
-            await self.app(scope, receive, observe)
+            if not hold_retryable:
+                await self.app(scope, receive, observe)
+            else:
+                hold_ms = max(0, int(self.pool.store.data.get("pool", {})
+                                     .get("queue_hold_ms", 3000)))
+                app_task = asyncio.ensure_future(self.app(scope, receive, observe))
+                try:
+                    done, _ = await asyncio.wait({app_task},
+                                                 timeout=hold_ms / 1000.0)
+                except asyncio.CancelledError:
+                    app_task.cancel()
+                    raise
+                if app_task in done:
+                    # 应用已结束：响应完整，可以判定要不要换号重发。
+                    await self._await_app(app_task)
+                    if hold["hit"]:
+                        body = b"".join(hold["raw"])
+                        if not _body_has_content(body):
+                            # 上游明确拒绝且没吐内容：一个字节都没发出去，
+                            # 可以安全换号重发（不会重复计费，见 core/replay_policy.py）。
+                            outcome = {"kind": "retryable", "status": status,
+                                       "http_status": hold["status"],
+                                       "headers": hold["headers"], "body": body}
+                else:
+                    # 窗口到点：不再判定，原样放行（行为退回改动前）。
+                    # 放行交给下一次 observe 或 finally —— 这里 await 下去会让
+                    # 应用插进来发分片，响应头就可能晚于分片到达客户端。
+                    hold["released"] = True
+                    await self._await_app(app_task)
         finally:
             REQUEST_CREDENTIAL.reset(token)
             # token 明细（用户 2026-10-19）：原路径也用最后一次完整 usage 归一化，
             # 让关闭排队切换时请求日志同样有输入/输出/缓存 token。
             log_context["tokens_detail"] = _tokens_of(nonlocal_last_usage[0])
             log_context["upstream_request_id"] = upstream_id
-            self.pool.record(aid, status,
-                             hint_text=" ".join(err_texts) or None,
-                             hint_headers=resp_headers,
-                             usage=nonlocal_last_usage[0], model=model)
-            self.pool.note_usage(aid, model, usage_tokens or 0,
-                                 _credits_of(nonlocal_last_usage[0]))
-            if kid is not None:
-                self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
-            self.pool.flush()
+            if outcome is None and hold["hit"] and not hold["flushed"]:
+                # 扣留到期、放弃重试：把响应原样放行。走到这里应用已经结束，
+                # 不会有分片插队，顺序是安全的。
+                await flush_held()
+            if outcome is None:
+                # 正常路径才记账：**可重试的那次不记账**——换号本身已经处理了，
+                # 一次客户端请求最多只冷却 1 个账号的该模型（见 _serve_with_retry）。
+                self.pool.record(aid, status,
+                                 hint_text=" ".join(err_texts) or None,
+                                 hint_headers=resp_headers,
+                                 usage=nonlocal_last_usage[0], model=model)
+                self.pool.note_usage(aid, model, usage_tokens or 0,
+                                     _credits_of(nonlocal_last_usage[0]))
+                if kid is not None:
+                    self.pool.store.record_key_usage(kid, tokens=usage_tokens or None)
+                self.pool.flush()
+        return outcome
+
+    async def _next_account(self, affinity_key, kid, tried_accounts, model, backend):
+        """挑下一个可试的账号；凭据不可用的号直接摘掉继续找。
+
+        返回 ``(aid, manager)``，没有可试的号时返回 ``None``。
+        """
+        while True:
+            picked = self.pool.try_select(affinity_key, kid, tried_accounts,
+                                          model=model, backend=backend)
+            if picked is None:
+                return None
+            aid, manager = picked
+            try:
+                await asyncio.to_thread(manager.get_headers)
+            except Exception:
+                # 换到的号凭据不可用：摘掉它（冷却 5 分钟）再找下一个。
+                # 不把它算进「重试次数」——额度用完不是上游的错。
+                self.pool.update(aid, cooldown_until=self.pool.clock() + 300,
+                                 last_error="凭据暂不可用，已冷却 5 分钟")
+                tried_accounts.append(aid)
+                continue
+            return aid, manager
+
+    async def _serve_with_retry(self, scope, raw, receive, send, aid, manager, kid,
+                                log_context, model, affinity_key, backend, pool_cfg):
+        """上游 5xx 换号重试（``upstream_retry`` 开关打开时走这里）。
+
+        ## 为什么可以重发
+        502/503/504 是上游**明确拒绝**、没开始生成内容，换个号重发不会重复
+        计费（见 core/replay_policy.py 的 TRANSIENT_STATUS）。前提是**一个字节
+        都还没发给客户端**——由 :meth:`_serve_once` 的扣留保证。
+
+        ## 记账口径
+        中间几次重试**不记账**（换号本身已经处理了），只有最后一次——把上游
+        原始响应还给客户端的那次——才记一次失败。一次客户端请求因此最多冷却
+        1 个账号的该模型，不会放大成 N 个。
+        """
+        tries = max(0, int(pool_cfg.get("upstream_retry_tries", 2)))
+        tried_accounts = []
+        while True:
+            # 每次 attempt 都要用**新的** receive 闭包：下游应用可能多次
+            # await receive()，闭包里的 delivered 标志只能喂一次请求体。
+            result = await self._serve_once(scope, _replay_receive(raw, receive), send,
+                                            aid, manager, kid, log_context,
+                                            model=model, hold_retryable=True)
+            if not result or result.get("kind") != "retryable":
+                return  # 响应已放行（成功或非重试类错误），收工
+            status = result.get("status")
+            tried_accounts.append(aid)
+            picked = None
+            if tries > 0:
+                tries -= 1
+                picked = await self._next_account(affinity_key, kid, tried_accounts,
+                                                 model, backend)
+            if picked is None:
+                # 没有别的号可试（或次数用尽）：把上游的原始响应**原样**还给
+                # 客户端。**不是** 503 —— 503 会掩盖真实原因（上游到底说了什么）。
+                await send({"type": "http.response.start",
+                            "status": result.get("http_status") or status,
+                            "headers": result.get("headers") or []})
+                await send({"type": "http.response.body",
+                            "body": result.get("body") or b""})
+                self.pool.record(aid, status,
+                                 hint_text=self._text_of(result),
+                                 hint_headers=result.get("headers"),
+                                 model=model)
+                if kid is not None:
+                    self.pool.store.record_key_usage(kid, tokens=None)
+                self.pool.flush()
+                return
+            aid, manager = picked
+            # 与 account_id/account_name 同步刷新：换号后这条记录才是「实际用的那个号」。
+            log_context["account_id"] = aid
+            log_context["account_name"] = self.pool.store.data["accounts"].get(aid, {}).get("name")
+            log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
+            _logger.info("上游 %s，换号重试（账号 %s）", status, aid)
 
 
 def _replay_receive(raw, original_receive):

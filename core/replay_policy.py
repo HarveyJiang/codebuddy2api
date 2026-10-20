@@ -41,6 +41,17 @@ REPLAYABLE_STATUS = frozenset((401, 403, 429, 502, 503, 504))
 # 语义错误：请求本身有问题，换账号、重发、换模型都没用。
 DETERMINISTIC_STATUS = frozenset((400, 404, 405, 413, 422))
 
+# 上游**明确拒绝**、且没有开始生成内容的状态码：换号重发安全。
+#
+# 与传输异常的区别在于「上游有没有开始干活」：
+#   - 这里的 5xx 是上游**回了一个错误响应**，生成根本没开始，重发不会重复计费；
+#   - 传输异常里有一半是「请求体已发出、上游可能已处理并计费」
+#     （AMBIGUOUS_TRANSPORT），那种情况重发就是主动制造重复计费，绝不能重试。
+#
+# 用它做换号重试的判据时，还必须保证**一个字节都还没发给客户端**——
+# 否则客户端会先看到一个 503、然后又收到一次完整响应。
+TRANSIENT_STATUS = frozenset((502, 503, 504))
+
 # 连接建立阶段失败：请求体一个字节都没发出去，重试绝对安全。
 REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout)
 
@@ -64,6 +75,20 @@ def is_replayable_status(status: int) -> bool:
 
 def is_deterministic_status(status: int) -> bool:
     return status in DETERMINISTIC_STATUS
+
+
+def is_transient_status(status) -> bool:
+    """这个状态码是不是「上游明确拒绝、可以换号重发」的 5xx。
+
+    转不了数字（None、文本）一律返回 False —— 宁可漏判成「不可重试」，
+    也不能把一个说不清的状态码当成可重试的依据。
+    """
+    if status is None or isinstance(status, bool):
+        return False
+    try:
+        return int(status) in TRANSIENT_STATUS
+    except (TypeError, ValueError):
+        return False
 
 
 def classify_transport_error(exc: BaseException) -> str:
