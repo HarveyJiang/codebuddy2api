@@ -126,7 +126,10 @@ check("详情弹框存在且可抽取", detailDialog !== null, true);
 check("日志状态列不再有行内 cell-note 文字",
       /log-status[\s\S]{0,120}cell-note inline/.test(src), false);
 check("日志状态列带 data-tip 气泡（三处：概览/账号日志/密钥明细）",
-      (src.match(/pill log-status/g) || []).length >= 3, true);
+      // v24 起三处日志表共用同一个 statusCell()：徽标与气泡只写一份，
+      // 由三处调用点复用（避免三处各写一份、慢慢漂移）。
+      (src.match(/pill log-status/g) || []).length >= 1
+      && (src.match(/\$\{statusCell\(r\)\}/g) || []).length >= 3, true);
 // 用户 2026-10-20 再报：token 三列加进来后 760px 仍出横向滚动条，
 // 已加宽到 980px 并同步收紧这两个弹框内的 th/td padding。详细回归断言
 // 见 tests/frontend/logdialog.test.mjs，这里只保留粗粒度兜底。

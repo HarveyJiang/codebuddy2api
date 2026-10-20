@@ -590,7 +590,25 @@ function renderDashboard() {
   $("dash-routing").textContent = ({round_robin:"轮流分配请求，自动跳过不可用账号", random:"在可用账号中随机分配", expiry_first:"优先消耗最早到期的积分"}[overview.pool?.default_routing] || "按各密钥的分配策略选择账号");
   const states={available:"可用",paused:"已暂停",cooling:"冷却中",exhausted:"积分耗尽",invalid:"凭据异常"};
 }
-const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
+// 结果分类（v24 起细化）。后端 admin/metrics.py 的 classify_outcome 是唯一
+// 权威口径，这里只负责翻译成人话；前端不自己判定，避免两处规则漂移。
+// 老日志里出现的取值（success/stream_error/interrupted/http_error）保留在表里，
+// 否则历史行的悬停提示会退化成「请求失败」。
+const outcomes={
+  success:"完成",
+  model_cooling:"模型冷却中",
+  no_account:"无可用账号",
+  client_error:"请求有误",
+  rate_limited:"被限流",
+  auth_error:"鉴权失败",
+  quota_exhausted:"额度耗尽",
+  upstream_error:"上游错误",
+  waf_blocked:"风控拦截",
+  queue:"上游排队",
+  stream_error:"流式错误",
+  interrupted:"未完整结束",
+  http_error:"请求失败",
+};
 // 分配策略的图标与短名：列表里用「图标 + 短名」展示，编辑集中到设置弹框。
 // 图标是纯文本符号，与导航栏风格一致，不引入图标字体依赖。
 const ROUTING_ICON = {"": "↺", round_robin: "↻", random: "⁘", expiry_first: "⏳"};
@@ -653,6 +671,30 @@ function upstreamIdCell(r) {
   const short = id.length > 16 ? id.slice(0, 16) + "…" : id;
   return `<small class="cell-note mono" title="${esc(id)}">${esc(short)}</small>`;
 }
+// 业务错误码（v24 起）：上游给的码（11128 / USER_LIMIT / WAITING …）与 HTTP
+// 状态码是**两回事**，后端已分列落库。挂在状态徽标下面的小字，不新增列
+// ——表格已经很宽（用户 2026-10-17 报过横向溢出）。
+function errorCodeCell(r) {
+  const code = r.error_code === null || r.error_code === undefined ? "" : String(r.error_code).trim();
+  if (!code) return "";
+  return `<small class="cell-note mono" title="上游业务错误码：${esc(code)}">码 ${esc(code)}</small>`;
+}
+// 状态徽标的悬停提示：业务码 + 结果分类 + 来源 IP/UA。
+// 三样都是用户可控的字符串，进属性前统一 esc()。
+function logTip(r) {
+  const parts = [];
+  const code = r.error_code === null || r.error_code === undefined ? "" : String(r.error_code).trim();
+  if (code) parts.push("业务码 " + code);
+  parts.push(outcomes[r.outcome] || "请求失败");
+  const src = sourceTip(r);
+  if (src) parts.push(src);
+  return parts.join(" · ");
+}
+// 状态列（请求日志页 / 账号日志弹框 / 密钥日志弹框三处共用）：
+// 徽标只显示 HTTP 状态码，业务码另挂小字 —— 混在一格里会看不懂「11128」是什么。
+function statusCell(r) {
+  return `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(logTip(r))}">${esc(r.status ?? "—")}</span>${errorCodeCell(r)}</td>`;
+}
 
 function renderLogRows(rows) {
   // 账号列 = 后端小图标 + 账号名：图标区分是哪个上游（用户 2026-10-17：去掉
@@ -660,7 +702,7 @@ function renderLogRows(rows) {
   const accountCell = r => r.account_name
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td><td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(sourceTip(r) || outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>${tokenCells(r)}${firstTokenCell(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="10" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td>${statusCell(r)}${tokenCells(r)}${firstTokenCell(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="10" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
   const size = Number($("dash-page-size").value) || 10;
@@ -1378,7 +1420,7 @@ async function loadAccountLogs() {
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td>${esc(keyLabel(r))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td>`
-      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(sourceTip(r) || outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
+      + `${statusCell(r)}`
       + tokenCells(r)
       + firstTokenCell(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
@@ -2137,7 +2179,7 @@ async function loadKeyRequests(offset) {
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td>`
       + `<td>${r.account_name ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>` : "—"}</td>`
-      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(sourceTip(r) || outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
+      + `${statusCell(r)}`
       + tokenCells(r)
       + firstTokenCell(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")

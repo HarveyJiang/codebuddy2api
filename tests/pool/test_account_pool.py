@@ -885,7 +885,13 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["model_name"], "hy3")
 
     async def test_request_log_records_sse_error_code_as_status(self):
-        """回归：SSE 内带的 429 要以状态码入库，才能和客户端断连区分开。"""
+        """回归：SSE 内带的 429 要能落进日志，与客户端断连区分开。
+
+        v24 起**两列分开**（改动前业务码会覆盖 HTTP 状态码）：
+          - ``status`` = 客户端实际收到的 HTTP 状态码（这里是 200）；
+          - ``error_code`` = 上游业务码原样（这里是 "429"）；
+          - ``outcome`` = 分类，业务码优先于 HTTP 状态 → "rate_limited"。
+        """
         from admin.metrics import MetricsMiddleware, RequestMetrics
 
         async def app(scope, receive, send):
@@ -903,9 +909,12 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
                               headers={'Authorization': 'Bearer api-test'})
         self.store.save()
         row = self.store.db.recent_request_logs(1)[0]
-        # HTTP 层是 200，但生效状态码必须是 SSE 里的 429。
-        self.assertEqual(row["status"], 429)
-        self.assertEqual(row["outcome"], "stream_error")
+        # status 只放 HTTP 状态码：客户端确实收到了 200。
+        self.assertEqual(row["status"], 200)
+        # 业务码原样进 error_code 列。
+        self.assertEqual(row["error_code"], "429")
+        # 分类按业务码判：这是限流，不是「流式错误」。
+        self.assertEqual(row["outcome"], "rate_limited")
 
     async def test_request_log_records_token_detail(self):
         """用户 2026-10-19：请求日志要带输入/输出/缓存 token。

@@ -65,6 +65,44 @@ USAGE_SYNC_DAYS = 30   # 拉取窗口必须 ≥ 同步周期，否则连续断�
 ROUTING_POLICIES = frozenset(("round_robin", "random", "expiry_first"))
 
 
+class LocalReject(HTTPException):
+    """**本地拒绝**：请求根本没打到上游（v24）。
+
+    ## 为什么要有这个类型
+
+    池里「选不出号」有好几种原因，客户端看到的都是 503 或 400，但对排障
+    完全是两回事：池子空了 / 这个模型在所有号上冷却 / 护栏把号挡了 /
+    密钥无权用这个模型。改动前只能靠**文案**区分，调用方没法结构化地
+    拿到「为什么」，请求日志也因此记不出这类请求（它们在 select() 之前
+    就被拒了，而日志上下文那时还没建）。
+
+    现在带一个机器可读的 ``reason``，请求日志按它落 ``outcome``：
+    ``model_cooling`` / ``no_account`` / ``client_error``。
+    """
+
+    reason = "client_error"
+
+    def __init__(self, status_code, detail, reason=None):
+        super().__init__(status_code, detail)
+        if reason:
+            self.reason = reason
+
+
+class ModelCoolingError(LocalReject):
+    """该模型在**全部可用账号**上都在冷却（用户 2026-10-20 的模型级冷却）。
+
+    单列一个类型而不是复用 LocalReject：这条要带 ``model``（哪个模型冷了），
+    日志里据此落 ``outcome=model_cooling``，前端也能分开显示
+    「换模型」与「等一等」两种建议。
+    """
+
+    reason = "model_cooling"
+
+    def __init__(self, detail, model=None):
+        super().__init__(503, detail)
+        self.model = model
+
+
 def number(value):
     if isinstance(value, bool):
         raise ValueError("invalid number")
@@ -540,10 +578,17 @@ class AccountPool:
             if not candidates:
                 # 区分「池子空了」与「只是这个模型全在冷却」：后者换模型就能用，
                 # 让人去查登录态/暂停是白费功夫。
+                #
+                # v24：这两条改成结构化异常（LocalReject / ModelCoolingError），
+                # 调用方不再靠 match 文案认，请求日志也能落出 model_cooling /
+                # no_account 两类。文案保持原样，客户端看到的没变。
                 if model and any(self.state(row) == "available" for row in self.store.account_rows()
                                  if backend is None or row.get("backend", default_backend()) == backend):
-                    raise HTTPException(503, f"模型 {model} 在全部可用账号上都在冷却，请换模型或稍后重试")
-                raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+                    raise ModelCoolingError(
+                        f"模型 {model} 在全部可用账号上都在冷却，请换模型或稍后重试",
+                        model=model)
+                raise LocalReject(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态",
+                                  reason="no_account")
             routing = self._routing_for(kid)
             now = self.clock()
             # 优先跳过刚排过队的账号。但**全部**都在让位期内时必须忽略该标记——
@@ -562,10 +607,12 @@ class AccountPool:
             if candidates:
                 candidates, blocked = self._apply_guards(candidates, model)
                 if not candidates and blocked:
-                    raise HTTPException(
-                        503, f"账号已达本地限额（{blocked[0]}），请调整设置或等待次日重置")
+                    raise LocalReject(
+                        503, f"账号已达本地限额（{blocked[0]}），请调整设置或等待次日重置",
+                        reason="no_account")
             if not candidates:
-                raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+                raise LocalReject(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态",
+                                  reason="no_account")
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
                 if bindings[key].get("expires", 0) <= now:
@@ -1667,8 +1714,29 @@ class PoolMiddleware:
         if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}:
             return await self.app(scope, receive, send)
         headers = dict(scope.get("headers", []))
+        # 请求日志上下文（v24）：**在取密钥之前就建**，好让任何失败路径都能
+        # 落一行日志。
+        #
+        # 改动前它是 select() 之后才建的 —— 于是「压根没打到上游」的请求
+        # （模型在所有号上冷却、池子空了、密钥无权用这个模型）记不进
+        # request_logs：日志里只剩「打过上游的那些」，排障时看不出
+        # 「有多少请求根本没出去」。现在先建空壳，字段随信息量陆续补齐。
+        log_context = {"key_id": None, "account_id": None, "account_name": None,
+                       "backend": None, "model_id": None, "model_name": None,
+                       "error_code": None, "tokens_detail": None,
+                       "upstream_request_id": None,
+                       # 本地拒绝的原因（model_cooling / no_account / client_error）。
+                       # 非空 = 这个请求**没有打到上游**，日志按它落 outcome。
+                       "local_reject": None,
+                       # 上游排队让位：请求打到了上游，但拿回的是「你在排队中」。
+                       # 标记后日志落 outcome=queue，不与「没完整结束」混为一谈。
+                       "queued": False,
+                       # WAF/通道拦截（出口 IP 级）：日志落 outcome=waf_blocked。
+                       "waf": False}
+        scope[REQUEST_LOG_CONTEXT] = log_context
         try:
             kid = self.pool.store.check_api(headers.get(b"authorization", b"").decode(), headers.get(b"x-api-key", b"").decode())
+            log_context["key_id"] = kid
             raw = bytearray()
             while True:
                 message = await receive()
@@ -1684,6 +1752,12 @@ class PoolMiddleware:
                 body = json.loads(raw) if raw else {}
             except ValueError:
                 body = {}
+            # 模型名**先**取出来记进日志上下文：模型门/白名单门拒绝时请求
+            # 压根没打上游，日志里也得看得到是哪个模型/哪个密钥被拒的。
+            model_name = None
+            if isinstance(body, dict) and isinstance(body.get("model"), str):
+                model_name = body["model"]
+            log_context["model_id"] = log_context["model_name"] = model_name
             # 模型名 → 后端（§5 裸名路由）**必须在模型门之前**：
             #   - 后端已被管理员禁用 / 没有启用账号 / 目录里没这个模型 —— 这些原因
             #     只有策略算得出来（它逐后端看候选），`_resolve_backend_for` 会以
@@ -1730,10 +1804,10 @@ class PoolMiddleware:
             # `backend` 在上面（模型门之前）就算好了 —— 顺序反过来的话，
             # 「后端禁用」会被模型门误报成「模型已禁用」，见那段注释。
             scope[ROUTED_BACKEND] = backend
+            # 选定后端先记进日志：选号失败时（池空/模型全冷）日志里能看出
+            # 这个请求本来要打哪条链路。选出账号后会改成**实际账号**的后端。
+            log_context["backend"] = backend
             affinity_key = request_affinity(headers, body)
-            model_name = None
-            if isinstance(body, dict) and isinstance(body.get("model"), str):
-                model_name = body["model"]
             # Refresh before entering a stream; retry another eligible account only
             # if credential preparation fails, never replay a partially emitted response.
             # 重试分支也要传同一个 kid、同一个 backend 与同一个 model，否则凭据失败后
@@ -1750,23 +1824,20 @@ class PoolMiddleware:
                 aid, manager = self.pool.select(affinity_key, kid, model=model_name, backend=backend)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
+            # 本地拒绝（没打到上游）：记下机器可读的原因，请求日志据此落
+            # outcome=model_cooling / no_account / client_error。
+            log_context["local_reject"] = getattr(e, "reason", "client_error")
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
         except Exception:
+            log_context["local_reject"] = "no_account"
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
-        log_context = {"key_id": kid, "account_id": aid,
-                       "account_name": self.pool.store.data["accounts"].get(aid, {}).get("name"),
-                       # 这条请求走的是哪条链路（trae / workbuddy）。取**实际选中的账号**
-                       # 的 backend，而不是由模型名推导的值——轮转/降级之后两者可能不同，
-                       # 记实际发生的事实才能用于事后排查。
-                       "backend": self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend()),
-                       "model_id": model_name, "model_name": model_name,
-                       "error_code": None,
-                       "tokens_detail": None,
-                       # 上游返回的请求 ID（crb-…）。非流式走响应头
-                       # X-Upstream-Request-Id，流式从 SSE 顶层 id 取。
-                       "upstream_request_id": None}
-        # 挂到 scope 上交给外层 MetricsMiddleware（同一条链共享，见 REQUEST_LOG_CONTEXT 注释）。
-        scope[REQUEST_LOG_CONTEXT] = log_context
+        # 选号成功：补上账号信息。
+        log_context["account_id"] = aid
+        log_context["account_name"] = self.pool.store.data["accounts"].get(aid, {}).get("name")
+        # 这条请求走的是哪条链路（trae / workbuddy）。取**实际选中的账号**
+        # 的 backend，而不是由模型名推导的值——轮转/降级之后两者可能不同，
+        # 记实际发生的事实才能用于事后排查。
+        log_context["backend"] = self.pool.store.data["accounts"].get(aid, {}).get("backend", default_backend())
         pool_cfg = self.pool.store.data.get("pool", {})
         failover_on = bool(pool_cfg.get("queue_failover"))
         max_tries = max(1, int(pool_cfg.get("queue_retry", 3))) if failover_on else 1
@@ -1838,6 +1909,9 @@ class PoolMiddleware:
             if outcome["kind"] == "done":
                 log_context["tokens_detail"] = outcome.get("tokens_detail")
                 log_context["upstream_request_id"] = outcome.get("upstream_request_id")
+                # 上游业务码（v24）：SSN 里的 error.code（如 11128、429）落进
+                # error_code 列，status 仍是客户端拿到的 HTTP 状态码。
+                log_context["error_code"] = outcome.get("error_code")
                 # 已放行并完整结束：记录本次生效的账号与用量，收工。
                 self.pool.record(aid, outcome["status"],
                                  hint_text=outcome.get("error_text"),
@@ -1850,7 +1924,7 @@ class PoolMiddleware:
                 # WAF 判定必须在收工**之前**：403/11128 也走 kind="done"（响应已由
                 # _attempt 转交给客户端，判为 done 是对的），但它是出口 IP 级信号，
                 # 不记账就等于把这条线索整个丢掉。见 admin/rotation.py。
-                self._note_waf_if_any(aid, outcome, backend=backend)
+                self._note_waf_if_any(aid, outcome, backend=backend, log_context=log_context)
                 self.pool.flush()
                 return
             # 命中排队：标记让位。决策顺序见 spec 4.4——先换号，候选耗尽再降级模型。
@@ -1863,7 +1937,7 @@ class PoolMiddleware:
             # WAF/通道拦截是**出口 IP 级**的，换号无用（实测换遍全池仍被拦）。
             # 识别出来就立刻停手：继续轮转只会把一次客户端请求放大成 N 次上游
             # 请求，把一个已经触发的风控推得更重。见 admin/rotation.py。
-            if self._note_waf_if_any(aid, outcome, backend=backend):
+            if self._note_waf_if_any(aid, outcome, backend=backend, log_context=log_context):
                 _logger.warning(
                     "上游 WAF 拦截疑似出口 IP 级（%d 秒内多个账号被拦），"
                     "停止本次轮转以免放大：%s", WAF_IP_WINDOW,
@@ -1880,6 +1954,10 @@ class PoolMiddleware:
         # data.retry_after 自行轮询（spec 4.4 第 4 条）。**不是** 503——
         # 503 会掩盖真实原因。last_outcome 为 None 说明连一次上游都没打到。
         if last_outcome is not None:
+            # 全部重试都用尽：把上游的排队响应原样还给客户端。日志要能看出
+            # 「这次没拿到答案，是被上游排队了」——它既不是成功也不是失败。
+            log_context["queued"] = True
+            log_context["error_code"] = last_outcome.get("code")
             await send({"type": "http.response.start", "status": last_outcome["status"],
                         "headers": last_outcome["headers"]})
             await send({"type": "http.response.body", "body": last_outcome["body"]})
@@ -1894,16 +1972,21 @@ class PoolMiddleware:
                 {"detail": "暂无可用账号：请检查暂停、积分、冷却或登录状态"}, 503)(scope, receive, send)
         self.pool.flush()
 
-    def _note_waf_if_any(self, aid, outcome, backend=None):
+    def _note_waf_if_any(self, aid, outcome, backend=None, log_context=None):
         """这次结果是否算 WAF/通道拦截？是则记账，返回该后端是否已激活。
 
         判据见 admin/rotation.py：结构化 code（11128）为主，403 需配合通道文案。
         记账口径是「短窗内**不同账号**」，所以单个坏号反复被拦永远不会停掉轮转；
         按 backend 分桶，所以字节被拦不会停掉腾讯的轮转。
+
+        顺带把判定结果写进请求日志上下文（v24）：日志落 outcome=waf_blocked，
+        与「账号凭据失效」分开 —— 前者换号无用（该查出口 IP），后者该换号。
         """
         text = self._text_of(outcome) or outcome.get("error_text")
         if not is_waf_error(outcome.get("status"), text, outcome.get("code")):
             return False
+        if log_context is not None:
+            log_context["waf"] = True
         return self.pool.waf_gate.note_waf(aid, backend=backend)
 
     def _next_model(self, pool_cfg, current_model, computed_models, backend=None):
@@ -2176,11 +2259,15 @@ class PoolMiddleware:
                             if isinstance(err, dict) and err.get("message"):
                                 err_texts.append(str(err["message"]))
                             code = err.get("code") if isinstance(err, dict) else None
-                            if isinstance(code, str) and code.isdigit():
-                                code = int(code)
-                            if code in (401, 402, 403, 404, 429):
-                                status = code
-                                log_context["error_code"] = code
+                            if code is not None:
+                                # v24：业务码**原样**进 error_code 列（非数字文本
+                                # 如 "USER_LIMIT" 也照存），与 HTTP 状态码分开。
+                                log_context["error_code"] = str(code)
+                                numeric = int(code) if isinstance(code, str) and code.isdigit() else code
+                                if numeric in (401, 402, 403, 404, 429):
+                                    # 冷却判定用**业务码**：上游会用「HTTP 200 + SSE
+                                    # 里的 429」表示限流，按 HTTP 200 判会以为这次成功。
+                                    status = numeric
                         except (ValueError, AttributeError):
                             pass
                 if len(buffer) > 65536:

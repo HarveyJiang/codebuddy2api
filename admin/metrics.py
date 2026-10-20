@@ -8,8 +8,86 @@ import threading
 import time
 
 from admin.pool import REQUEST_LOG_CONTEXT
+from admin.rotation import is_waf_error
 
 PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}
+
+
+def _numeric_code(value):
+    """上游错误码 → int；转不了（文本码、None）返回 None。
+
+    上游码有两种形态：数字（429、11128）与文本（"USER_LIMIT"、"WAITING"）。
+    只有**数字码**能参与 HTTP 语义的分类（限流/鉴权/额度/上游错误），
+    文本码原样落库给人看，不硬转成 0 —— 0 是合法码，会把「未知」说成「正常」。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_outcome(status=None, error_code=None, *, ok=False, failed=False,
+                     streaming=False, completed=False, disconnected=False,
+                     terminal=False, local_reject=None, queued=False, waf=False):
+    """把一次请求归到**互斥**的一个类别（v24）。
+
+    ## 为什么要有这一层
+
+    改动前只有四类（success / stream_error / interrupted / http_error），而
+    「失败」这一大块里混着**四种完全不同**的事：本地没账号可用、上游限流、
+    凭据失效、上游报错。混在一起的后果是：看日志的人只能自己再猜一遍
+    「400 是模型被禁还是密钥没权限」「503 是池子空了还是上游挂了」。
+
+    ## 优先级（从高到低）
+
+    1. **本地拒绝**（根本没打上游）：model_cooling / no_account / client_error
+    2. **上游排队**（打到了上游，但拿回的是「你在排队中」）
+    3. **WAF/通道拦截**（出口 IP 级，换号无用——与「账号被禁」要分开看）
+    4. **业务码分类**：限流 429 / 鉴权 401,403 / 额度 402 / 上游 5xx
+    5. **成功**
+    6. **其他非 2xx**
+    7. **流内报错** / **未完整结束**
+
+    第 4 条用**业务码优先于 HTTP 状态**：上游在 SSE 里报 429 时 HTTP 仍是
+    200，但那**就是**限流；归成「流式错误」会让人误判成流断了。它也优先于
+    「成功」——有业务错误码就说明这次请求出错了，哪怕 HTTP 是 200（上游用
+    200 裹错误是常态）。
+
+    ## 兼容性
+
+    老行的 outcome 取值不变（success/stream_error/interrupted/http_error
+    仍在集合里），统计口径 `outcome='success'` 不受影响。
+    """
+    if local_reject:
+        return local_reject
+    if queued:
+        return "queue"
+    if waf or is_waf_error(status, None, error_code):
+        # 11128 这类通道拦截：换遍全池都会被拦，问题在出口 IP 而不在账号。
+        # 归成「鉴权失败」会让人去查账号凭据，所以单列一类。
+        return "waf_blocked"
+    code = _numeric_code(error_code)
+    # 业务码优先（能转成数字时）；转不了就只看 HTTP 状态。
+    effective = code if code is not None else status
+    if effective == 429:
+        return "rate_limited"
+    if effective in (401, 403):
+        return "auth_error"
+    if effective == 402:
+        return "quota_exhausted"
+    if effective is not None and 500 <= int(effective) < 600:
+        return "upstream_error"
+    if ok:
+        return "success"
+    if effective is not None and not (200 <= int(effective) < 300):
+        return "http_error"
+    if failed:
+        return "stream_error"
+    if not completed or disconnected or (streaming and not terminal):
+        return "interrupted"
+    return "http_error"
 
 
 def _header(scope, name):
@@ -166,7 +244,14 @@ class MetricsMiddleware:
         finally:
             http_ok = status is not None and 200 <= status < 300
             ok = http_ok and completed and not disconnected and not failed and (not streaming or terminal)
-            outcome = "success" if ok else "stream_error" if failed and streaming else "interrupted" if not completed or disconnected or (streaming and not terminal) else "http_error"
+            # 分类（v24）：本地拒绝信息与上游业务码都来自 PoolMiddleware 挂在
+            # scope 上的上下文，缺上下文时按 HTTP 状态分类。
+            context = scope.get(REQUEST_LOG_CONTEXT) or {}
+            outcome = classify_outcome(
+                status, context.get("error_code"), ok=ok, failed=failed, streaming=streaming,
+                completed=completed, disconnected=disconnected, terminal=terminal,
+                local_reject=context.get("local_reject"), queued=bool(context.get("queued")),
+                waf=bool(context.get("waf")))
             duration = (time.monotonic() - start) * 1000
             self.metrics.finish(path, self.source, status, ok, duration, outcome)
             if self.store is not None:
@@ -176,25 +261,27 @@ class MetricsMiddleware:
     def _record_request_log(self, scope, path, status, outcome, duration, first_token_ms=None):
         """一行日志只在这里写。
 
-        PoolMiddleware（内层）把 key/account/model 与 SSE 内的 error.code 挂在 scope 上；
-        生效状态码在此统一：HTTP 非 2xx 用 HTTP 码，SSE 内带的 401/402/403/429 优先，
-        两者都没有时（正常 2xx）仍落 HTTP 状态码，避免成功请求在库里 status 为 NULL。
+        PoolMiddleware（内层）把 key/account/model 与 SSE 内的 error.code 挂在 scope 上。
+
+        ## v24：status 与 error_code 分开
+
+        - ``status`` = **HTTP 状态码**（客户端实际收到的那个），不再被上游
+          业务码覆盖。改动前 11128 会盖掉 200，于是「HTTP 200 但流内报错」
+          的行看不出客户端拿到的状态，纯本地 503 又与上游 503 混作一团。
+        - ``error_code`` = **上游业务码原样**（字符串）。上游码可能是
+          "11128"、"USER_LIMIT"、"WAITING" 这类非数字文本，所以落 TEXT 列；
+          拿不到就是 NULL，不猜 0。
+
         落库走 Store 的批量缓冲，不每请求写一次库。
         """
         context = scope.get(REQUEST_LOG_CONTEXT) or {}
-        # error_code 来自上游 SSE 扫描，可能是字符串（如 WAF 的 "11128"）；
-        # request_logs.status 是 INTEGER 列，SQLite 动态类型会把文本原样存回来，
-        # 之后每次 AVG/比较都脏。这里统一归一成 int，失败回落 HTTP 状态码。
-        effective = status
         code = context.get("error_code")
         if code is not None:
-            try:
-                effective = int(code)
-            except (TypeError, ValueError):
-                effective = status
+            code = str(code).strip() or None
         self.store.queue_request_log({
             "time": int(time.time()), "source": self.source, "path": path,
-            "status": effective, "outcome": outcome, "duration_ms": round(duration),
+            "status": status, "outcome": outcome, "duration_ms": round(duration),
+            "error_code": code,
             "key_id": context.get("key_id"), "account_id": context.get("account_id"),
             "account_name": context.get("account_name"), "model_id": context.get("model_id"),
             "model_name": context.get("model_name"), "upstream_request_id": context.get("upstream_request_id"),

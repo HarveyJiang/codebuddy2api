@@ -596,7 +596,39 @@ def _v22_to_v23(db):
         db._write.execute("ALTER TABLE keys ADD COLUMN model_backend_order TEXT")
 
 
-SCHEMA_VERSION = 23
+def _v23_to_v24(db):
+    """v23 → v24：request_logs 拆出独立的 error_code 列。
+
+    ## 为什么
+
+    改动前 `status` 一列身兼两职：**HTTP 状态码**与**上游业务错误码**。
+    采集侧遇到 SSE 里的 `error.code`（"11128"、"429"、"USER_LIMIT"…）会
+    **覆盖** HTTP 状态码，于是：
+
+    - 「HTTP 200 + 流内报错」的行在库里 status 是 429，看不出客户端实际
+      拿到的状态；
+    - 本地拒绝（无可用账号 503）与上游 503 混在同一列，分不出是谁的问题；
+    - 业务码可能是**非数字文本**，硬塞进 INTEGER 列后每次比较/聚合都是脏的。
+
+    ## 做法
+
+    新增 `error_code TEXT` 存**上游业务码原样**（字符串），`status` 从此
+    只放 HTTP 状态码。两列各说各的，不再互相覆盖。
+
+    ## 取舍
+
+    - 存 TEXT 不存 INTEGER：上游码可能是 "USER_LIMIT"、"WAITING" 这类文本。
+    - **存量行一律 NULL**：老数据已经把业务码写进 status 了，拆不回来
+      （一个 429 可能是 HTTP 429，也可能是上游码 429），与其猜错不如留空。
+    - 不回填、不改写存量 status：改写会把「客户端实际收到的状态」抹掉，
+      那是比「少一列信息」更糟的事。
+    """
+    columns = {row[1] for row in db._write.execute("PRAGMA table_info(request_logs)")}
+    if "error_code" not in columns:
+        db._write.execute("ALTER TABLE request_logs ADD COLUMN error_code TEXT")
+
+
+SCHEMA_VERSION = 24
 
 
 MICRO = 1_000_000
@@ -653,6 +685,9 @@ LOG_COLUMNS = (
     "tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_creation",
     # v22：首字延迟（流式体感）与来源识别（哪个客户端在打）。
     "first_token_ms", "client_ip", "user_agent",
+    # v24：上游业务错误码。status 只放 HTTP 状态码，error_code 放上游原样码
+    # （"11128"/"USER_LIMIT"…，非数字文本也照存）——两列不再互相覆盖。
+    "error_code",
 )
 
 REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
@@ -838,7 +873,8 @@ class Database:
             backend TEXT,
             tokens_in INTEGER, tokens_out INTEGER,
             tokens_cache_read INTEGER, tokens_cache_creation INTEGER,
-            first_token_ms INTEGER, client_ip TEXT, user_agent TEXT)""",
+            first_token_ms INTEGER, client_ip TEXT, user_agent TEXT,
+            error_code TEXT)""",
         """CREATE TABLE IF NOT EXISTS upstream_request_usage (
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
@@ -1006,7 +1042,7 @@ class Database:
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
                   (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21),
-                  (22, _v21_to_v22), (23, _v22_to_v23))
+                  (22, _v21_to_v22), (23, _v22_to_v23), (24, _v23_to_v24))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")
