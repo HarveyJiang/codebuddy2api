@@ -545,6 +545,25 @@ function tokenCells(r) {
     + `<td class="align-right mono">${fmtLogToken(r.tokens_out)}</td>`
     + `<td class="align-right mono">${cache}</td>`;
 }
+// 首字延迟（用户 2026-10-20）：流式体感由「多久吐出第一个字」决定，与总耗时
+// 是两回事。NULL = 这次没拿到响应体（失败/排队耗尽），显示「—」，不显示 0。
+function firstTokenCell(r) {
+  const v = r.first_token_ms;
+  if (v === null || v === undefined) return `<td class="align-right mono">—</td>`;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return `<td class="align-right mono">—</td>`;
+  return `<td class="align-right mono">${Math.round(n).toLocaleString("zh-CN")} ms</td>`;
+}
+// 来源 IP / UA（用户 2026-10-20）：用于分清是哪个客户端在打、有没有被扫。
+// 不加列——表格已经很宽（用户 2026-10-17 报过弹框横向溢出），挂在状态徽标的
+// 悬停提示里，并去掉内容里的引号/换行避免破属性。
+function sourceTip(r) {
+  const ip = r.client_ip ? String(r.client_ip) : "";
+  const ua = r.user_agent ? String(r.user_agent) : "";
+  if (!ip && !ua) return "";
+  return [ip, ua].filter(Boolean).join(" · ")
+    .replace(/["<>]/g, "").replace(/\s+/g, " ").slice(0, 200);
+}
 // 上游请求 ID（用户 2026-10-19 要求）：拿它去和上游账单里的 requestId 逐条对账。
 // 挂在模型名下的小字，不加列——弹框 560px 已经横向溢出（用户 2026-10-17 报过）。
 // 老日志是 NULL（改动前没记），不渲染，不显示「—」占位。
@@ -561,7 +580,7 @@ function renderLogRows(rows) {
   const accountCell = r => r.account_name
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td><td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>${tokenCells(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="9" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td><td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(sourceTip(r) || outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>${tokenCells(r)}${firstTokenCell(r)}<td class="align-right mono">${Math.round(Number(r.duration_ms)||0).toLocaleString("zh-CN")} ms</td></tr>`).join("") || '<tr><td colspan="10" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }async function loadLogs(offset) {
   // 默认 10 条（需求：默认显示 10，可选 10/20/30/50）。
   const size = Number($("dash-page-size").value) || 10;
@@ -574,7 +593,7 @@ function renderLogRows(rows) {
     $("dash-page-info").textContent = logTotal ? `第 ${current} / ${pages} 页 · 共 ${logTotal.toLocaleString("zh-CN")} 条` : "暂无记录";
     $("dash-prev").disabled = data.offset <= 0;
     $("dash-next").disabled = data.offset + size >= logTotal;
-  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="9" class="history-empty">${esc(e.message)}</td></tr>`; }
+  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="10" class="history-empty">${esc(e.message)}</td></tr>`; }
 }
 $("dash-prev").addEventListener("click", () => loadLogs(Math.max(0, logOffset - Number($("dash-page-size").value))));
 $("dash-next").addEventListener("click", () => loadLogs(logOffset + Number($("dash-page-size").value)));
@@ -1248,7 +1267,7 @@ async function loadAccountLogs() {
   if (!a) return;
   $("account-logs-title").textContent = accountLabel(a);
   $("account-logs-sub").textContent = `${backendName(a.backend)} 账号 · 最近 7 天，每页 ${ACCOUNT_LOGS_SIZE} 条`;
-  $("account-logs-body").innerHTML = '<tr><td colspan="8" class="history-empty">加载中…</td></tr>';
+  $("account-logs-body").innerHTML = '<tr><td colspan="9" class="history-empty">加载中…</td></tr>';
   const requestedId = accountLogsId, requestedOffset = accountLogsOffset;
   const since = Math.floor((Date.now() - 7 * 86400000) / 1000);
   try {
@@ -1258,10 +1277,11 @@ async function loadAccountLogs() {
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td>${esc(keyLabel(r))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td>`
-      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
+      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(sourceTip(r) || outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + tokenCells(r)
+      + firstTokenCell(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
-      || '<tr><td colspan="8" class="history-empty">这个账号最近 7 天没有请求记录。</td></tr>';
+      || '<tr><td colspan="9" class="history-empty">这个账号最近 7 天没有请求记录。</td></tr>';
     const pages = Math.max(1, Math.ceil(data.total / ACCOUNT_LOGS_SIZE));
     const current = Math.floor(data.offset / ACCOUNT_LOGS_SIZE) + 1;
     $("account-logs-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
@@ -1269,7 +1289,7 @@ async function loadAccountLogs() {
     $("account-logs-next").disabled = data.offset + ACCOUNT_LOGS_SIZE >= data.total;
   } catch (err) {
     if (requestedId !== accountLogsId) return;
-    $("account-logs-body").innerHTML = `<tr><td colspan="8" class="history-empty">${esc(err.message)}</td></tr>`;
+    $("account-logs-body").innerHTML = `<tr><td colspan="9" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }
 $("account-logs-prev").addEventListener("click", () => { accountLogsOffset = Math.max(0, accountLogsOffset - ACCOUNT_LOGS_SIZE); loadAccountLogs(); });
@@ -1996,7 +2016,7 @@ async function loadKeyRequests(offset) {
   // 会覆盖后发的列表，导致「显示的记录不属于当前密钥」。
   const requestedId = keyReqId, requestedOffset = keyReqOffset;
   const day = keyReqDay;
-  $("key-requests-body").innerHTML = '<tr><td colspan="8" class="history-empty">加载中…</td></tr>';
+  $("key-requests-body").innerHTML = '<tr><td colspan="9" class="history-empty">加载中…</td></tr>';
   try {
     // 从用量历史点进来时带 since/until，只显示选中那天；从「请求」按钮进来
     // 不带时间条件，显示最近的记录。
@@ -2009,10 +2029,11 @@ async function loadKeyRequests(offset) {
       `<tr><td class="mono muted">${esc(stamp(r.time * 1000))}</td>`
       + `<td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td>`
       + `<td>${r.account_name ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>` : "—"}</td>`
-      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
+      + `<td><span class="pill log-status ${r.ok ? 'green' : 'red'}" data-tip="${esc(sourceTip(r) || outcomes[r.outcome] || '请求失败')}">${esc(r.status ?? "—")}</span></td>`
       + tokenCells(r)
+      + firstTokenCell(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
-      || '<tr><td colspan="8" class="history-empty">该密钥还没有请求记录。</td></tr>';
+      || '<tr><td colspan="9" class="history-empty">该密钥还没有请求记录。</td></tr>';
     const pages = Math.max(1, Math.ceil(data.total / keyReqSize));
     const current = Math.floor(data.offset / keyReqSize) + 1;
     $("key-requests-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
@@ -2020,7 +2041,7 @@ async function loadKeyRequests(offset) {
     $("key-requests-next").disabled = data.offset + keyReqSize >= data.total;
   } catch (err) {
     if (requestedId !== keyReqId) return;
-    $("key-requests-body").innerHTML = `<tr><td colspan="8" class="history-empty">${esc(err.message)}</td></tr>`;
+    $("key-requests-body").innerHTML = `<tr><td colspan="9" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }
 $("key-requests-prev").addEventListener("click", () => loadKeyRequests(keyReqOffset - keyReqSize));

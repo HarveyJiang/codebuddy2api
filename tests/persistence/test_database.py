@@ -492,6 +492,36 @@ class DatabaseTests(unittest.TestCase):
                          str(SCHEMA_VERSION))
         db.close()
 
+    def test_v21_migration_adds_first_token_and_source_columns(self):
+        # v22 迁移：request_logs 补首字延迟与来源 IP/UA；存量行全 NULL，新行可写读回。
+        path = self.root / "legacy-v21.db"
+        legacy = Database(path)
+        legacy._write.execute("UPDATE schema_meta SET value='21' WHERE key='version'")
+        legacy.append_request_logs([
+            {"time": NOW, "source": "api", "path": "/p", "outcome": "success", "duration_ms": 1},
+        ])
+        legacy.close()
+        db = Database(path)  # 重开触发迁移
+        cols = {r[1] for r in db.query("PRAGMA table_info(request_logs)")}
+        for c in ("first_token_ms", "client_ip", "user_agent"):
+            self.assertIn(c, cols)
+        # 迁移只加列不回填：存量行三项都是 NULL。
+        old = db.recent_request_logs(1)[0]
+        for c in ("first_token_ms", "client_ip", "user_agent"):
+            self.assertIsNone(old[c])
+        # 新行带上三项：写入并读回。
+        db.append_request_logs([
+            {"time": NOW + 1, "source": "api", "path": "/p", "outcome": "success",
+             "duration_ms": 1800, "first_token_ms": 320,
+             "client_ip": "203.0.113.9", "user_agent": "claude-cli/1.0.60"},
+        ])
+        row = db.recent_request_logs(1)[0]
+        self.assertEqual((row["first_token_ms"], row["client_ip"], row["user_agent"]),
+                         (320, "203.0.113.9", "claude-cli/1.0.60"))
+        self.assertEqual(db.query("SELECT value FROM schema_meta WHERE key='version'")[0][0],
+                         str(SCHEMA_VERSION))
+        db.close()
+
     def test_v20_migration_adds_input_trunc_column(self):
         # v20 迁移：upstream_request_usage 补 input_trunc（用户 2026-10-19 要求
         # 明细看请求内容）。存量行 NULL，新同步的行才有摘要。

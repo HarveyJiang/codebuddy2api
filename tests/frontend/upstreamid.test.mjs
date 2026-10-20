@@ -66,8 +66,8 @@ for (const [label, anchor] of [
   check(`${label} 渲染了 upstreamIdCell`, at >= 0 && src.slice(at, at + 1400).includes("upstreamIdCell(r)"), true);
 }
 
-// 不新增列：三张表头的列数不变（9 / 8 / 8），弹框才不会更横向溢出。
-// 定位方式：从 tbody id 往前找最近的 <table>，再取其 <thead>。
+// 列数：请求日志页 9 → 10（v22 加「首字」列），两个弹框 8 → 9。
+// 只加一列，不再加来源 IP/UA 列（已经很宽，IP/UA 走状态徽标的悬停提示）。
 const html = readFileSync("admin/static/index.html", "utf8");
 const headThCount = tbodyId => {
   const at = html.indexOf(tbodyId);
@@ -76,10 +76,10 @@ const headThCount = tbodyId => {
   // 数 </th>：count("<th") 会把 <thead> 自己算进去，多 1。
   return (head.match(/<\/th>/g) || []).length;
 };
-check("请求日志页仍是 9 列", headThCount('id="dash-recent-body"'), 9);
-// 账号日志与密钥请求弹框也仍是 8 列（时间/密钥/模型/账号/状态/输入/输出/缓存/耗时 去掉密钥列）。
-check("账号日志弹框仍是 8 列", headThCount('id="account-logs-body"'), 8);
-check("密钥请求弹框仍是 8 列", headThCount('id="key-requests-body"'), 8);
+check("请求日志页 10 列", headThCount('id="dash-recent-body"'), 10);
+// 账号日志与密钥请求弹框也是 9 列（时间/密钥/模型/账号/状态/输入/输出/缓存/首字/耗时 去掉密钥列）。
+check("账号日志弹框 9 列", headThCount('id="account-logs-body"'), 9);
+check("密钥请求弹框 9 列", headThCount('id="key-requests-body"'), 9);
 
 console.log(bad ? `=== ${bad} 个失败 ===` : "=== upstreamIdCell 全部通过 ===");
 process.exit(bad ? 1 : 0);

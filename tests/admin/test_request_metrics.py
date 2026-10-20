@@ -120,6 +120,74 @@ class MetricsTests(unittest.IsolatedAsyncioTestCase):
         for k in ('tokens_in','tokens_out','tokens_cache_read','tokens_cache_creation'):
             self.assertIsNone(queued[0][k])
 
+    # -- v22：首字延迟 + 来源 IP / UA -------------------------------------
+    async def _logged_row(self, app, scope_extra=None):
+        """跑一次请求并返回落库的那一行（store 用 FakeStore 接住）。"""
+        queued=[]
+        class FakeStore:
+            def queue_request_log(self, row): queued.append(row)
+        async def receive():return {'type':'http.request','body':b''}
+        async def send(m):pass
+        scope={'type':'http','method':'POST','path':'/v1/messages'}
+        scope.update(scope_extra or {})
+        await MetricsMiddleware(app,RequestMetrics(),'api',store=FakeStore())(scope,receive,send)
+        return queued[0]
+
+    async def test_first_token_ms_measures_first_body_chunk(self):
+        # 首字 = 第一个非空响应体的时刻（客户端视角），不是总耗时。
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,
+                        'headers':[(b'content-type',b'text/event-stream')]})
+            await asyncio.sleep(0.05)
+            await send({'type':'http.response.body','body':b'data: {"delta":"x"}\n','more_body':True})
+            await send({'type':'http.response.body','body':b'data: [DONE]\n','more_body':False})
+        row=await self._logged_row(app)
+        self.assertIsNotNone(row['first_token_ms'])
+        self.assertGreaterEqual(row['first_token_ms'], 40)   # 至少等过那个 sleep
+        self.assertLessEqual(row['first_token_ms'], row['duration_ms'])
+
+    async def test_first_token_ms_null_when_no_body(self):
+        # 上游一个字节都没吐（失败/超时）：落 NULL，不写 0（0 = 瞬间出字）。
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':429,
+                        'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'','more_body':False})
+        row=await self._logged_row(app)
+        self.assertIsNone(row['first_token_ms'])
+
+    async def test_client_ip_prefers_x_forwarded_for(self):
+        # 容器 + 反代部署：XFF 首段是真实客户端，优先于 scope["client"]。
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,
+                        'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'{}','more_body':False})
+        row=await self._logged_row(app, {
+            'client':('172.18.0.1', 51000),
+            'headers':[(b'x-forwarded-for', b'203.0.113.9, 172.18.0.1'),
+                       (b'user-agent', b'claude-cli/1.0.60')]})
+        self.assertEqual(row['client_ip'], '203.0.113.9')
+        self.assertEqual(row['user_agent'], 'claude-cli/1.0.60')
+
+    async def test_client_ip_falls_back_to_scope_client(self):
+        # 反代没透传 XFF：用 ASGI 的 client（uvicorn proxy_headers 已经处理过）。
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,
+                        'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'{}','more_body':False})
+        row=await self._logged_row(app, {'client':('198.51.100.7', 40000), 'headers':[]})
+        self.assertEqual(row['client_ip'], '198.51.100.7')
+        self.assertIsNone(row['user_agent'])   # 客户端没发 UA：NULL，不是空串
+
+    async def test_source_unknown_when_nothing_available(self):
+        # 什么来源信息都没有（单测直接调中间件）：两列都是 NULL。
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,
+                        'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'{}','more_body':False})
+        row=await self._logged_row(app)
+        self.assertIsNone(row['client_ip'])
+        self.assertIsNone(row['user_agent'])
+
 
 if __name__=='__main__':unittest.main()
 

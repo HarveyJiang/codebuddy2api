@@ -488,6 +488,36 @@ def _v20_to_v21(db):
         db._write.execute("ALTER TABLE accounts ADD COLUMN travel_date TEXT")
 
 
+def _v21_to_v22(db):
+    """v21 → v22：request_logs 补 first_token_ms（首字延迟）与来源 client_ip / user_agent。
+
+    ## 为什么
+
+    - **首字延迟**：流式请求的体感由「多久吐出第一个字」决定，而不是总耗时。
+      总耗时 20 秒里前 19 秒在排队、最后 1 秒吐完，和匀速 20 秒是两种体验，
+      只看 duration_ms 分不出来（用户 2026-10-20 要求对照参考项目移植）。
+    - **来源 IP / UA**：出问题时要能分清是哪个客户端在打（Claude Code /
+      Codex / 浏览器 / 扫描器）。没有这两列，日志里所有请求长得一模一样。
+
+    ## 取舍
+
+    - 三个列都可空：首字延迟只有真正拿到响应体才有值（失败/排队耗尽的请求
+      落 NULL）；client_ip / user_agent 在 IP 取不到或客户端没发 UA 时也落
+      NULL，不写空串——NULL 是「不知道」，空串是「知道但为空」，语义不同。
+    - client_ip 只存字符串，不存端口：端口每次请求都变，没有排查价值。
+    - 不加索引：只有人翻日志时才看这两列，没有按 IP 筛选的需求；加索引反而
+      要为此多付写入成本。
+    - 列名直接进 LOG_COLUMNS，append/recent/page 三个读函数自动生效。
+    """
+    existing = {row[1] for row in db._write.execute("PRAGMA table_info(request_logs)")}
+    if "first_token_ms" not in existing:
+        db._write.execute("ALTER TABLE request_logs ADD COLUMN first_token_ms INTEGER")
+    if "client_ip" not in existing:
+        db._write.execute("ALTER TABLE request_logs ADD COLUMN client_ip TEXT")
+    if "user_agent" not in existing:
+        db._write.execute("ALTER TABLE request_logs ADD COLUMN user_agent TEXT")
+
+
 def _v18_to_v19(db):
     """v18 → v19：request_logs 补四项 token 用量（输入/输出/缓存读/缓存写）。
 
@@ -539,7 +569,7 @@ def _v17_to_v18(db):
         "WHERE account_id IN (SELECT id FROM accounts)")
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 MICRO = 1_000_000
@@ -591,6 +621,8 @@ LOG_COLUMNS = (
     "time", "source", "path", "status", "outcome", "duration_ms", "key_id", "account_id",
     "account_name", "model_id", "model_name", "upstream_request_id", "backend",
     "tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_creation",
+    # v22：首字延迟（流式体感）与来源识别（哪个客户端在打）。
+    "first_token_ms", "client_ip", "user_agent",
 )
 
 REQUEST_LOG_KEEP_DAYS = 93   # 3 个月
@@ -775,7 +807,8 @@ class Database:
             model_id TEXT, model_name TEXT, upstream_request_id TEXT,
             backend TEXT,
             tokens_in INTEGER, tokens_out INTEGER,
-            tokens_cache_read INTEGER, tokens_cache_creation INTEGER)""",
+            tokens_cache_read INTEGER, tokens_cache_creation INTEGER,
+            first_token_ms INTEGER, client_ip TEXT, user_agent TEXT)""",
         """CREATE TABLE IF NOT EXISTS upstream_request_usage (
             request_id TEXT PRIMARY KEY, account_id TEXT, account_name TEXT,
             credit_micro INTEGER NOT NULL DEFAULT 0, model TEXT, client TEXT,
@@ -942,7 +975,8 @@ class Database:
                   (8, _v7_to_v8), (9, _v8_to_v9), (10, _v9_to_v10), (11, _v10_to_v11),
                   (12, _v11_to_v12), (13, _v12_to_v13), (14, _v13_to_v14), (15, _v14_to_v15),
                   (16, _v15_to_v16), (17, _v16_to_v17), (18, _v17_to_v18),
-                  (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21))
+                  (19, _v18_to_v19), (20, _v19_to_v20), (21, _v20_to_v21),
+                  (22, _v21_to_v22))
 
     def _migrate(self):
         rows = self.query("SELECT value FROM schema_meta WHERE key='version'")

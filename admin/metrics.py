@@ -12,6 +12,38 @@ from admin.pool import REQUEST_LOG_CONTEXT
 PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}
 
 
+def _header(scope, name):
+    """从 ASGI scope 里取一个请求头（bytes → str）；没有返回 None。"""
+    target = name.encode("latin-1")
+    for key, value in scope.get("headers") or []:
+        if key.lower() == target:
+            try:
+                return value.decode("latin-1").strip() or None
+            except (AttributeError, UnicodeDecodeError):
+                return None
+    return None
+
+
+def _client_ip(scope):
+    """来源 IP：优先 X-Forwarded-For 首段，回落 ASGI 的 ``scope["client"]``。
+
+    本项目线上跑在容器 + 反代后面，uvicorn 已经带 ``proxy_headers=True``
+    （见 admin/server.py 的 serve 调用），所以 ``scope["client"]`` 通常已是
+    真实客户端 IP；但反代如果没透传（或换了链路），XFF 首段更接近真相。
+    两者都取不到就返回 None——不拿容器网关地址冒充客户端。
+    """
+    forwarded = _header(scope, "x-forwarded-for")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    client = scope.get("client")
+    if isinstance(client, (tuple, list)) and client and client[0]:
+        return str(client[0])
+    return None
+
+
+
 class RequestMetrics:
     def __init__(self):
         self.lock = threading.Lock()
@@ -58,6 +90,10 @@ class MetricsMiddleware:
         completed = failed = streaming = terminal = disconnected = False
         buffer = b""
         oversized_line = False
+        # 首字延迟（v22）：客户端视角「多久见到第一个字节」。只记第一次真正
+        # 发出去的非空响应体；整条请求没有任何响应体（失败/超时）就保持 None，
+        # 落库为 NULL —— 不写 0（0 会被误读成「瞬间出字」）。
+        first_token_ms = [None]
 
         def event(line):
             nonlocal failed, terminal
@@ -96,6 +132,10 @@ class MetricsMiddleware:
                 headers = dict(message.get("headers", []))
                 streaming = b"text/event-stream" in headers.get(b"content-type", b"").lower()
             elif message["type"] == "http.response.body":
+                if first_token_ms[0] is None and message.get("body"):
+                    # 首个非空响应体 = 首字。排队扣留之后池会把首片补发到这里，
+                    # 所以量到的是客户端真实看到的等待时间。
+                    first_token_ms[0] = round((time.monotonic() - start) * 1000)
                 if streaming:
                     # Bound storage even if the upstream sends a huge unterminated line.
                     for fragment in message.get("body", b"").splitlines(keepends=True):
@@ -130,9 +170,10 @@ class MetricsMiddleware:
             duration = (time.monotonic() - start) * 1000
             self.metrics.finish(path, self.source, status, ok, duration, outcome)
             if self.store is not None:
-                self._record_request_log(scope, path, status, outcome, duration)
+                self._record_request_log(scope, path, status, outcome, duration,
+                                         first_token_ms[0])
 
-    def _record_request_log(self, scope, path, status, outcome, duration):
+    def _record_request_log(self, scope, path, status, outcome, duration, first_token_ms=None):
         """一行日志只在这里写。
 
         PoolMiddleware（内层）把 key/account/model 与 SSE 内的 error.code 挂在 scope 上；
@@ -167,4 +208,10 @@ class MetricsMiddleware:
             "tokens_out": (context.get("tokens_detail") or {}).get("out"),
             "tokens_cache_read": (context.get("tokens_detail") or {}).get("cache_read"),
             "tokens_cache_creation": (context.get("tokens_detail") or {}).get("cache_creation"),
+            # 首字延迟（v22）：本中间件直接量到的值优先（它是客户端真正看到首片
+            # 的时刻，池那层的 sniff 时刻可能略早），池没走到这条链路时也就它有。
+            "first_token_ms": first_token_ms,
+            # 来源识别（v22）：哪个客户端在打、从哪个 IP 来，用于排查。
+            "client_ip": _client_ip(scope),
+            "user_agent": _header(scope, "user-agent"),
         })
