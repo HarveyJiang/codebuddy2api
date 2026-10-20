@@ -305,6 +305,12 @@ class AccountPool:
                 self.last_flush = self.clock()
 
     def state(self, row):
+        """账号级状态。
+
+        模型级冷却（用户 2026-10-20）**不**改变账号的 pool_state —— 账号还是可用
+        的账号，只是那个模型暂时不用它。前端行状态仍显示「可用」，模型冷却另列
+        展示；判断「这个号能不能接这个模型」用 `usable_for(row, model)`。
+        """
         status = self.store.data["account_status"].get(row["id"], {})
         if not row["enabled"]:
             return "paused"
@@ -312,9 +318,22 @@ class AccountPool:
             return "invalid"
         if (status.get("cooldown_until") or 0) > self.clock():
             return "cooling"
-        if status.get("credits_updated", 0) > self.clock() - 600 and status.get("remaining") == 0 and status.get("packages", 0) > 0:
+        if (status.get("credits_updated", 0) > self.clock() - 600 and status.get("remaining") == 0
+                and status.get("packages", 0) > 0):
             return "exhausted"
         return "available"
+
+    def usable_for(self, row, model):
+        """该账号此刻能不能接这个模型的请求。
+
+        账号级状态可用 **且** 这个模型没在该账号上冷却。model 为空（老调用/
+        不知道模型）时只看账号级——不能因为「不知道是哪个模型」就把号判死。
+        """
+        if self.state(row) != "available":
+            return False
+        if not model:
+            return True
+        return not self.model_cooling(row["id"], model)
 
     def rows(self, rows):
         today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
@@ -331,6 +350,15 @@ class AccountPool:
                         "checkin_slot": status.get("checkin_slot"), "checkin_when": status.get("checkin_when"),
                         "today_checked_in": status.get("checkin_date") == today,
                         "cooldown_until": status.get("cooldown_until", 0),
+                        # 模型级冷却（用户 2026-10-20）：账号本身没被冷掉，只是
+                        # 这些模型暂时不用它。前端据此显示「模型冷却」，而不是把
+                        # 整个账号标成冷却中。
+                        "model_cooldowns": {m: until for m, until in
+                                            (status.get("model_cooldowns") or {}).items()
+                                            if int(until or 0) > self.clock()},
+                        "model_cooling_count": len([m for m, until in
+                                                    (status.get("model_cooldowns") or {}).items()
+                                                    if int(until or 0) > self.clock()]),
                         "queued_until": status.get("queued_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
                         "request_count": status.get("request_count", 0),
@@ -497,8 +525,11 @@ class AccountPool:
         """
         exclude = set(exclude or ())
         with self.store.lock:
+            # 模型级冷却（用户 2026-10-20）：候选集按「这个模型能不能用」筛，
+            # 而不是看账号有没有被限流过。某个模型撞了限流，这个号仍然可以接
+            # 别的模型——这正是本次需求的核心。
             candidates = [row for row in self.store.account_rows()
-                          if self.state(row) == "available" and row["id"] not in exclude]
+                          if self.usable_for(row, model) and row["id"] not in exclude]
             if kid is not None:
                 # 空白名单 = 不限制；只有显式列了账号才收窄候选集。
                 whitelist = self.store.key_bindings(kid)[1]
@@ -507,6 +538,11 @@ class AccountPool:
             if backend is not None:
                 candidates = [row for row in candidates if row.get("backend", default_backend()) == backend]
             if not candidates:
+                # 区分「池子空了」与「只是这个模型全在冷却」：后者换模型就能用，
+                # 让人去查登录态/暂停是白费功夫。
+                if model and any(self.state(row) == "available" for row in self.store.account_rows()
+                                 if backend is None or row.get("backend", default_backend()) == backend):
+                    raise HTTPException(503, f"模型 {model} 在全部可用账号上都在冷却，请换模型或稍后重试")
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             routing = self._routing_for(kid)
             now = self.clock()
@@ -710,6 +746,52 @@ class AccountPool:
             text += f"：{summary}"
         return text
 
+    # -- 模型级冷却（用户 2026-10-20） --------------------------------------
+    # 上游限流**绝大多数是按模型**的：同一个账号换个模型照样能用。原来不管哪
+    # 个模型撞了限流，冷却都写在账号上，等于一个模型被限流就把整个号冷掉，
+    # 池子里少一个人一起背锅。用户明确要求：不能因为单个模型影响账号冷却。
+    #
+    # 下面这组状态码（以及后端声明的 soft_cooldown）判为**模型级**：只记
+    # ``model_cooldowns[model]``，账号本身仍参与分配——请求别的模型时它会
+    # 被正常选中，请求同一个模型时才被跳过（见 select / state）。
+    MODEL_LEVEL_STATUSES = frozenset({429, 503})
+    # 账号级：凭据/权限/额度层面的问题，换什么模型都没用。
+    #   401/403 认证与权限被拒      402 账号额度耗尽
+    ACCOUNT_LEVEL_STATUSES = frozenset({401, 402, 403})
+
+    @staticmethod
+    def _bump_model_fails(data, model):
+        """该账号在该模型上的连续失败数 +1（模型级退避用）。"""
+        fails = data.get("model_fails")
+        if not isinstance(fails, dict):
+            fails = data["model_fails"] = {}
+        count = int(fails.get(model) or 0) + 1
+        fails[model] = count
+        return count
+
+    def model_cooldown_until(self, aid, model):
+        """该账号在该模型上的冷却截止时刻；没冷却返回 0。"""
+        if not model:
+            return 0
+        status = self.store.data["account_status"].get(aid) or {}
+        return int((status.get("model_cooldowns") or {}).get(model, 0) or 0)
+
+    def model_cooling(self, aid, model):
+        """该账号是否正被**这个模型**限流（只影响这个模型）。"""
+        return self.model_cooldown_until(aid, model) > self.clock()
+
+    def cooling_models(self, aid):
+        """该账号当前仍在冷却的模型列表（已过期的顺手清掉），按到期时刻排序。"""
+        status = self.store.data["account_status"].get(aid) or {}
+        entries = status.get("model_cooldowns") or {}
+        now = self.clock()
+        live = {m: until for m, until in entries.items() if int(until or 0) > now}
+        if len(live) != len(entries):
+            with self.store.lock:
+                status["model_cooldowns"] = dict(live)
+                self.dirty = True
+        return sorted(live, key=lambda m: live[m])
+
     def record(self, aid, status=200, *, hint_text=None, hint_headers=None, usage=None, model=None):
         """记录一次请求结果，并在失败时施加冷却。
 
@@ -721,6 +803,18 @@ class AccountPool:
         真的带回了可解析的 credit 才会记录，否则账本保持为空、选号行为不变。
         ``model`` 另外还用于把冷却原因写具体（用户 2026-10-18 反馈：只写
         「上游额度或频率限制」看不出是哪个模型、什么时候能好）。
+
+        ## 冷却粒度（用户 2026-10-20 要求）
+
+        失败分两种，**落点不同**：
+
+        - ``MODEL_LEVEL_STATUSES``（429/503 与后端 soft_cooldown 声明的码）：
+          记到 ``model_cooldowns[model]``，账号本身**不冷却**。只知道这个模型
+          撞了限流，换个模型还是一条好汉。没有 model 信息时无法判定范围，
+          按旧行为升级成账号级——宁可多冷一个号，也不要让请求在同一个
+          限流模型上反复撞墙。
+        - ``ACCOUNT_LEVEL_STATUSES``（401/402/403）：账号级冷却 + 指数退避。
+          凭据失效/额度耗尽换模型也救不了，必须从候选集里摘掉。
         """
         if usage and model and aid:
             self._observe_cost(aid, model, usage)
@@ -734,20 +828,51 @@ class AccountPool:
             data["last_request"] = int(self.clock())
             backend = self.store.data["accounts"][aid].get("backend", default_backend())
             soft = spec_for(backend).soft_cooldown_for(status)
-            if soft is not None:
-                # 该状态码对这个后端是「软」的：模型/资源不可用，账号本身通常是好的。
-                # 只做有界冷却，不计入连续失败（否则会把好账号升级到 2h 硬冷却）。
-                # 具体冷却时长由后端自己声明（见 BackendSpec.soft_cooldown）。
+            # 判定顺序：先看「是不是只跟这个模型有关」，再看账号级。
+            # soft_cooldown 是后端自己声明的「这个模型/资源不可用，账号是好的」，
+            # 与 429 同一个落点。
+            model_level = soft is not None or status in self.MODEL_LEVEL_STATUSES
+            if model_level and model:
+                # 模型级冷却：账号继续参与分配，只把这个模型临时摘掉。
+                # 时长：后端声明优先，其次采信上游明示的恢复时刻，最后本地有界退避。
+                seconds = int(soft) if soft is not None else 0
+                if not seconds:
+                    explicit = earliest_deadline(
+                        parse_reset_at(hint_text, now=self.clock()),
+                        parse_retry_after(hint_headers, now=self.clock()),
+                    )
+                    if explicit:
+                        # 上游报到一天以后必然是脏数据，夹一下。
+                        seconds = max(60, min(int(explicit - self.clock()), 86400))
+                    else:
+                        seconds = min(300 * (2 ** (self._bump_model_fails(data, model) - 1)), 7200)
+                else:
+                    self._bump_model_fails(data, model)
+                until = self.clock() + max(1, seconds)
+                cooldowns = data.setdefault("model_cooldowns", {})
+                if not isinstance(cooldowns, dict):
+                    cooldowns = data["model_cooldowns"] = {}
+                # 只延长不缩短：并发响应乱序时不能把已有的冷却改早。
+                cooldowns[model] = max(int(cooldowns.get(model) or 0), int(until))
+                data["last_error"] = self._cooldown_reason(
+                    status=status,
+                    label="上游模型限流" if status in self.MODEL_LEVEL_STATUSES else "模型不可用",
+                    minutes=max(1, seconds // 60), model=model,
+                    hint_text=hint_text, source="模型级", until=cooldowns[model])
+            elif soft is not None:
+                # 软冷却但**不知道是哪个模型**（老调用方/旧数据）：无法判定影响范围，
+                # 回落成账号级有界冷却——宁可多冷一个号，也不要让请求在同一个
+                # 限流模型上反复撞墙。不计入连续失败（否则好账号会被升级到 2h 硬冷却）。
                 minutes = max(1, int(soft) // 60)
-                # 冷却原因写具体（用户 2026-10-18）：哪个模型、上游原文摘要、
-                # 什么时候恢复。模型级频率限制（如「Step-5-Preview 使用量已超出
-                # 频率限制，14:23:36 重置」）原来只显示成一句笼统文案，看不出
-                # 该切哪个模型、要等到几点。
                 data.update(cooldown_until=self.clock() + soft,
                             last_error=self._cooldown_reason(
                                 status=status, minutes=minutes, model=model,
                                 hint_text=hint_text, source=None, until=None))
-            elif status in (401, 403, 402, 429):
+                cooldown = int(soft)
+            elif status in self.ACCOUNT_LEVEL_STATUSES or status == 429:
+                # 账号级冷却：凭据/权限/额度问题换模型也救不了，必须整个摘掉。
+                # 429 走到这里只有一个原因——**不知道是哪个模型**（拿不到 model），
+                # 无法判定影响范围，按旧行为冷却整个账号。
                 # 指数退避：连续失败翻倍冷却时长，上限 2 小时；成功请求重置计数。
                 fails = data.get("consecutive_fails", 0) + 1
                 data["consecutive_fails"] = fails
@@ -778,6 +903,9 @@ class AccountPool:
             else:
                 recovered = bool(data.get("consecutive_fails"))
                 data["consecutive_fails"] = 0
+                # 这个模型这次成功了：清掉它的失败计数，退避从头算。
+                if model and isinstance(data.get("model_fails"), dict):
+                    data["model_fails"].pop(model, None)
             self.dirty = True
         # 日志放在锁外：record() 是每请求热路径，stderr/文件 I/O 可能被管道背压拖慢，
         # 持锁写会把所有账号选择排在同一把锁后面。
@@ -787,8 +915,16 @@ class AccountPool:
             _logger.warning("账号 %s 上游认证被拒（HTTP %s），冷却 %d 分钟，可能需要重新授权",
                             aid, status, cooldown // 60)
         elif status in (402, 429):
-            _logger.info("账号 %s 触发上游限流（HTTP %s），冷却 %d 分钟",
-                         aid, status, cooldown // 60)
+            if model_level and model:
+                # 模型级：账号还在池子里，只是这个模型暂时不用它。
+                data = self.store.data["account_status"].get(aid) or {}
+                until = (data.get("model_cooldowns") or {}).get(model, 0)
+                _logger.info("账号 %s 的模型 %s 触发上游限流（HTTP %s），该模型冷却至 %s；"
+                             "账号本身仍参与分配", aid, model, status,
+                             datetime.fromtimestamp(until).strftime("%m-%d %H:%M"))
+            else:
+                _logger.info("账号 %s 触发上游限流（HTTP %s），冷却 %d 分钟",
+                             aid, status, cooldown // 60)
         elif recovered:
             _logger.info("账号 %s 请求恢复正常", aid)
 
@@ -802,13 +938,15 @@ class AccountPool:
             spec = spec_for(item.get("backend", default_backend()))
             try:
                 if action == "clear-cooldown":
-                    # 手动解除冷却（用户 2026-10-18 拍板做按钮）：上游按**模型**限流
-                    # （如「Step-5-Preview 使用量已超出频率限制，14:23 重置」），但
-                    # 冷却记在**账号**上——期间该账号所有模型都不可用，即使别的模型
-                    # 还能用。用户要能自己决定提前放行，而不是干等到点。
-                    # 只清冷却；连续失败计数与 last_error 保留（再撞一次限流，
+                    # 手动解除冷却（用户 2026-10-18 拍板做按钮）。上游按**模型**限流
+                    # （如「Step-5-Preview 使用量已超出频率限制，14:23 重置」）。
+                    # 自模型级冷却（用户 2026-10-20）起，模型限流只冷该模型，账号
+                    # 不再被整体摘掉；这个按钮现在负责两件事：
+                    #   1) 清掉账号级冷却（认证/额度问题，仍要人等或人放行）；
+                    #   2) 一并清掉模型级冷却，让这个号立刻能接所有模型。
+                    # 连续失败计数与 last_error 保留（再撞一次限流，
                     # 下次退避从当前计数继续翻倍，不会清零重来）。
-                    self.update(aid, cooldown_until=0)
+                    self.update(aid, cooldown_until=0, model_cooldowns={}, model_fails={})
                     return {"id": aid, "ok": True, "message": "冷却已解除，账号重新参与分配"}
                 if action == "refresh":
                     with manager._lock:
@@ -1747,7 +1885,8 @@ class PoolMiddleware:
             await send({"type": "http.response.body", "body": last_outcome["body"]})
             self.pool.record(aid, last_outcome["status"],
                              hint_text=self._text_of(last_outcome),
-                             hint_headers=last_outcome.get("headers"))
+                             hint_headers=last_outcome.get("headers"),
+                             model=attempt_model)
             if kid is not None:
                 self.pool.store.record_key_usage(kid, tokens=None)
         else:

@@ -607,6 +607,14 @@ $("dash-base").textContent=location.origin+"/v1";
 $("dash-copy").addEventListener("click",()=>copy(location.origin+"/v1"));
 // 账号表的当前页与每页条数。与最近请求一样默认 10 条，选项 10/20/30/50。
 let accountPage = 0, accountPageSize = 10;
+// 模型级冷却（用户 2026-10-20）：上游按**模型**限流时，只冷这个模型，账号本身
+// 照常参与分配。前端必须把「哪些模型在冷却、几点恢复」讲清楚 —— 否则用户只看到
+// 账号「可用」，却在请求某个模型时莫名 503。
+function modelCooldowns(a) {
+  return Object.entries(a.model_cooldowns || {})
+    .filter(([, until]) => until > Date.now() / 1000)
+    .sort((x, y) => x[1] - y[1]);
+}
 function renderAccounts() {
   const query = $("account-search").value.toLowerCase(), filter = $("account-filter").value;  // 快过期的排前面：先按最早过期时间升序，再按状态严重度，最后按剩余积分升序。
   const severity = {invalid: 0, exhausted: 1, cooling: 2, paused: 3, available: 4};
@@ -663,10 +671,17 @@ function renderAccounts() {
     // 全部操作收进设置弹框；查询积分/签到/刷新凭据这类即时动作也在里面。
     // 冷却中才给「解除冷却」（用户 2026-10-18）：上游按单个模型限流，但冷却记在
     // 账号上——期间所有模型都不可用。按钮只在 cooldown_until 未过期时出现。
+    // 模型级冷却（2026-10-20）也要能提前放行：这个模型此刻用不了，但换个模型
+    // 这个号照样能用 —— 所以按钮的判据是「账号冷却中 **或** 有模型在冷却」。
     const cooling = a.cooldown_until > Date.now() / 1000;
-    const unfreezeBtn = cooling ? `<button class="btn-ghost" data-action="clear-cooldown" data-id="${a.id}" title="提前解除账号冷却，立即重新参与分配">解除冷却</button>` : "";
+    const mcd = modelCooldowns(a);
+    const unfreezeBtn = (cooling || mcd.length) ? `<button class="btn-ghost" data-action="clear-cooldown" data-id="${a.id}" title="${cooling ? "提前解除账号冷却" : "提前解除模型冷却"}，立即重新参与分配">解除冷却</button>` : "";
     const actions = `<td><div class="actions">${unfreezeBtn}<button class="btn-ghost" data-action="logs" data-id="${a.id}" title="查看这个账号的请求日志">日志</button><button class="btn-ghost" data-action="settings" data-id="${a.id}" title="备注 / 权重 / 删除">⚙ 设置</button></div></td>`;
-    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><button type="button" class="credit-number credit-link" data-credits="${esc(a.id)}" title="点击查看该账号每天的积分消费">${credits}</button><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
+    // 模型冷却备注：账号状态列里点明「哪些模型在冷却、几点恢复」。
+    const modelNote = mcd.length
+      ? `<small class="cell-note" title="上游按模型限流：只影响这些模型，账号本身仍参与分配">模型冷却 ${mcd.length} 个：${esc(mcd.map(([m, u]) => `${m} 至 ${stamp(u * 1000)}`).join("、"))}</small>`
+      : "";
+    return `<tr class="account-row" data-account="${esc(a.id)}"><td><div class="account-cell">${kindIcon}<strong>${esc(accountLabel(a))}</strong></div></td><td>${stateToggle}${checkinCell}${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}${modelNote}${a.queued_until > Date.now()/1000 ? `<small class="cell-note">排队让位至 ${esc(stamp(a.queued_until*1000))}</small>` : ""}</td><td><button type="button" class="credit-number credit-link" data-credits="${esc(a.id)}" title="点击查看该账号每天的积分消费">${credits}</button><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td>${expiringCell}${nearestCell}${actions}</tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="6" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
 }
 $("account-search").addEventListener("input", () => { accountPage = 0; if(overview) renderAccounts(); });
@@ -729,6 +744,10 @@ async function openAccountDetail(a) {
       ["排队让位至", a.queued_until > Date.now()/1000 ? stamp(a.queued_until*1000) : "—"],
       ["是否启用", yes(a.enabled)],
     ]),
+    // 模型级冷却（用户 2026-10-20）：只在上游真的按模型限流时出现 ——
+    // 账号没被冷掉，但这些模型此刻用不了。没有就不留空块。
+    ...(modelCooldowns(a).length ? [section("模型冷却", modelCooldowns(a).map(([m, u]) =>
+      [m, `至 ${stamp(u * 1000)}`]))] : []),
   ].join("");
   // 最近错误只在真有时才出现，没错误时不留一块空白（用户 2026-10-16：弹框别堆空字段）。
   const err = a.last_error;
@@ -1217,7 +1236,9 @@ function openAccountSettings(a) {
   $("account-settings-error").textContent = "";
   // 「解除冷却」只在真冷却着时出现（用户 2026-10-18：上游按模型限流却冷整个
   // 账号，设置弹框里也要能放行，与账号行那颗按钮同一入口）。
-  $("as-unfreeze").hidden = !(a.cooldown_until > Date.now() / 1000);
+  // 模型级冷却（2026-10-20）同样要能放行：那个模型此刻用不了，但换个模型
+  // 这个号照常可用 —— 所以判据加上「有没有模型在冷却」。
+  $("as-unfreeze").hidden = !(a.cooldown_until > Date.now() / 1000 || modelCooldowns(a).length);
   $("account-settings-dialog").showModal();
 }
 

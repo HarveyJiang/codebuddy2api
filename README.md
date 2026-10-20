@@ -611,6 +611,8 @@ workbuddy2api/
 │   ├── observability.md       # 日志分级 + 深度 health
 │   ├── stream-robustness.md   # 流式空闲超时与截断可观测
 │   ├── usage-stats.md         # 用量明细与报表
+│   ├── growth-tasks.md        # 成长任务（任务 / 旅行 / 活跃 / 保活）
+│   ├── model-cooldown.md      # 模型级冷却（单个模型限流不冷却整个账号）
 │   └── custom-models.md       # 手动添加模型
 ├── deploy/                    # 部署
 │   ├── standalone/            # 独立转换器（Dockerfile + compose）

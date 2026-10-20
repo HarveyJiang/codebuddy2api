@@ -1899,9 +1899,13 @@ async def _e2e_trae_404_soft_cooldown(self):
                                json={"model": "Doubao-Seed-Code", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 404
     status = self.app.state.store.data["account_status"][aid]
-    # 软冷却：cooldown_until 置位、不计入连续失败、不触发积分重查
-    assert status["cooldown_until"] > time.time()
+    # 软冷却（用户 2026-10-20 起改为**模型级**）：Trae 的 404 含义是「这个模型
+    # 不可用」，账号本身是好的 —— 冷却只落在该模型上，账号仍参与分配，
+    # 不计入连续失败，也不触发积分重查。
+    assert status.get("cooldown_until", 0) <= time.time(), "模型级限流不该冷却整个账号"
     assert not status.get("consecutive_fails")
+    cooldowns = status.get("model_cooldowns") or {}
+    assert cooldowns.get("Doubao-Seed-Code", 0) > time.time()
     assert "404" in (status.get("last_error") or "")
 
 
