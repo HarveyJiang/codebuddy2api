@@ -535,6 +535,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 | `WORKBUDDY_DESENSITIZE`（`CODEBUDDY_RESPONSES_DESENSITIZE`） | 关 | 等价 `--desensitize` |
 | `WORKBUDDY_NO_COMPACT` | 关 | 等价 `--no-compact` |
 | `WORKBUDDY_LOSSY_PROJECTION` | 关 | 有损投影 |
+| `WORKBUDDY_OUTBOUND_SANITIZE` | 开 | 出站请求体剥离上游逐字匹配的黑名单指纹（`11128`、官方客户端模板句等），降低被风控整单拦的概率 |
+| `WORKBUDDY_SESSION_HEADERS` | `sticky` | 向上游透传/派生会话聚合头（`X-Conversation-*` / `X-Trace-ID` / `X-B3-*`）。`off`=完全不发，`pass`=发头但每次请求新 ID，`sticky`=同一次客户端请求内重试/换号复用同一 ID |
 | `WORKBUDDY_ENV_FILE` | `.env` | 指定 env 文件路径 |
 
 容器部署通常用旧名最省事——旧名全部继续生效，只是启动时会给一行提示。
@@ -769,6 +771,8 @@ startup log prints one aggregated line telling you the new name.
 | `WORKBUDDY_STREAM_IDLE_TIMEOUT` | `120` | Per-chunk stream idle timeout (s) |
 | `WORKBUDDY_DESENSITIZE` (`CODEBUDDY_RESPONSES_DESENSITIZE`) | off | Same as `--desensitize` |
 | `WORKBUDDY_NO_COMPACT` | off | Same as `--no-compact` |
+| `WORKBUDDY_OUTBOUND_SANITIZE` | on | Strip upstream blacklisted literals from outbound bodies (`11128`, official-client template sentences) |
+| `WORKBUDDY_SESSION_HEADERS` | `sticky` | Pass through / derive session aggregation headers (`X-Conversation-*`, `X-Trace-ID`, `X-B3-*`). `off`=none, `pass`=new id per attempt, `sticky`=same id across retries |
 
 ### Observability
 

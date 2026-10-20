@@ -1065,7 +1065,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     # 以前这里把 log_path 硬覆盖成 None，导致设了 WORKBUDDY_LOG/CODEBUDDY2OPENAI_LOG
     # 也不记日志。现在日志由 setup_logging 统一管，这里不再插手。
     converter.CONFIG.update({"desensitize": cfg.desensitize, "no_compact": cfg.no_compact,
-                             "log_path": cfg.log_path})
+                             "log_path": cfg.log_path,
+                             "outbound_sanitize": cfg.outbound_sanitize,
+                             "session_headers": cfg.session_headers})
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
     metrics = RequestMetrics()

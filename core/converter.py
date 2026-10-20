@@ -77,8 +77,16 @@ from .responses_adapter import (
     ResponsesStreamConverter,
     responses_request_to_chat,
 )
+from .outbound_sanitize import sanitize_outbound_body
 from .responses_projection import project_responses_chat_body
 from .replay_policy import explain as explain_transport
+from .session_headers import (
+    MODE_OFF,
+    MODE_STICKY,
+    SCOPE_REQUEST_ID,
+    build_session_headers,
+    resolve_session_identity,
+)
 from .system_identity import filter_system_identity
 
 # ---------------------------------------------------------------------------
@@ -329,6 +337,9 @@ class CredentialManager:
             # 设备指纹：按账号稳定派生，跨重启恒定、账号间互异。
             "X-Machine-ID": _fingerprint("machine", seed),
             "X-Session-ID": _fingerprint("session", seed),
+            # 用量归属：不带这个头，上游账单里的 agentPurpose 会是空的，
+            # 后台「用途」列就全空。conversation = 普通对话。
+            "X-Agent-Purpose": "conversation",
             "User-Agent": USER_AGENT,
         }
         # 设备令牌是上游登录时签发的，我们没有签发记录就不编造；
@@ -565,6 +576,10 @@ CONFIG: dict = {
     "log_path": None,
     "desensitize": False,
     "no_compact": False,
+    # 出站指纹剥离（上游按逐字匹配拦截客户端模板句与裸错误码 11128）。
+    "outbound_sanitize": True,
+    # 会话聚合头模式：off / pass / sticky（默认 sticky = 重试换号复用同一 X-Request-ID）。
+    "session_headers": "sticky",
 }  # cred: CredentialManager | None
 
 
@@ -757,6 +772,54 @@ def _routed_backend(request) -> str | None:
     return scope.get(ROUTED_BACKEND)
 
 
+def _sanitize_outbound_body(body: dict, backend) -> dict:
+    """出站指纹剥离：上游内容审核按**逐字匹配**拦客户端模板句与裸错误码。
+
+    只对腾讯后端生效（Trae 是私有协议，没有这套审核）。
+    剥离是纯函数：同样输入永远同样输出，上游的 prompt 缓存前缀不受影响。
+    """
+    if not backend.tencent_policies:
+        return body
+    if not CONFIG.get("outbound_sanitize", True):
+        return body
+    return sanitize_outbound_body(body)
+
+
+def _with_session_headers(headers: dict, request, payload: dict, backend) -> dict:
+    """并入会话聚合头，让上游能把同一次用户发送聚合成一条。
+
+    三档（``WORKBUDDY_SESSION_HEADERS``）：
+      - ``off``：完全不发会话头。
+      - ``pass``：发会话头，但 ``X-Request-ID`` 每次尝试都新（保守，不动
+        「上游按 uuid7 时间位还原请求时刻」的既有语义）。
+      - ``sticky``（默认）：同一次客户端请求内的重试/换号复用同一个
+        ``X-Request-ID``，与官方客户端一致，上游才能把这些尝试聚合成一条。
+        缓存在 scope 里——池中间件每次 attempt 传的都是同一个 scope dict，
+        所以天然跨重试稳定（换号也带着它走）。
+    """
+    if not backend.tencent_policies:
+        return headers
+    mode = CONFIG.get("session_headers", "sticky")
+    if mode == MODE_OFF:
+        return headers
+    request_id = headers.get("X-Request-ID", "")
+    if not request_id:
+        # 没有请求 ID 就没有派生的依据——发一堆空值头比不发更糟。
+        return headers
+    if mode == MODE_STICKY:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, dict):
+            cached = scope.get(SCOPE_REQUEST_ID)
+            if cached:
+                request_id = cached
+            else:
+                scope[SCOPE_REQUEST_ID] = request_id
+        headers["X-Request-ID"] = request_id
+    identity = resolve_session_identity(request.headers, payload)
+    headers.update(build_session_headers(identity, request_id))
+    return headers
+
+
 def _resolve_backend_or_http(model_raw, routed=None) -> tuple:
     """四端点共用前置：模型名 → (backend, upstream_model, cred)。
 
@@ -858,6 +921,10 @@ async def chat_completions(
             strip_tool_metadata=True,
         )
 
+    # 出站指纹剥离：上游按逐字匹配拦客户端模板句（You are Claude Code…）
+    # 与裸错误码 11128。放在脱敏之后——脱敏插的零宽空格会被这里穿透。
+    body = _sanitize_outbound_body(body, backend)
+
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
     tool_names = [
@@ -877,7 +944,7 @@ async def chat_completions(
         f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}"
     )
 
-    headers = cred.get_headers()
+    headers = _with_session_headers(cred.get_headers(), request, payload, backend)
     t0 = time.time()
 
     if client_wants_stream:
@@ -1397,6 +1464,9 @@ async def create_response(
     if backend.tencent_policies and _RESPONSES_DESENSITIZE:
         chat_body = _chat_body_desensitize(chat_body)
 
+    # 出站指纹剥离（Responses 路径同样会带上客户端模板句与裸 11128）。
+    chat_body = _sanitize_outbound_body(chat_body, backend)
+
     client_wants_stream = bool(payload.get("stream", False))
     model_name = payload.get("model", "auto")
     rid = os.urandom(4).hex()
@@ -1418,7 +1488,7 @@ async def create_response(
         f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
-    headers = cred.get_headers()
+    headers = _with_session_headers(cred.get_headers(), request, payload, backend)
     t0 = time.time()
 
     if client_wants_stream:
@@ -1582,6 +1652,9 @@ async def create_message(
             strip_tool_metadata=True,
         )
 
+    # 出站指纹剥离：Claude Code 的模板句主要就在这条路径上。
+    chat_body = _sanitize_outbound_body(chat_body, backend)
+
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
     rid = os.urandom(4).hex()
@@ -1592,7 +1665,7 @@ async def create_message(
         f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
-    headers = cred.get_headers()
+    headers = _with_session_headers(cred.get_headers(), request, payload, backend)
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
@@ -1788,12 +1861,15 @@ async def count_tokens(
             strip_tool_metadata=True,
         )
 
+    # 出站指纹剥离（count_tokens 也打上游，同样要洗）。
+    chat_body = _sanitize_outbound_body(chat_body, backend)
+
     # Trae：SOLO 上游大概率不遵守 max_tokens=1，走真实请求会白烧生成额度（Claude Code
     # 每条消息前都调 count_tokens），默认本地 chars/4 估算；env 可逃生走上游。
     if not backend.count_tokens_upstream and os.environ.get("CODEBUDDY_TRAE_COUNT_TOKENS_UPSTREAM", "0") != "1":
         return {"input_tokens": _estimate_tokens(chat_body)}
 
-    headers = cred.get_headers()
+    headers = _with_session_headers(cred.get_headers(), request, payload, backend)
 
     try:
         input_tokens = 0
@@ -1920,6 +1996,8 @@ def main():
     # 命令行开关是「或」的关系：配置开了就开，命令行也开就开，两者都没有才关。
     CONFIG["desensitize"] = args.desensitize or cfg.desensitize
     CONFIG["no_compact"] = args.no_compact or cfg.no_compact
+    CONFIG["outbound_sanitize"] = cfg.outbound_sanitize
+    CONFIG["session_headers"] = cfg.session_headers
     CONFIG["log_path"] = args.log
     # 日志最早初始化：之后的启动信息与请求日志才有出口。
     logging_setup.setup_logging(cfg.log_level, args.log)

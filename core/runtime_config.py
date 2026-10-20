@@ -32,6 +32,10 @@ _ALIASES = {
     "WORKBUDDY_STREAM_IDLE_TIMEOUT": (),
     "WORKBUDDY_DESENSITIZE": ("CODEBUDDY_RESPONSES_DESENSITIZE",),
     "WORKBUDDY_NO_COMPACT": (),
+    # 出站指纹剥离：默认开（上游按逐字精确匹配拦 11128，漏一条就整单失败）。
+    "WORKBUDDY_OUTBOUND_SANITIZE": (),
+    # 会话聚合头：off / pass / sticky（默认 sticky，与官方客户端一致）。
+    "WORKBUDDY_SESSION_HEADERS": (),
     "WORKBUDDY_LOSSY_PROJECTION": ("CODEBUDDY_LOSSY_PROJECTION",),
     # 伪装头也走统一入口，但保持原有名字（README 已公开文档化，改名收益低、破坏面大）。
     "WORKBUDDY_PRODUCT_NAME": ("CLIENT_INFO_PRODUCT_NAME",),
@@ -146,6 +150,13 @@ class Config:
         self.desensitize = _to_bool(raw("WORKBUDDY_DESENSITIZE"), False)
         self.no_compact = _to_bool(raw("WORKBUDDY_NO_COMPACT"), False)
         self.lossy_projection = _to_bool(raw("WORKBUDDY_LOSSY_PROJECTION"), False)
+        # 出站指纹剥离默认开：上游对请求内容做逐字精确匹配，命中即整单拒
+        # （11128）。关掉它＝把「换个账号就能救」的错觉留给用户。
+        self.outbound_sanitize = _to_bool(raw("WORKBUDDY_OUTBOUND_SANITIZE"), True)
+        # 会话聚合头模式：off / pass / sticky。非法值回落到 sticky。
+        self.session_headers = (raw("WORKBUDDY_SESSION_HEADERS") or "sticky").strip().lower()
+        if self.session_headers not in ("off", "pass", "sticky"):
+            self.session_headers = "sticky"
         self.product_name = raw("WORKBUDDY_PRODUCT_NAME", "WorkBuddy")
         self.product_version = raw("WORKBUDDY_PRODUCT_VERSION", "5.8.2")
         self.ua_extension = raw("WORKBUDDY_UA_EXTENSION", "CLI/2.161.0")

@@ -1282,6 +1282,46 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[1], self.b)
         self.assertTrue(self.pool.queued(self.a))           # 只有排过队的那个被让位
         self.assertFalse(self.pool.queued(self.b))
+    async def test_scope_identity_survives_rotation(self):
+        """换号重试必须把**同一个 scope dict** 交给下游。
+
+        会话聚合头的 sticky 档（``core/session_headers.py``）把 X-Request-ID
+        缓存在 ``scope`` 里，靠的就是池每次 attempt 传同一个 dict——
+        否则换号后上游会看到两个不同的请求 ID，聚合成一条就失效了。
+        这里从池这一侧钉住这个前提：scope 身份不变，且第一次 attempt 写进去的值
+        第二次 attempt 读得到。
+        """
+        self._enable_failover()
+        seen_ids = []
+        carried = []
+
+        async def app(scope, receive, send):
+            await receive()
+            seen_ids.append(id(scope))
+            carried.append(scope.get("codebuddy.probe"))
+            scope["codebuddy.probe"] = f"attempt-{len(seen_ids)}"
+            if len(seen_ids) == 1:
+                # 第一次命中排队 → 池会换号重放
+                await send({'type': 'http.response.start', 'status': 200,
+                            'headers': [(b'content-type', b'application/json')]})
+                await send({'type': 'http.response.body', 'body': json.dumps({
+                    "code": "WAITING", "model": "Step-5-Preview",
+                    "message": "当前模型资源紧张，请等候。前方约 7859 位用户排队",
+                }).encode()})
+                return
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ANSWER'})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            with self.rotation_backoff():
+                response = await client.post('/v1/responses', json={'input': 'hi'},
+                                             headers={'Authorization': 'Bearer api-test'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(seen_ids), 2, "应确实换号重试过一次")
+        self.assertEqual(seen_ids[0], seen_ids[1], "换号后必须传同一个 scope dict")
+        self.assertIsNone(carried[0], "第一次 attempt 还没有缓存")
+        self.assertEqual(carried[1], "attempt-1", "第二次 attempt 必须读到第一次写进 scope 的值")
+
     async def test_queue_without_content_is_never_replayed_once_content_seen(self):
         # 首包已含真实内容时，即使同时命中排队关键词也必须放行——重放会重复输出。
         self._enable_failover()
