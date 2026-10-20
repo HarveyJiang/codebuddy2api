@@ -15,6 +15,31 @@ import httpx
 from .base import BackendHTTPError, BackendSpec
 
 
+def _site_headers(headers: dict) -> dict:
+    """给 chat 请求补上「像官方客户端」的站点头。
+
+    官方桌面端除了 X-CodeBuddy-Request，还会带 Origin / Referer /
+    Accept-Language —— 上游据此判断「这是客户端直连，不是裸脚本」。
+    这三个头与请求目标 host 无关，但与**账号所属站点**有关，所以按
+    X-Domain 派生（海外站 .ai 用 en-US，国内站用 zh-CN）。
+
+    只在 chat 路径加：账单与运维接口打的是 www.workbuddy.cn，
+    让它们带上 codebuddy.cn 的 Origin 会被 WAF 当成跨站请求拦掉。
+    """
+    out = dict(headers)
+    domain = str(out.get("X-Domain") or "").strip()
+    # X-Domain 正常是裸域名（"www.codebuddy.cn"），但防御性剥掉 scheme
+    # 与尾部斜杠，免得多拼出 "https://https://…" 这种一眼假的来源。
+    domain = domain.split("://", 1)[-1].strip("/")
+    if not domain:
+        return out
+    origin = f"https://{domain}"
+    out["Origin"] = origin
+    out["Referer"] = f"{origin}/"
+    out["Accept-Language"] = "en-US" if domain.endswith(".ai") else "zh-CN"
+    return out
+
+
 class WorkBuddyBackend(BackendSpec):
     name = "workbuddy"
     owned_by = "codebuddy"
@@ -88,6 +113,8 @@ class WorkBuddyBackend(BackendSpec):
 
     async def astream(self, headers, body, *, timeout=None, raise_on_error=False):
         url = self.chat_url()
+        # 站点头只加在 chat 路径（见 _site_headers 的说明）。
+        headers = _site_headers(headers)
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:

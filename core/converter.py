@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -106,6 +107,26 @@ _LOSSY_PROJECTION = config.get().lossy_projection
 # client 字段的取值来源（大写 WorkBuddy 为目标值）。
 IDE_TYPE = _PRODUCT_NAME
 USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
+
+
+# ---------------------------------------------------------------------------
+# 设备指纹（用户 2026-10-20 要求，参考 workbuddy2api-panel）
+# ---------------------------------------------------------------------------
+# 上游按「设备指纹是否缺失 / 漂移」判网关特征：完全不带像脚本，
+# 每次请求都变像爬虫。按账号 uid 稳定派生，满足三个条件：
+#   跨重启恒定（不随进程变化）、账号间互异（多号不会被认成同一台设备）、
+#   不依赖实例状态（刷新令牌与发请求共用同一份派生逻辑）。
+# 命名空间前缀固定，避免与别的项目撞出相同指纹。
+_FINGERPRINT_NS = "codebuddy2api"
+
+
+def _fingerprint(purpose: str, seed: str) -> str:
+    """按用途与种子派生稳定的设备指纹（36 位 hex）。
+
+    刻意不用随机数：随机值每次请求都变，恰恰是上游要抓的「漂移」。
+    """
+    digest = hashlib.sha256(f"{_FINGERPRINT_NS}:{purpose}:{seed}".encode()).hexdigest()
+    return digest[:36]
 
 
 def _uuid7_fallback_hex() -> str:
@@ -283,6 +304,9 @@ class CredentialManager:
 
     def _build_headers_from(self, auth: dict, account: dict) -> dict:
         domain = auth.get("domain") or DEFAULT_DOMAIN
+        # 设备指纹种子：uid 最稳定（每账号唯一且不变），退到 enterpriseId，
+        # 再退到固定串——宁可同号同指纹，也不让指纹每次请求都变。
+        seed = str(account.get("uid") or account.get("enterpriseId") or "anonymous")
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -299,8 +323,19 @@ class CredentialManager:
             # UUIDv7：上游从这里还原请求时刻（见 _uuid7_hex 的说明）。
             # 只作用于 WorkBuddy —— Trae 有自己的 _solo_headers，不走这条路径。
             "X-Request-ID": _uuid7_hex(),
+            # 官方客户端的风控闸门头：缺这个头的请求会被判「非客户端直连」。
+            # 与 host 无关（chat / 账单 / 配置都带），所以放共享 builder 安全。
+            "X-CodeBuddy-Request": "1",
+            # 设备指纹：按账号稳定派生，跨重启恒定、账号间互异。
+            "X-Machine-ID": _fingerprint("machine", seed),
+            "X-Session-ID": _fingerprint("session", seed),
             "User-Agent": USER_AGENT,
         }
+        # 设备令牌是上游登录时签发的，我们没有签发记录就不编造；
+        # 万一 auth 文件里带了（其它工具写入），就原样带上。
+        device_token = auth.get("deviceToken") or auth.get("device_token") or ""
+        if device_token:
+            h["X-Device-Token"] = str(device_token)
         return h
 
     def get_headers(self) -> dict:
