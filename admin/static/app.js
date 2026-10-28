@@ -637,13 +637,31 @@ function fmtLogToken(v) {
   if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, "") + "K";
   return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
 }
+// 缓存命中率（用户 2026-10-28）：命中 token / 本次输入 token。
+// 上游按前缀缓存计费，命中部分单价低一个量级，所以这个比例比「缓存读了多少」
+// 更能说明一次请求贵不贵。没有 usage 的请求（失败/排队耗尽）显示「—」，
+// 有 usage 但完全没命中显示 0%——两者语义不同，不合并。
+function cacheRate(r) {
+  const inTok = Number(r.tokens_in);
+  if (!Number.isFinite(inTok) || inTok <= 0) return "—";
+  const hit = r.tokens_cache_read;
+  if (hit === null || hit === undefined || hit === "") return "—";
+  const n = Number(hit);
+  if (!Number.isFinite(n)) return "—";
+  if (n <= 0) return "0%";
+  const pct = Math.min(100, (n / inTok) * 100);
+  if (pct >= 99.95) return "100%";
+  // 保留一位小数：98.7% 与 99% 对成本判断是两回事，不要四舍五入掉。
+  return pct.toFixed(1).replace(/\.0$/, "") + "%";
+}
 function tokenCells(r) {
   const read = fmtLogToken(r.tokens_cache_read);
   const creation = fmtLogToken(r.tokens_cache_creation);
   const cache = (read === "—" && creation === "—") ? "—" : `${read} / ${creation}`;
   return `<td class="align-right mono">${fmtLogToken(r.tokens_in)}</td>`
     + `<td class="align-right mono">${fmtLogToken(r.tokens_out)}</td>`
-    + `<td class="align-right mono">${cache}</td>`;
+    + `<td class="align-right mono">${cache}</td>`
+    + `<td class="align-right mono">${cacheRate(r)}</td>`;
 }
 // 首字延迟（用户 2026-10-20）：流式体感由「多久吐出第一个字」决定，与总耗时
 // 是两回事。NULL = 这次没拿到响应体（失败/排队耗尽），显示「—」，不显示 0。
@@ -743,7 +761,7 @@ function renderLogRows(rows) {
   const accountCell = r => r.account_name
     ? `<span class="account-cell-log">${backendIconSvg(r.backend)}<span>${esc(r.account_name)}</span></span>`
     : "—";
-  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td>${statusCell(r)}${tokenCells(r)}${firstTokenCell(r)}${durationCell(r)}</tr>`).join("") || '<tr><td colspan="10" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML = rows.map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${esc(keyLabel(r))}</td><td class="mono">${esc(r.model_id || "—")}${upstreamIdCell(r)}</td><td>${accountCell(r)}</td>${statusCell(r)}${tokenCells(r)}${firstTokenCell(r)}${durationCell(r)}</tr>`).join("") || '<tr><td colspan="11" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }// 当前看的日志来源（v26）：本代理的请求 / 上游侧的流水。
 // 上游那一批是**另一个视角**——上游自己记的账，包含官方 App/CLI/IDE 的流量，
 // 用来回答「云端看到的那条请求，到底是不是我这条」。
@@ -767,7 +785,7 @@ async function loadLogs(offset) {
     $("dash-page-info").textContent = logTotal ? `第 ${current} / ${pages} 页 · 共 ${logTotal.toLocaleString("zh-CN")} 条` : "暂无记录";
     $("dash-prev").disabled = data.offset <= 0;
     $("dash-next").disabled = data.offset + size >= logTotal;
-  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="10" class="history-empty">${esc(e.message)}</td></tr>`; }
+  } catch (e) { $("dash-recent-body").innerHTML = `<tr><td colspan="11" class="history-empty">${esc(e.message)}</td></tr>`; }
 }
 $("dash-prev").addEventListener("click", () => loadLogs(Math.max(0, logOffset - Number($("dash-page-size").value))));
 $("dash-next").addEventListener("click", () => loadLogs(logOffset + Number($("dash-page-size").value)));
@@ -1465,7 +1483,7 @@ async function loadAccountLogs() {
   if (!a) return;
   $("account-logs-title").textContent = accountLabel(a);
   $("account-logs-sub").textContent = `${backendName(a.backend)} 账号 · 最近 7 天，每页 ${ACCOUNT_LOGS_SIZE} 条`;
-  $("account-logs-body").innerHTML = '<tr><td colspan="9" class="history-empty">加载中…</td></tr>';
+  $("account-logs-body").innerHTML = '<tr><td colspan="10" class="history-empty">加载中…</td></tr>';
   const requestedId = accountLogsId, requestedOffset = accountLogsOffset;
   const since = Math.floor((Date.now() - 7 * 86400000) / 1000);
   try {
@@ -1479,7 +1497,7 @@ async function loadAccountLogs() {
       + tokenCells(r)
       + firstTokenCell(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
-      || '<tr><td colspan="9" class="history-empty">这个账号最近 7 天没有请求记录。</td></tr>';
+      || '<tr><td colspan="10" class="history-empty">这个账号最近 7 天没有请求记录。</td></tr>';
     const pages = Math.max(1, Math.ceil(data.total / ACCOUNT_LOGS_SIZE));
     const current = Math.floor(data.offset / ACCOUNT_LOGS_SIZE) + 1;
     $("account-logs-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
@@ -1487,7 +1505,7 @@ async function loadAccountLogs() {
     $("account-logs-next").disabled = data.offset + ACCOUNT_LOGS_SIZE >= data.total;
   } catch (err) {
     if (requestedId !== accountLogsId) return;
-    $("account-logs-body").innerHTML = `<tr><td colspan="9" class="history-empty">${esc(err.message)}</td></tr>`;
+    $("account-logs-body").innerHTML = `<tr><td colspan="10" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }
 $("account-logs-prev").addEventListener("click", () => { accountLogsOffset = Math.max(0, accountLogsOffset - ACCOUNT_LOGS_SIZE); loadAccountLogs(); });
@@ -2221,7 +2239,7 @@ async function loadKeyRequests(offset) {
   // 会覆盖后发的列表，导致「显示的记录不属于当前密钥」。
   const requestedId = keyReqId, requestedOffset = keyReqOffset;
   const day = keyReqDay;
-  $("key-requests-body").innerHTML = '<tr><td colspan="9" class="history-empty">加载中…</td></tr>';
+  $("key-requests-body").innerHTML = '<tr><td colspan="10" class="history-empty">加载中…</td></tr>';
   try {
     // 从用量历史点进来时带 since/until，只显示选中那天；从「请求」按钮进来
     // 不带时间条件，显示最近的记录。
@@ -2238,7 +2256,7 @@ async function loadKeyRequests(offset) {
       + tokenCells(r)
       + firstTokenCell(r)
       + `<td class="align-right mono">${Math.round(Number(r.duration_ms) || 0).toLocaleString("zh-CN")} ms</td></tr>`).join("")
-      || '<tr><td colspan="9" class="history-empty">该密钥还没有请求记录。</td></tr>';
+      || '<tr><td colspan="10" class="history-empty">该密钥还没有请求记录。</td></tr>';
     const pages = Math.max(1, Math.ceil(data.total / keyReqSize));
     const current = Math.floor(data.offset / keyReqSize) + 1;
     $("key-requests-info").textContent = data.total ? `第 ${current} / ${pages} 页 · 共 ${data.total.toLocaleString("zh-CN")} 条` : "暂无记录";
@@ -2246,7 +2264,7 @@ async function loadKeyRequests(offset) {
     $("key-requests-next").disabled = data.offset + keyReqSize >= data.total;
   } catch (err) {
     if (requestedId !== keyReqId) return;
-    $("key-requests-body").innerHTML = `<tr><td colspan="9" class="history-empty">${esc(err.message)}</td></tr>`;
+    $("key-requests-body").innerHTML = `<tr><td colspan="10" class="history-empty">${esc(err.message)}</td></tr>`;
   }
 }
 $("key-requests-prev").addEventListener("click", () => loadKeyRequests(keyReqOffset - keyReqSize));
