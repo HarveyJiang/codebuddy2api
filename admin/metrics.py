@@ -4,6 +4,8 @@
 组装成一行后交给 Store 的批量缓冲，由 5 秒防抖统一写库。
 """
 import json
+import logging
+import os
 import threading
 import time
 
@@ -12,6 +14,15 @@ from admin.rotation import is_waf_error
 from core.session_headers import SCOPE_REQUEST_ID, SCOPE_UPSTREAM_MODEL
 
 PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}
+
+_logger = logging.getLogger(__name__)
+
+# 慢请求阈值（用户 2026-10-28）：超过就单独打一行 WARN。
+# 用途是把「慢」拆成三种可区分的情况：
+#   ttft 大、总耗时大        → 上游 prefill 慢（上下文太大）
+#   ttft 小、总耗时大        → 上游吐字慢 / 输出太长
+#   ttft 小、总耗时也小      → 慢在两次请求之间（客户端工具执行），服务端无责
+SLOW_MS = int(os.environ.get("WORKBUDDY_SLOW_MS") or 10000)
 
 
 def _numeric_code(value):
@@ -279,6 +290,19 @@ class MetricsMiddleware:
         code = context.get("error_code")
         if code is not None:
             code = str(code).strip() or None
+        if duration >= SLOW_MS:
+            td = context.get("tokens_detail") or {}
+            _logger.warning(
+                "[SLOW] %.1fs | ttft=%s | model=%s -> %s | in=%s out=%s | account=%s | status=%s/%s | %s",
+                duration / 1000.0,
+                ("%.1fs" % (first_token_ms / 1000.0)) if first_token_ms else "n/a",
+                context.get("model_name") or "?",
+                scope.get(SCOPE_UPSTREAM_MODEL) or "-",
+                td.get("in"),
+                td.get("out"),
+                context.get("account_name") or "-",
+                status, outcome, path,
+            )
         self.store.queue_request_log({
             "time": int(time.time()), "source": self.source, "path": path,
             "status": status, "outcome": outcome, "duration_ms": round(duration),
