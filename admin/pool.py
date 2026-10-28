@@ -2390,7 +2390,11 @@ class PoolMiddleware:
             事件循环让出去，应用可能趁机把后面的分片发出来 —— 那样客户端
             会先收到分片、再收到响应头（顺序错乱）。
             """
-            if hold["flushed"]:
+            if not hold["hit"] or hold["flushed"]:
+                # 本轮没扣住任何东西：响应已经在正常透传，start 早就发过了。
+                # 再发一次 response.start 会被 uvicorn 判为协议违规并直接掐断连接，
+                # 客户端表现为 ECONNRESET（2026-10-28 实测：任何流式响应超过
+                # queue_hold_ms 必断，与模型无关）。
                 return
             hold["flushed"] = True
             hold["released"] = True
@@ -2460,7 +2464,8 @@ class PoolMiddleware:
                     # 窗口到点：不再判定，原样放行（行为退回改动前）。
                     # 放行交给下一次 observe 或 finally —— 这里 await 下去会让
                     # 应用插进来发分片，响应头就可能晚于分片到达客户端。
-                    hold["released"] = True
+                    if hold["hit"]:
+                        hold["released"] = True
                     await self._await_app(app_task)
         finally:
             REQUEST_CREDENTIAL.reset(token)
