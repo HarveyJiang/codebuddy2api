@@ -215,10 +215,27 @@ def _tokens_of(usage):
                 except (TypeError, ValueError):
                     return None
         return None
+    # 缓存命中字段三套并存，取值口径按实测（2026-10-28 在 WorkBuddy 通道上验证）：
+    #   prompt_cache_hit_tokens            命中时 = 命中 token 数（本通道真正在用的）
+    #   prompt_tokens_details.cached_tokens 同上（OpenAI 风，嵌在 details 里）
+    #   cache_read_input_tokens            本通道**恒为 0**（Anthropic 风字段，上游没填）
+    # 之前只读第三个 → 明明命中却全记 0，管理页「缓存命中率」永远是 0.0%。
+    # 取三者里最大的那个，任一为 None 时退到下一个。
+    _detail = usage.get("prompt_tokens_details")
+    _detail_cached = None
+    if isinstance(_detail, dict) and _detail.get("cached_tokens") is not None:
+        try:
+            _detail_cached = int(_detail["cached_tokens"])
+        except (TypeError, ValueError):
+            _detail_cached = None
+    _candidates = [v for v in (first("cache_read_input_tokens"),
+                               first("prompt_cache_hit_tokens"),
+                               _detail_cached) if v is not None]
+
     return {
         "in": first("prompt_tokens", "input_tokens"),
         "out": first("completion_tokens", "output_tokens"),
-        "cache_read": first("cache_read_input_tokens"),
+        "cache_read": max(_candidates) if _candidates else None,
         "cache_creation": first("cache_creation_input_tokens"),
     }
 
