@@ -113,6 +113,8 @@ _UA_EXTENSION = config.raw("WORKBUDDY_UA_EXTENSION", "CLI/2.161.0")
 # 两套解析器会让 WORKBUDDY_DESENSITIZE=true 只影响 chat 路径、Responses 路径静默失效。
 _RESPONSES_DESENSITIZE = config.get().desensitize
 _LOSSY_PROJECTION = config.get().lossy_projection
+# 前缀探针用：上一次请求的消息哈希序列（仅调试）
+_PREFIX_STATE = {"hashes": []}
 # client 字段的取值来源（大写 WorkBuddy 为目标值）。
 IDE_TYPE = _PRODUCT_NAME
 USER_AGENT = f"{_PRODUCT_NAME}/{_PRODUCT_VERSION} {_UA_EXTENSION}"
@@ -965,6 +967,27 @@ async def chat_completions(
         + (f" | tools={tool_names}" if tool_names else "")
         + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else "")
     )
+    # 前缀哈希探针（WORKBUDDY_PREFIX_DEBUG=1）：逐条哈希消息，定位前缀从第几条开始变。
+    # 只打哈希和首条差异摘要，不打正文。
+    if os.environ.get("WORKBUDDY_PREFIX_DEBUG") == "1":
+        try:
+            _msgs = body.get("messages") or []
+            _hs = [hashlib.sha256(json.dumps(m, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8]
+                   for m in _msgs]
+            _prev = _PREFIX_STATE["hashes"]
+            _div = None
+            for _i in range(min(len(_prev), len(_hs))):
+                if _prev[_i] != _hs[_i]:
+                    _div = _i
+                    break
+            _diff_txt = ""
+            if _div is not None:
+                _diff_txt = " diff=" + repr(_truncate(json.dumps(_msgs[_div], ensure_ascii=False), 200))
+            _log(f"[PREFIX] {rid} n={len(_hs)} prev_n={len(_prev)} 首个差异下标={_div}{_diff_txt}")
+            _PREFIX_STATE["hashes"] = _hs
+        except Exception:
+            pass
+
     # 完整请求体（发往后端的实际内容；若启用脱敏，这里已是脱敏后）
     _log_debug(
         f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}"
