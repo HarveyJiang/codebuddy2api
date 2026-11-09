@@ -17,6 +17,9 @@ services:
       MANAGEMENT_DATA_DIR: /data/management
       # 界面上的版本标识。留空则显示 unknown；用镜像 tag 填，便于核对线上跑的是哪一次发布。
       WORKBUDDY_IMAGE_TAG: ${WORKBUDDY_IMAGE_TAG:-}
+      # 发往上游的客户端标识：X-IDE-Type / X-IDE-Name / User-Agent。
+      # 留空回落 WorkBuddy；设为 app_cloud 则上游用量报表按 app_cloud 归类。
+      WORKBUDDY_PRODUCT_NAME: ${WORKBUDDY_PRODUCT_NAME:-WorkBuddy}
       TZ: Asia/Shanghai
     volumes:
       - ./data/auth:/data/auth
